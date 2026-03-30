@@ -90,6 +90,12 @@
           <artifactId>spark-sql_${scala.compat.version}</artifactId>
           <version>${spark3.version}</version>
           <scope>provided</scope>
+          <exclusions>
+            <exclusion>
+              <groupId>org.lz4</groupId>
+              <artifactId>lz4-java</artifactId>
+            </exclusion>
+          </exclusions>
         </dependency>
         <dependency>
           <groupId>org.scala-lang</groupId>
