@@ -113,18 +113,13 @@ public class ResponseStoreCleaner extends ControllerPeriodicTask<Void> {
     return frequencyInSeconds;
   }
 
-  /**
-   * Returns a singleton list with the task name as a pseudo-table so that the standard leadership gating in
-   * {@link ControllerPeriodicTask#runTask} ensures exactly one controller runs cleanup, independent of actual
-   * table distribution.
-   */
-  @Override
-  protected List<String> getTablesToProcess(Properties periodicTaskProperties) {
-    return List.of(TASK_NAME);
-  }
-
   @Override
   protected void processTables(List<String> tableNamesWithType, Properties periodicTaskProperties) {
+    // Make it so that only one controller is responsible for cleaning up minion instances.
+    if (!_leadControllerManager.isLeaderForTable(TASK_NAME)) {
+      return;
+    }
+
     long cleanAtMs = System.currentTimeMillis();
     String cleanAtMsStr = periodicTaskProperties.getProperty(CLEAN_AT_TIME);
     if (cleanAtMsStr != null) {
