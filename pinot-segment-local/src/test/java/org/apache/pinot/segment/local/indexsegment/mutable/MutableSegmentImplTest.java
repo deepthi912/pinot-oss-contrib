@@ -20,7 +20,9 @@ package org.apache.pinot.segment.local.indexsegment.mutable;
 
 import java.io.File;
 import java.io.IOException;
+import java.lang.reflect.Field;
 import java.net.URL;
+import java.util.Map;
 import org.apache.commons.io.FileUtils;
 import org.apache.pinot.segment.local.indexsegment.immutable.ImmutableSegmentLoader;
 import org.apache.pinot.segment.local.segment.creator.SegmentTestUtils;
@@ -199,6 +201,28 @@ public class MutableSegmentImplTest {
             }
           }
         }
+      }
+    }
+  }
+
+  @Test
+  public void testDestroyClearsIndexContainerMap()
+      throws ReflectiveOperationException {
+    MutableSegmentImpl freshSegment = MutableSegmentImplTestUtils.createMutableSegmentImpl(_schema);
+    boolean destroyed = false;
+    try {
+      Field indexContainerMapField = MutableSegmentImpl.class.getDeclaredField("_indexContainerMap");
+      indexContainerMapField.setAccessible(true);
+      Map<?, ?> indexContainerMap = (Map<?, ?>) indexContainerMapField.get(freshSegment);
+      Assert.assertFalse(indexContainerMap.isEmpty());
+
+      freshSegment.destroy();
+      destroyed = true;
+
+      Assert.assertTrue(indexContainerMap.isEmpty());
+    } finally {
+      if (!destroyed) {
+        freshSegment.destroy();
       }
     }
   }
