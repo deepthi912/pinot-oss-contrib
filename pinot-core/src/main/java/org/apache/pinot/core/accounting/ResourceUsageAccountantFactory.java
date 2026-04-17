@@ -136,6 +136,11 @@ public class ResourceUsageAccountantFactory implements ThreadAccountantFactory {
     }
 
     @Override
+    public boolean waitIfPaused() {
+      return _queryResourceAggregator.waitIfPaused();
+    }
+
+    @Override
     public void clear() {
       ThreadResourceTrackerImpl threadTracker = _threadLocalEntry.get();
       assert threadTracker.getThreadContext() != null;
@@ -330,6 +335,8 @@ public class ResourceUsageAccountantFactory implements ThreadAccountantFactory {
         LOGGER.info("_minMemoryFootprintForKill: {}", queryMonitorConfig.getMinMemoryFootprintForKill());
         LOGGER.info("_cpuTimeBasedKillingEnabled: {}", queryMonitorConfig.isCpuTimeBasedKillingEnabled());
         LOGGER.info("_cpuTimeBasedKillingThresholdNs: {}", queryMonitorConfig.getCpuTimeBasedKillingThresholdNs());
+        LOGGER.info("_oomPreQueryKillPauseDurationMs: {}", queryMonitorConfig.getOomPreQueryKillPauseDurationMs());
+        LOGGER.info("_oomPanicPreQueryKillPauseEnabled: {}", queryMonitorConfig.isOomPanicPreQueryKillPauseEnabled());
         LOGGER.info("_workloadSleepTimeMs: {}", queryMonitorConfig.getWorkloadSleepTimeMs());
         LOGGER.info("_workloadCostEnforcementEnabled: {}", queryMonitorConfig.isWorkloadCostEnforcementEnabled());
       }

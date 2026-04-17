@@ -62,6 +62,12 @@ public class QueryMonitorConfig {
 
   private final boolean _queryKilledMetricEnabled;
 
+  // how long to pause query threads (ms) before proceeding with kill; non-positive means disabled
+  private final long _oomPreQueryKillPauseDurationMs;
+
+  // whether to also apply the OOM pause before killing at panic level
+  private final boolean _oomPanicPreQueryKillPauseEnabled;
+
   private final int _workloadSleepTimeMs;
 
   private final boolean _workloadCostEnforcementEnabled;
@@ -110,6 +116,14 @@ public class QueryMonitorConfig {
 
     _queryKilledMetricEnabled = config.getProperty(CommonConstants.Accounting.CONFIG_OF_QUERY_KILLED_METRIC_ENABLED,
         CommonConstants.Accounting.DEFAULT_QUERY_KILLED_METRIC_ENABLED);
+
+    _oomPreQueryKillPauseDurationMs = config.getProperty(
+        CommonConstants.Accounting.CONFIG_OF_OOM_PRE_QUERY_KILL_PAUSE_DURATION_MS,
+        CommonConstants.Accounting.DEFAULT_OOM_PRE_QUERY_KILL_PAUSE_DURATION_MS);
+
+    _oomPanicPreQueryKillPauseEnabled = config.getProperty(
+        CommonConstants.Accounting.CONFIG_OF_OOM_PANIC_ALLOW_PRE_QUERY_KILL_PAUSE,
+        CommonConstants.Accounting.DEFAULT_OOM_PANIC_PRE_QUERY_KILL_PAUSE_ENABLED);
 
     _workloadSleepTimeMs = config.getProperty(CommonConstants.Accounting.CONFIG_OF_WORKLOAD_SLEEP_TIME_MS,
         CommonConstants.Accounting.DEFAULT_WORKLOAD_SLEEP_TIME_MS);
@@ -257,6 +271,30 @@ public class QueryMonitorConfig {
       _queryKilledMetricEnabled = oldConfig._queryKilledMetricEnabled;
     }
 
+    if (changedConfigs.contains(CommonConstants.Accounting.CONFIG_OF_OOM_PRE_QUERY_KILL_PAUSE_DURATION_MS)) {
+      if (clusterConfigs == null || !clusterConfigs.containsKey(
+          CommonConstants.Accounting.CONFIG_OF_OOM_PRE_QUERY_KILL_PAUSE_DURATION_MS)) {
+        _oomPreQueryKillPauseDurationMs = CommonConstants.Accounting.DEFAULT_OOM_PRE_QUERY_KILL_PAUSE_DURATION_MS;
+      } else {
+        _oomPreQueryKillPauseDurationMs = Long.parseLong(
+            clusterConfigs.get(CommonConstants.Accounting.CONFIG_OF_OOM_PRE_QUERY_KILL_PAUSE_DURATION_MS));
+      }
+    } else {
+      _oomPreQueryKillPauseDurationMs = oldConfig._oomPreQueryKillPauseDurationMs;
+    }
+
+    if (changedConfigs.contains(CommonConstants.Accounting.CONFIG_OF_OOM_PANIC_ALLOW_PRE_QUERY_KILL_PAUSE)) {
+      if (clusterConfigs == null || !clusterConfigs.containsKey(
+          CommonConstants.Accounting.CONFIG_OF_OOM_PANIC_ALLOW_PRE_QUERY_KILL_PAUSE)) {
+        _oomPanicPreQueryKillPauseEnabled = CommonConstants.Accounting.DEFAULT_OOM_PANIC_PRE_QUERY_KILL_PAUSE_ENABLED;
+      } else {
+        _oomPanicPreQueryKillPauseEnabled = Boolean.parseBoolean(
+            clusterConfigs.get(CommonConstants.Accounting.CONFIG_OF_OOM_PANIC_ALLOW_PRE_QUERY_KILL_PAUSE));
+      }
+    } else {
+      _oomPanicPreQueryKillPauseEnabled = oldConfig._oomPanicPreQueryKillPauseEnabled;
+    }
+
     if (changedConfigs.contains(CommonConstants.Accounting.CONFIG_OF_WORKLOAD_SLEEP_TIME_MS)) {
       if (clusterConfigs == null || !clusterConfigs.containsKey(
           CommonConstants.Accounting.CONFIG_OF_WORKLOAD_SLEEP_TIME_MS)) {
@@ -328,6 +366,18 @@ public class QueryMonitorConfig {
 
   public boolean isQueryKilledMetricEnabled() {
     return _queryKilledMetricEnabled;
+  }
+
+  public boolean isOomPreQueryKillPauseEnabled() {
+    return _oomPreQueryKillPauseDurationMs > 0;
+  }
+
+  public long getOomPreQueryKillPauseDurationMs() {
+    return _oomPreQueryKillPauseDurationMs;
+  }
+
+  public boolean isOomPanicPreQueryKillPauseEnabled() {
+    return _oomPanicPreQueryKillPauseEnabled;
   }
 
   public int getWorkloadSleepTimeMs() {
