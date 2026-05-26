@@ -129,12 +129,12 @@ public abstract class BaseDictionaryBasedPredicateEvaluator extends BasePredicat
   }
 
   @Override
-  public final boolean applySV(String value) {
+  public boolean applySV(String value) {
     throw new UnsupportedOperationException();
   }
 
   @Override
-  public final boolean applyMV(String[] values, int length) {
+  public boolean applyMV(String[] values, int length) {
     throw new UnsupportedOperationException();
   }
 
