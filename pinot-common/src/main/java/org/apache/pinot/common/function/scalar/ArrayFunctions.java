@@ -140,11 +140,6 @@ public class ArrayFunctions {
   }
 
   @ScalarFunction
-  public static long[] arraySliceLong(long[] values, int start, int end) {
-    return Arrays.copyOfRange(values, start, end);
-  }
-
-  @ScalarFunction
   public static String[] arraySliceString(String[] values, int start, int end) {
     return Arrays.copyOfRange(values, start, end);
   }

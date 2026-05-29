@@ -2329,13 +2329,16 @@ public class MultiStageEngineIntegrationTest extends BaseClusterIntegrationTestS
   }
 
   @Test
-  public void testStageStatsPipelineBreaker() {
-    String query = "select * from mytable "
-        + "WHERE DayOfWeek in (select dayid from daysOfWeek)";
-    // Pipeline breaker stats are kept by default. Retry in case a sibling test that overrode the default has just
-    // finished and the reset has not yet propagated to the server.
-    String errorMsg = "Failed to verify presence of pipeline breaker stats after multiple attempts";
-    TestUtils.waitForCondition(() -> {
+  public void testStageStatsPipelineBreaker()
+      throws Exception {
+    HelixConfigScope scope =
+        new HelixConfigScopeBuilder(HelixConfigScope.ConfigScopeProperty.CLUSTER).forCluster(getHelixClusterName())
+            .build();
+    try {
+      _helixManager.getConfigAccessor()
+          .set(scope, CommonConstants.MultiStageQueryRunner.KEY_OF_SKIP_PIPELINE_BREAKER_STATS, "false");
+      String query = "select * from mytable "
+          + "WHERE DayOfWeek in (select dayid from daysOfWeek)";
       JsonNode response = postQuery(query);
       assertNotNull(response.get("stageStats"), "Should have stage stats");
 
@@ -2349,11 +2352,6 @@ public class MultiStageEngineIntegrationTest extends BaseClusterIntegrationTestS
       Assertions.assertThat(mytableLeaf.get("type").asText()).isEqualTo("LEAF");
       Assertions.assertThat(mytableLeaf.get("table").asText()).isEqualTo("mytable");
 
-      if (mytableLeaf.get("children") == null) {
-        // Sibling test's reset has not yet propagated. Retry.
-        return false;
-      }
-
       JsonNode pipelineReceive = mytableLeaf.get("children").get(0);
       Assertions.assertThat(pipelineReceive.get("type").asText()).isEqualTo("MAILBOX_RECEIVE");
 
@@ -2363,24 +2361,29 @@ public class MultiStageEngineIntegrationTest extends BaseClusterIntegrationTestS
       JsonNode dayOfWeekLeaf = pipelineSend.get("children").get(0);
       Assertions.assertThat(dayOfWeekLeaf.get("type").asText()).isEqualTo("LEAF");
       Assertions.assertThat(dayOfWeekLeaf.get("table").asText()).isEqualTo("daysOfWeek");
-      return true;
-    }, 100, 10_000L, errorMsg, Duration.ofSeconds(1));
+    } finally {
+      _helixManager.getConfigAccessor()
+          .set(scope, CommonConstants.MultiStageQueryRunner.KEY_OF_SKIP_PIPELINE_BREAKER_STATS, "true");
+    }
   }
 
   @Test
-  public void testPipelineBreakerKeepsNumGroupsLimitReached() {
-    String query = ""
-        + "SET numGroupsLimit = 1;"
-        + "SELECT * FROM daysOfWeek "
-        + "WHERE dayid in ("
-        + " SELECT DayOfWeek FROM mytable"
-        + " GROUP BY DayOfWeek"
-        + ")";
+  public void testPipelineBreakerKeepsNumGroupsLimitReached()
+      throws Exception {
+    HelixConfigScope scope =
+        new HelixConfigScopeBuilder(HelixConfigScope.ConfigScopeProperty.CLUSTER).forCluster(getHelixClusterName())
+            .build();
+    try {
+      _helixManager.getConfigAccessor()
+          .set(scope, CommonConstants.MultiStageQueryRunner.KEY_OF_SKIP_PIPELINE_BREAKER_STATS, "false");
+      String query = ""
+          + "SET numGroupsLimit = 1;"
+          + "SELECT * FROM daysOfWeek "
+          + "WHERE dayid in ("
+          + " SELECT DayOfWeek FROM mytable"
+          + " GROUP BY DayOfWeek"
+          + ")";
 
-    // Pipeline breaker stats are kept by default. Retry in case a sibling test that overrode the default has just
-    // finished and the reset has not yet propagated to the server.
-    String errorMsg = "Failed to verify numGroupsLimitReached on a pipeline breaker after multiple attempts";
-    TestUtils.waitForCondition(() -> {
       JsonNode response = postQuery(query);
       assertNotNull(response.get("stageStats"), "Should have stage stats");
 
@@ -2394,11 +2397,6 @@ public class MultiStageEngineIntegrationTest extends BaseClusterIntegrationTestS
       Assertions.assertThat(mytableLeaf.get("type").asText()).isEqualTo("LEAF");
       Assertions.assertThat(mytableLeaf.get("table").asText()).isEqualToIgnoringCase("daysOfWeek");
 
-      if (mytableLeaf.get("children") == null) {
-        // Sibling test's reset has not yet propagated. Retry.
-        return false;
-      }
-
       JsonNode pipelineReceive = mytableLeaf.get("children").get(0);
       Assertions.assertThat(pipelineReceive.get("type").asText()).isEqualTo("MAILBOX_RECEIVE");
 
@@ -2408,46 +2406,36 @@ public class MultiStageEngineIntegrationTest extends BaseClusterIntegrationTestS
       Assertions.assertThat(response.get("numGroupsLimitReached").asBoolean(false))
           .describedAs("numGroupsLimitReached should be true even when the limit is reached on a pipeline breaker")
           .isEqualTo(true);
-      return true;
-    }, 100, 10_000L, errorMsg, Duration.ofSeconds(1));
+    } finally {
+      _helixManager.getConfigAccessor()
+          .set(scope, CommonConstants.MultiStageQueryRunner.KEY_OF_SKIP_PIPELINE_BREAKER_STATS, "true");
+    }
   }
 
   @Test
   public void testPipelineBreakerWithoutKeepingStats() {
-    HelixConfigScope scope =
-        new HelixConfigScopeBuilder(HelixConfigScope.ConfigScopeProperty.CLUSTER).forCluster(getHelixClusterName())
-            .build();
-    try {
-      // Pipeline breaker stats are kept by default, so explicitly skip them for this test.
-      _helixManager.getConfigAccessor()
-          .set(scope, CommonConstants.MultiStageQueryRunner.KEY_OF_SKIP_PIPELINE_BREAKER_STATS, "true");
-      // let's try several times to give helix time to propagate the config change
-      String errorMsg = "Failed to verify absence of pipeline breaker stats after multiple attempts after 10 attempts";
-      TestUtils.waitForCondition(() -> {
-        String query = "select * from mytable "
-            + "WHERE DayOfWeek in (select dayid from daysOfWeek)";
-        JsonNode response = postQuery(query);
-        assertNotNull(response.get("stageStats"), "Should have stage stats");
+    // let's try several times to give helix time to propagate the config change
+    String errorMsg = "Failed to verify absence of pipeline breaker stats after multiple attempts after 10 attempts";
+    TestUtils.waitForCondition(() -> {
+      String query = "select * from mytable "
+          + "WHERE DayOfWeek in (select dayid from daysOfWeek)";
+      JsonNode response = postQuery(query);
+      assertNotNull(response.get("stageStats"), "Should have stage stats");
 
-        JsonNode receiveNode = response.get("stageStats");
-        Assertions.assertThat(receiveNode.get("type").asText()).isEqualTo("MAILBOX_RECEIVE");
+      JsonNode receiveNode = response.get("stageStats");
+      Assertions.assertThat(receiveNode.get("type").asText()).isEqualTo("MAILBOX_RECEIVE");
 
-        JsonNode sendNode = receiveNode.get("children").get(0);
-        Assertions.assertThat(sendNode.get("type").asText()).isEqualTo("MAILBOX_SEND");
+      JsonNode sendNode = receiveNode.get("children").get(0);
+      Assertions.assertThat(sendNode.get("type").asText()).isEqualTo("MAILBOX_SEND");
 
-        JsonNode mytableLeaf = sendNode.get("children").get(0);
-        Assertions.assertThat(mytableLeaf.get("type").asText()).isEqualTo("LEAF");
-        Assertions.assertThat(mytableLeaf.get("table").asText()).isEqualTo("mytable");
+      JsonNode mytableLeaf = sendNode.get("children").get(0);
+      Assertions.assertThat(mytableLeaf.get("type").asText()).isEqualTo("LEAF");
+      Assertions.assertThat(mytableLeaf.get("table").asText()).isEqualTo("mytable");
 
-        // Once the config change has propagated, there should be no children (pipeline breaker stats) under the leaf
-        // node. Return the result instead of asserting so that waitForCondition keeps retrying while the change is
-        // still propagating (AssertionError would not be caught and retried).
-        return mytableLeaf.get("children") == null;
-      }, 100, 10_000L, errorMsg, Duration.ofSeconds(1));
-    } finally {
-      _helixManager.getConfigAccessor()
-          .set(scope, CommonConstants.MultiStageQueryRunner.KEY_OF_SKIP_PIPELINE_BREAKER_STATS, "false");
-    }
+      Assert.assertNull(mytableLeaf.get("children"), "When pipeline breaker stats are not kept, "
+          + "there should be no children under the leaf node");
+      return true;
+    }, 100, 10_000L, errorMsg, Duration.ofSeconds(1));
   }
 
   @AfterClass

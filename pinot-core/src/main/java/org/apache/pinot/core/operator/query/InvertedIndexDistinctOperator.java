@@ -67,30 +67,33 @@ import org.apache.pinot.spi.utils.ByteArray;
 import org.apache.pinot.spi.utils.Pairs;
 import org.roaringbitmap.PeekableIntIterator;
 import org.roaringbitmap.buffer.ImmutableRoaringBitmap;
+import org.roaringbitmap.buffer.MutableRoaringBitmap;
 
 
-/// Inverted-index-based operator for single-column distinct queries on a single segment.
-///
-/// Supports three execution paths, chosen at runtime:
-/// - **Sorted index path**: For sorted columns, merge-iterates filter bitmap against contiguous doc ranges.
-///   Cost ~ `O(cardinality + filteredDocs)`.
-///   Always chosen when the column has a sorted forward index.
-/// - **Bitmap inverted index path**: Iterates dictionary entries and uses inverted index bitmap intersections to check
-///   filter membership. Avoids the projection pipeline entirely.
-///   Chosen by cost heuristic when dictionary cardinality is much smaller than the filtered doc count.
-/// - **Scan path (fallback)**: Uses ProjectOperator + DistinctExecutor to scan filtered docs.
-///   Used when the cost heuristic determines scanning is cheaper.
-///
-/// Enabled via the `useIndexBasedDistinctOperator` query option. The cost ratio can be tuned via the
-/// `invertedIndexDistinctCostRatio` query option; setting it to 0 forces the inverted index path for non-empty filter
-/// results.
+/**
+ * Inverted-index-based operator for single-column distinct queries on a single segment.
+ *
+ * <p>Supports three execution paths, chosen at runtime:
+ * <ul>
+ *   <li><b>Sorted index path</b>: For sorted columns, merge-iterates filter bitmap against contiguous doc ranges.
+ *       Cost ~ O(cardinality + filteredDocs). Always chosen when the column has a sorted forward index.</li>
+ *   <li><b>Bitmap inverted index path</b>: Iterates dictionary entries and uses inverted index bitmap intersections
+ *       to check filter membership. Avoids the projection pipeline entirely. Chosen by cost heuristic when dictionary
+ *       cardinality is much smaller than the filtered doc count.</li>
+ *   <li><b>Scan path (fallback)</b>: Uses ProjectOperator + DistinctExecutor to scan filtered docs.
+ *       Used when the cost heuristic determines scanning is cheaper.</li>
+ * </ul>
+ *
+ * <p>Enabled via the {@code useIndexBasedDistinctOperator} query option. The cost ratio can be tuned
+ * via the {@code invertedIndexDistinctCostRatio} query option; setting it to 0 forces the inverted index path
+ * for non-empty filter results.
+ */
 public class InvertedIndexDistinctOperator extends BaseOperator<DistinctResultsBlock> {
   private static final String EXPLAIN_NAME = "DISTINCT_INVERTED_INDEX";
   private static final String EXPLAIN_NAME_SORTED_INDEX = "DISTINCT_SORTED_INDEX";
   private static final String EXPLAIN_NAME_SCAN_FALLBACK = "DISTINCT";
 
   private final IndexSegment _indexSegment;
-  private final int _totalDocs;
   private final SegmentContext _segmentContext;
   private final QueryContext _queryContext;
   private final BaseFilterOperator _filterOperator;
@@ -102,16 +105,18 @@ public class InvertedIndexDistinctOperator extends BaseOperator<DistinctResultsB
   private BaseProjectOperator<?> _projectOperator;
 
   // Execution tracking
+  private boolean _usedInvertedIndexPath = false;
   private int _numDocsScanned = 0;
+  private int _numEntriesExamined = 0;
   private long _numEntriesScannedInFilter = 0;
-  private int _numEntriesExaminedPostFilter = 0;
 
-  /// Creates an InvertedIndexDistinctOperator. The caller (DistinctPlanNode) must verify that the column has both a
-  /// dictionary and an inverted index before constructing this operator.
+  /**
+   * Creates an InvertedIndexDistinctOperator. The caller (DistinctPlanNode) must verify that the column
+   * has both a dictionary and an inverted index before constructing this operator.
+   */
   public InvertedIndexDistinctOperator(IndexSegment indexSegment, SegmentContext segmentContext,
       QueryContext queryContext, BaseFilterOperator filterOperator, DataSource dataSource) {
     _indexSegment = indexSegment;
-    _totalDocs = indexSegment.getSegmentMetadata().getTotalDocs();
     _segmentContext = segmentContext;
     _queryContext = queryContext;
     _filterOperator = filterOperator;
@@ -122,77 +127,57 @@ public class InvertedIndexDistinctOperator extends BaseOperator<DistinctResultsB
 
   @Override
   protected DistinctResultsBlock getNextBlock() {
-    if (_filterOperator.isResultEmpty()) {
-      return createEmptyResultsBlock();
-    }
-
     // Sorted index: always use the sorted path — O(cardinality + filteredDocs) merge iteration
     if (_invertedIndexReader instanceof SortedIndexReader) {
-      BaseFilterOperator.FilteredDocIds filteredDocIds = _filterOperator.getFilteredDocIds();
-      ImmutableRoaringBitmap docIds = filteredDocIds.getDocIds();
-      _numDocsScanned = docIds != null ? docIds.getCardinality() : _totalDocs;
-      _numEntriesScannedInFilter = filteredDocIds.getNumEntriesScannedInFilter();
-      return executeSortedIndexPath((SortedIndexReader<?>) _invertedIndexReader, docIds);
+      ImmutableRoaringBitmap filteredDocIds = buildFilteredDocIds();
+      _usedInvertedIndexPath = true;
+      return executeSortedIndexPath((SortedIndexReader<?>) _invertedIndexReader, filteredDocIds);
     }
 
-    // Pre-compute the inverted-index-vs-scan threshold so it can also gate the third materialization branch below.
-    // `matchingDocsThreshold == 0` means the user (or the auto-tuned ratio) forces the inverted-index path.
-    Double costRatioOverride = QueryOptionsUtils.getInvertedIndexDistinctCostRatio(_queryContext.getQueryOptions());
-    int dictionaryCardinality = _dictionary.length();
-    double costRatio = costRatioOverride != null ? costRatioOverride : getDefaultCostRatio(dictionaryCardinality);
-    int matchingDocsThreshold = (int) Math.ceil(dictionaryCardinality * costRatio);
+    // Prefer cheap count-only inputs for the heuristic so scan fallback can keep the original filter pipeline.
+    FilterPreparation filterPreparation = prepareBitmapPathInput();
+    Integer filteredDocCount = filterPreparation.getFilteredDocCount();
 
-    // Try to materialize the filter cheaply so the decision below is informed.
-    // - matching-all: no bitmap needed, just use the total doc count.
-    // - canProduceBitmaps: the filter already has bitmaps available, so reducing is cheap.
-    // - threshold==0 (forced inverted-index): eagerly materialize via `getFilteredDocIds()` since
-    //   `executeInvertedIndexPath` needs the bitmap. This branch only fires when neither of the above produced one.
-    // - else (implicit): filter would require expensive evaluation; leave `numMatchingDocs == -1` and fall through to
-    //   the scan path, which evaluates the filter alongside the projection.
-    ImmutableRoaringBitmap matchingDocIds = null;
-    int numMatchingDocs = -1;
-    if (_filterOperator.isResultMatchingAll()) {
-      numMatchingDocs = _totalDocs;
-    } else if (_filterOperator.canProduceBitmaps()) {
-      matchingDocIds = _filterOperator.getBitmaps().reduce();
-      numMatchingDocs = matchingDocIds.getCardinality();
-    } else if (matchingDocsThreshold == 0) {
-      BaseFilterOperator.FilteredDocIds filteredDocIds = _filterOperator.getFilteredDocIds();
-      matchingDocIds = filteredDocIds.getDocIds();
-      numMatchingDocs = matchingDocIds != null ? matchingDocIds.getCardinality() : _totalDocs;
-      _numEntriesScannedInFilter = filteredDocIds.getNumEntriesScannedInFilter();
+    if (filteredDocCount != null) {
+      if (filteredDocCount == 0) {
+        return createEmptyResultsBlock();
+      }
+      // Bitmap inverted index: use cost heuristic to decide
+      if (shouldUseBitmapInvertedIndex(filteredDocCount)) {
+        ImmutableRoaringBitmap filteredDocIds = filterPreparation.getFilteredDocIds();
+        if (filteredDocIds == null) {
+          filteredDocIds = buildFilteredDocIds();
+        }
+        _usedInvertedIndexPath = true;
+        return executeInvertedIndexPath(filteredDocIds);
+      }
     }
-    if (numMatchingDocs == 0) {
-      return createEmptyResultsBlock();
-    }
-    // `numMatchingDocs == -1` (no cheap materialization, threshold > 0) makes this comparison false, so the scan path
-    // is selected. For the explicit-force case (threshold == 0), the comparison is always true once the count is known.
-    if (numMatchingDocs >= matchingDocsThreshold) {
-      _numDocsScanned = numMatchingDocs;
-      return executeInvertedIndexPath(matchingDocIds);
-    }
-    return executeScanPath(matchingDocIds);
+    return executeScanPath(filterPreparation.getFilteredDocIds());
   }
 
   // ==================== Cost Heuristic ====================
 
-  /// Default cost ratios for the inverted-index-based distinct heuristic, keyed by dictionary cardinality threshold.
-  /// The inverted index path is chosen when `dictionaryCardinality * costRatio <= filteredDocCount`.
-  ///
-  /// The cost ratio accounts for the per-entry bitmap intersection cost relative to the per-doc scan cost.
-  /// For low-cardinality dictionaries, each bitmap is dense and `intersects()` is fast, but there are few entries so
-  /// any unnecessary intersection is relatively expensive vs. scanning a small filtered doc set.
-  /// For high-cardinality dictionaries, bitmaps are sparser and `intersects()` is slower per entry, but the scan path
-  /// also becomes cheaper (fewer docs per value), so a lower ratio suffices.
-  ///
-  /// Benchmarking (BenchmarkInvertedIndexDistinct, 1M docs) shows the crossover points:
-  /// - dictCard ≤ 1K:  costRatio=30 — inverted index wins when filteredDocs ≥ ~30x dictCard
-  /// - dictCard ≤ 10K: costRatio=10 — inverted index wins when filteredDocs ≥ ~10x dictCard
-  /// - dictCard > 10K: costRatio=6  — inverted index wins when filteredDocs ≥ ~6x dictCard
-  ///
-  /// Can be overridden at query time via the query option `invertedIndexDistinctCostRatio`. Setting it to 0 forces the
-  /// inverted index path for non-empty filter results.
-  private static final NavigableMap<Integer, Double> DEFAULT_COST_RATIO_BY_CARDINALITY;
+  /**
+   * Default cost ratios for the inverted-index-based distinct heuristic, keyed by dictionary cardinality threshold.
+   * The inverted index path is chosen when {@code dictionaryCardinality * costRatio <= filteredDocCount}.
+   *
+   * <p>The cost ratio accounts for the per-entry bitmap intersection cost relative to the per-doc scan cost.
+   * For low-cardinality dictionaries, each bitmap is dense and {@code intersects()} is fast, but there are few
+   * entries so any unnecessary intersection is relatively expensive vs. scanning a small filtered doc set.
+   * For high-cardinality dictionaries, bitmaps are sparser and {@code intersects()} is slower per entry,
+   * but the scan path also becomes cheaper (fewer docs per value), so a lower ratio suffices.
+   *
+   * <p>Benchmarking (BenchmarkInvertedIndexDistinct, 1M docs) shows the crossover points:
+   * <ul>
+   *   <li>dictCard &le; 1K:  costRatio=30 — inverted index wins when filteredDocs &ge; ~30x dictCard</li>
+   *   <li>dictCard &le; 10K: costRatio=10 — inverted index wins when filteredDocs &ge; ~10x dictCard</li>
+   *   <li>dictCard &gt; 10K: costRatio=6  — inverted index wins when filteredDocs &ge; ~6x dictCard</li>
+   * </ul>
+   *
+   * <p>Can be overridden at query time via the query option {@code invertedIndexDistinctCostRatio}. Setting it
+   * to 0 forces the inverted index path for non-empty filter results.
+   */
+  static final NavigableMap<Integer, Double> DEFAULT_COST_RATIO_BY_CARDINALITY;
 
   static {
     TreeMap<Integer, Double> map = new TreeMap<>();
@@ -206,15 +191,72 @@ public class InvertedIndexDistinctOperator extends BaseOperator<DistinctResultsB
     return DEFAULT_COST_RATIO_BY_CARDINALITY.floorEntry(dictionaryCardinality).getValue();
   }
 
+  private boolean shouldUseBitmapInvertedIndex(int filteredDocCount) {
+    if (filteredDocCount == 0) {
+      return false;
+    }
+    Double costRatioOverride = QueryOptionsUtils.getInvertedIndexDistinctCostRatio(_queryContext.getQueryOptions());
+    if (costRatioOverride != null && costRatioOverride == 0.0) {
+      return true;
+    }
+    int dictionaryCardinality = _dictionary.length();
+    double costRatio = costRatioOverride != null ? costRatioOverride : getDefaultCostRatio(dictionaryCardinality);
+    return (double) dictionaryCardinality * costRatio <= filteredDocCount;
+  }
+
+  static final class FilterPreparation {
+    @Nullable
+    private final ImmutableRoaringBitmap _filteredDocIds;
+    @Nullable
+    private final Integer _filteredDocCount;
+
+    private FilterPreparation(@Nullable ImmutableRoaringBitmap filteredDocIds, @Nullable Integer filteredDocCount) {
+      _filteredDocIds = filteredDocIds;
+      _filteredDocCount = filteredDocCount;
+    }
+
+    @Nullable
+    ImmutableRoaringBitmap getFilteredDocIds() {
+      return _filteredDocIds;
+    }
+
+    @Nullable
+    Integer getFilteredDocCount() {
+      return _filteredDocCount;
+    }
+  }
+
+  FilterPreparation prepareBitmapPathInput() {
+    int totalDocs = _indexSegment.getSegmentMetadata().getTotalDocs();
+    if (_filterOperator.isResultMatchingAll()) {
+      return new FilterPreparation(null, totalDocs);
+    }
+    if (_filterOperator.isResultEmpty()) {
+      return new FilterPreparation(new MutableRoaringBitmap(), 0);
+    }
+    // Prefer the cheaper exact count when available so scan fallback does not pay eager bitmap materialization.
+    if (_filterOperator.canOptimizeCount()) {
+      return new FilterPreparation(null, _filterOperator.getNumMatchingDocs());
+    }
+    if (_filterOperator.canProduceBitmaps()) {
+      ImmutableRoaringBitmap filteredDocIds = _filterOperator.getBitmaps().reduce();
+      return new FilterPreparation(filteredDocIds, filteredDocIds.getCardinality());
+    }
+    return new FilterPreparation(null, null);
+  }
+
   // ==================== Scan Path (Fallback) ====================
 
-  /// Scan fallback: uses ProjectOperator + DistinctExecutor. When an exact filter bitmap is already cheaply available,
-  /// wraps it in a [BitmapBasedFilterOperator] to avoid re-evaluating the filter through the projection pipeline.
-  /// Otherwise, preserves the original filter operator so scan fallback does not pay eager bitmap materialization.
+  /**
+   * Scan fallback: uses ProjectOperator + DistinctExecutor. When an exact filter bitmap is already cheaply available,
+   * wraps it in a {@link BitmapBasedFilterOperator} to avoid re-evaluating the filter through the projection pipeline.
+   * Otherwise preserves the original filter operator so scan fallback does not pay eager bitmap materialization.
+   */
   private DistinctResultsBlock executeScanPath(@Nullable ImmutableRoaringBitmap filteredDocIds) {
     BaseFilterOperator filterOp;
     if (filteredDocIds != null) {
-      filterOp = new BitmapBasedFilterOperator(filteredDocIds, false, _totalDocs);
+      filterOp = new BitmapBasedFilterOperator(filteredDocIds, false,
+          _indexSegment.getSegmentMetadata().getTotalDocs());
     } else {
       filterOp = _filterOperator;
     }
@@ -233,8 +275,10 @@ public class InvertedIndexDistinctOperator extends BaseOperator<DistinctResultsB
 
   // ==================== Sorted Index Path ====================
 
-  /// Optimized path for sorted columns. Each dictId maps to a contiguous doc range [start,end].
-  /// We merge-iterate the filter bitmap with the sorted ranges in O(cardinality + filteredDocs).
+  /**
+   * Optimized path for sorted columns. Each dictId maps to a contiguous doc range [start, end].
+   * We merge-iterate the filter bitmap with the sorted ranges in O(cardinality + filteredDocs).
+   */
   private DistinctResultsBlock executeSortedIndexPath(SortedIndexReader<?> sortedReader,
       @Nullable ImmutableRoaringBitmap filteredDocIds) {
     OrderByExpressionContext orderByExpression =
@@ -256,12 +300,13 @@ public class InvertedIndexDistinctOperator extends BaseOperator<DistinctResultsB
 
     if (nonNullFilteredDocIds == null) {
       // No filter, no null exclusion — every dictionary value is present
+      int entriesExamined = 0;
       int start = iterateReverse ? dictLength - 1 : 0;
       int end = iterateReverse ? -1 : dictLength;
       int step = iterateReverse ? -1 : 1;
       for (int dictId = start; dictId != end; dictId += step) {
-        QueryThreadContext.checkTerminationAndSampleUsagePeriodically(_numEntriesExaminedPostFilter++,
-            EXPLAIN_NAME_SORTED_INDEX);
+        QueryThreadContext.checkTerminationAndSampleUsagePeriodically(entriesExamined, EXPLAIN_NAME_SORTED_INDEX);
+        entriesExamined++;
         if (dictId == nullResult._nullPlaceholderDictId) {
           continue;
         }
@@ -270,40 +315,50 @@ public class InvertedIndexDistinctOperator extends BaseOperator<DistinctResultsB
           break;
         }
       }
+      _numEntriesExamined = entriesExamined;
     } else if (!nonNullFilteredDocIds.isEmpty()) {
       if (iterateReverse) {
-        // DESC + LIMIT: iterate dictIds backward, use intersects for presence check. Each dictId maps to a contiguous
-        // doc range; intersects short-circuits on the first matching container.
+        // DESC + LIMIT: iterate dictIds backward, use rangeCardinality for presence check.
+        // Each dictId maps to a contiguous doc range, so rangeCardinality is O(1) per check.
+        int entriesExamined = 0;
         for (int dictId = dictLength - 1; dictId >= 0; dictId--) {
-          QueryThreadContext.checkTerminationAndSampleUsagePeriodically(_numEntriesExaminedPostFilter++,
-              EXPLAIN_NAME_SORTED_INDEX);
+          QueryThreadContext.checkTerminationAndSampleUsagePeriodically(entriesExamined, EXPLAIN_NAME_SORTED_INDEX);
+          entriesExamined++;
           Pairs.IntPair range = sortedReader.getDocIds(dictId);
           int startDocId = range.getLeft();
           int endDocId = range.getRight(); // inclusive
-          if (nonNullFilteredDocIds.intersects(startDocId, endDocId + 1L)) {
+          if (nonNullFilteredDocIds.rangeCardinality(startDocId, endDocId + 1L) > 0) {
             if (addDistinctValue(distinctTable, dictId, orderByExpression, true)) {
               break;
             }
           }
         }
+        _numEntriesExamined = entriesExamined;
       } else {
-        // ASC or no ORDER BY: merge-iterate forward (O(cardinality + filteredDocs)). Sorted-index ranges are
-        // contiguous over [0, numDocs), and we advance the filter iterator past `endDocId` after each match, so
-        // `peekNext()` is always >= the current dictId's `startDocId` at the top of each iteration.
+        // ASC or no ORDER BY: merge-iterate forward (O(cardinality + filteredDocs))
         PeekableIntIterator filterIter = nonNullFilteredDocIds.getIntIterator();
-        for (int dictId = 0; dictId < dictLength && filterIter.hasNext(); dictId++) {
-          QueryThreadContext.checkTerminationAndSampleUsagePeriodically(_numEntriesExaminedPostFilter++,
-              EXPLAIN_NAME_SORTED_INDEX);
-          int endDocId = sortedReader.getDocIds(dictId).getRight(); // inclusive
-          if (filterIter.peekNext() <= endDocId) {
+        int dictId;
+        for (dictId = 0; dictId < dictLength && filterIter.hasNext(); dictId++) {
+          QueryThreadContext.checkTerminationAndSampleUsagePeriodically(dictId, EXPLAIN_NAME_SORTED_INDEX);
+          Pairs.IntPair range = sortedReader.getDocIds(dictId);
+          int startDocId = range.getLeft();
+          int endDocId = range.getRight(); // inclusive
+
+          // Skip filter docs before this range
+          filterIter.advanceIfNeeded(startDocId);
+
+          // Check if any non-null filter doc falls within this range
+          if (filterIter.hasNext() && filterIter.peekNext() <= endDocId) {
             boolean done = addDistinctValue(distinctTable, dictId, orderByExpression, orderedEarlyTermination);
             if (done) {
+              _numEntriesExamined = dictId + 1;
               return new DistinctResultsBlock(convertDistinctTable(distinctTable, nullResult._hasNull), _queryContext);
             }
-            // Advance past the current range so the next iteration's peekNext() is >= the next dictId's startDocId.
+            // Advance past the current range for next dictId
             filterIter.advanceIfNeeded(endDocId + 1);
           }
         }
+        _numEntriesExamined = dictId;
       }
     }
 
@@ -330,11 +385,14 @@ public class InvertedIndexDistinctOperator extends BaseOperator<DistinctResultsB
     boolean orderedEarlyTermination = useDictIdTable && orderByExpression != null && distinctTable.hasLimit();
     boolean iterateReverse = orderedEarlyTermination && !orderByExpression.isAsc();
 
+    int entriesExamined = 0;
     int start = iterateReverse ? dictLength - 1 : 0;
     int end = iterateReverse ? -1 : dictLength;
     int step = iterateReverse ? -1 : 1;
+
     for (int dictId = start; dictId != end; dictId += step) {
-      QueryThreadContext.checkTerminationAndSampleUsagePeriodically(_numEntriesExaminedPostFilter++, EXPLAIN_NAME);
+      QueryThreadContext.checkTerminationAndSampleUsagePeriodically(entriesExamined, EXPLAIN_NAME);
+      entriesExamined++;
       if (dictId == nullResult._nullPlaceholderDictId) {
         continue;
       }
@@ -361,8 +419,16 @@ public class InvertedIndexDistinctOperator extends BaseOperator<DistinctResultsB
         }
       }
     }
+    _numEntriesExamined = entriesExamined;
 
     return new DistinctResultsBlock(convertDistinctTable(distinctTable, nullResult._hasNull), _queryContext);
+  }
+
+  @Nullable
+  private ImmutableRoaringBitmap buildFilteredDocIds() {
+    BaseFilterOperator.FilteredDocIds filteredDocIds = _filterOperator.getFilteredDocIds();
+    _numEntriesScannedInFilter = filteredDocIds.getNumEntriesScannedInFilter();
+    return filteredDocIds.getDocIds();
   }
 
   private boolean canUseDictIdDistinctTable(@Nullable OrderByExpressionContext orderByExpression) {
@@ -539,12 +605,14 @@ public class InvertedIndexDistinctOperator extends BaseOperator<DistinctResultsB
 
   // ==================== Null Handling ====================
 
-  /// Processes null handling for the filter bitmap. Returns the filter bitmap with null docs excluded and whether any
-  /// filtered docs have null values.
-  ///
-  /// Nulls are not in the dictionary, so they must be checked separately via the null value vector.
-  /// The null placeholder value (e.g., `Integer.MIN_VALUE`) is excluded from dictionary iteration by removing null docs
-  /// from the filter bitmap.
+  /**
+   * Processes null handling for the filter bitmap. Returns the filter bitmap with null docs excluded
+   * and whether any filtered docs have null values.
+   *
+   * <p>Nulls are not in the dictionary, so they must be checked separately via the null value vector.
+   * The null placeholder value (e.g., Integer.MIN_VALUE) is excluded from dictionary iteration by
+   * removing null docs from the filter bitmap.
+   */
   private NullFilterResult processNullDocs(@Nullable ImmutableRoaringBitmap filteredDocIds) {
     if (!_queryContext.isNullHandlingEnabled()) {
       return new NullFilterResult(filteredDocIds, false, Dictionary.NULL_VALUE_INDEX);
@@ -565,7 +633,6 @@ public class InvertedIndexDistinctOperator extends BaseOperator<DistinctResultsB
     if (filteredDocIds == null) {
       // Preserve match-all to avoid materializing a dense complement bitmap. Instead skip the null placeholder dictId
       // while iterating dictionary values.
-      // TODO: This will count all default null values as null, regardless of whether they are actually nulls.
       nonNullFilteredDocIds = null;
       nullPlaceholderDictId = getNullPlaceholderDictId();
     } else {
@@ -613,7 +680,13 @@ public class InvertedIndexDistinctOperator extends BaseOperator<DistinctResultsB
 
   @Override
   public List<? extends Operator> getChildOperators() {
-    return _projectOperator != null ? List.of(_projectOperator) : List.of(_filterOperator);
+    // If scan fallback was used, the project operator is the logical child
+    if (_projectOperator != null && !_usedInvertedIndexPath) {
+      return Collections.singletonList(_projectOperator);
+    }
+    // For inverted/sorted index paths (or before execution in EXPLAIN plans),
+    // the filter operator is the logical child.
+    return Collections.singletonList(_filterOperator);
   }
 
   @Override
@@ -623,17 +696,21 @@ public class InvertedIndexDistinctOperator extends BaseOperator<DistinctResultsB
 
   @Override
   public ExecutionStatistics getExecutionStatistics() {
-    if (_projectOperator == null) {
-      // For inverted/sorted index paths:
-      // - numDocsScanned tracks the matching docs
-      // - numEntriesScannedInFilter tracks work done while materializing the exact filter bitmap
-      // - numEntriesScannedPostFilter tracks dictionary entries examined
-      return new ExecutionStatistics(_numDocsScanned, _numEntriesScannedInFilter, _numEntriesExaminedPostFilter,
-          _totalDocs);
+    int numTotalDocs = _indexSegment.getSegmentMetadata().getTotalDocs();
+    if (_usedInvertedIndexPath || _projectOperator == null) {
+      // For inverted/sorted index paths: numDocsScanned=0 (no forward index lookups),
+      // numEntriesScannedInFilter tracks work done while materializing the exact filter bitmap,
+      // numEntriesScannedPostFilter=numEntriesExamined (dictionary entries examined via bitmap
+      // intersection or sorted range checks).
+      return new ExecutionStatistics(0, _numEntriesScannedInFilter, _numEntriesExamined, numTotalDocs);
     }
+    // _numEntriesScannedInFilter captures filter work from exact bitmap materialization (non-zero only when
+    // the filter could not produce bitmaps directly). The project operator's stats capture any additional
+    // filter work (zero when using a pre-built BitmapBasedFilterOperator).
+    long numEntriesScannedInFilter = _numEntriesScannedInFilter
+        + _projectOperator.getExecutionStatistics().getNumEntriesScannedInFilter();
     // Single-column distinct, so numEntriesScannedPostFilter equals numDocsScanned
-    return new ExecutionStatistics(_numDocsScanned,
-        _projectOperator.getExecutionStatistics().getNumEntriesScannedInFilter(), _numDocsScanned, _totalDocs);
+    return new ExecutionStatistics(_numDocsScanned, numEntriesScannedInFilter, _numDocsScanned, numTotalDocs);
   }
 
   private String resolveExplainName() {
@@ -642,7 +719,11 @@ public class InvertedIndexDistinctOperator extends BaseOperator<DistinctResultsB
       return EXPLAIN_NAME_SORTED_INDEX;
     }
     // After execution, if scan fallback was used, report it accurately
-    return _projectOperator != null ? EXPLAIN_NAME_SCAN_FALLBACK : EXPLAIN_NAME;
+    if (_projectOperator != null && !_usedInvertedIndexPath) {
+      return EXPLAIN_NAME_SCAN_FALLBACK;
+    }
+    // Default: inverted index path (correct both pre-execution and post-execution)
+    return EXPLAIN_NAME;
   }
 
   @Override

@@ -58,7 +58,7 @@ import org.apache.pinot.spi.utils.JsonUtils;
     "explainPlanNumEmptyFilterSegments", "explainPlanNumMatchAllFilterSegments", "traceInfo", "tablesQueried",
     "offlineThreadMemAllocatedBytes", "realtimeThreadMemAllocatedBytes", "offlineResponseSerMemAllocatedBytes",
     "realtimeResponseSerMemAllocatedBytes", "offlineTotalMemAllocatedBytes", "realtimeTotalMemAllocatedBytes",
-    "pools", "rlsFiltersApplied", "groupsTrimmed", "materializedViewQueried", "serverStats"
+    "pools", "rlsFiltersApplied", "groupsTrimmed", "materializedViewQueried"
 })
 @JsonIgnoreProperties(ignoreUnknown = true)
 public class BrokerResponseNative implements BrokerResponse {
@@ -125,9 +125,6 @@ public class BrokerResponseNative implements BrokerResponse {
 
   @Nullable
   private String _materializedViewQueried;
-
-  @Nullable
-  private String _serverStats;
 
   public BrokerResponseNative() {
   }
@@ -651,17 +648,5 @@ public class BrokerResponseNative implements BrokerResponse {
   @Override
   public String getMaterializedViewQueried() {
     return _materializedViewQueried;
-  }
-
-  @JsonProperty("serverStats")
-  public void setServerStats(@Nullable String serverStats) {
-    _serverStats = serverStats;
-  }
-
-  @Nullable
-  @JsonProperty("serverStats")
-  @JsonInclude(JsonInclude.Include.NON_NULL)
-  public String getServerStats() {
-    return _serverStats;
   }
 }

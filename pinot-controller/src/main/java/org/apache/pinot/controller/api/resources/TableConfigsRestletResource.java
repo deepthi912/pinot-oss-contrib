@@ -198,7 +198,8 @@ public class TableConfigsRestletResource {
   @ManualAuthorization // performed after parsing table configs
   public ConfigSuccessResponse addConfig(
       String tableConfigsStr,
-      @ApiParam(value = "comma separated list of validation type(s) to skip. supported types: (ALL|TASK|UPSERT)")
+      @ApiParam(value = "comma separated list of validation type(s) to skip. supported types: "
+          + "(ALL|TASK|UPSERT|TENANT|MINION_INSTANCES|ACTIVE_TASKS)")
       @QueryParam("validationTypesToSkip") @Nullable String typesToSkip,
       @DefaultValue("false") @QueryParam("ignoreActiveTasks") boolean ignoreActiveTasks,
       @Context HttpHeaders httpHeaders, @Context Request request)
@@ -365,7 +366,8 @@ public class TableConfigsRestletResource {
   public ConfigSuccessResponse updateConfig(
       @ApiParam(value = "TableConfigs name i.e. raw table name", required = true) @PathParam("tableName")
       String tableName,
-      @ApiParam(value = "comma separated list of validation type(s) to skip. supported types: (ALL|TASK|UPSERT)")
+      @ApiParam(value = "comma separated list of validation type(s) to skip. supported types: "
+          + "(ALL|TASK|UPSERT|TENANT|MINION_INSTANCES|ACTIVE_TASKS)")
       @QueryParam("validationTypesToSkip") @Nullable String typesToSkip,
       @ApiParam(value = "Reload the table if the new schema is backward compatible") @DefaultValue("false")
       @QueryParam("reload") boolean reload,
@@ -514,25 +516,6 @@ public class TableConfigsRestletResource {
     String rawTableName = DatabaseUtils.translateTableName(tableConfigs.getTableName(), databaseName);
     tableConfigs.setTableName(rawTableName);
 
-    // Cluster-aware validations are exclusive to the validate/tune pre-flight endpoints so that users get fail-fast
-    // feedback on tenant/minion/active-task issues without re-running them in the create/update paths (which already
-    // perform the equivalent checks inline or via PinotHelixResourceManager).
-    Set<TableConfigUtils.ValidationType> skipTypes = TableConfigUtils.parseTypesToSkipString(typesToSkip);
-    try {
-      if (tableConfigs.getOffline() != null) {
-        validateClusterAwareConfig(tableConfigs.getOffline(), skipTypes);
-      }
-      if (tableConfigs.getRealtime() != null) {
-        validateClusterAwareConfig(tableConfigs.getRealtime(), skipTypes);
-      }
-    } catch (ControllerApplicationException e) {
-      // Already logged by the inner constructor; let it propagate as-is.
-      throw e;
-    } catch (Exception e) {
-      throw new ControllerApplicationException(LOGGER,
-          String.format("Invalid TableConfigs: %s. %s", rawTableName, e.getMessage()), Response.Status.BAD_REQUEST, e);
-    }
-
     // validate permission
     String endpointUrl = request.getRequestURL().toString();
     AccessControl accessControl = _accessControlFactory.create();
@@ -541,21 +524,6 @@ public class TableConfigsRestletResource {
       throw new ControllerApplicationException(LOGGER, "Permission denied", Response.Status.FORBIDDEN);
     }
     return tableConfigsAndUnrecognizedProps;
-  }
-
-  private void validateClusterAwareConfig(TableConfig tableConfig, Set<TableConfigUtils.ValidationType> skipTypes) {
-    if (skipTypes.contains(TableConfigUtils.ValidationType.ALL)) {
-      return;
-    }
-    if (!skipTypes.contains(TableConfigUtils.ValidationType.TENANT)) {
-      _pinotHelixResourceManager.validateTableTenantConfig(tableConfig);
-    }
-    if (!skipTypes.contains(TableConfigUtils.ValidationType.MINION_INSTANCES)) {
-      _pinotHelixResourceManager.validateTableTaskMinionInstanceTagConfig(tableConfig);
-    }
-    if (!skipTypes.contains(TableConfigUtils.ValidationType.ACTIVE_TASKS)) {
-      PinotTableRestletResource.tableTasksValidation(tableConfig, _pinotHelixTaskResourceManager);
-    }
   }
 
   private void applyTuning(TableConfig tableConfig, Schema schema) {
@@ -585,6 +553,8 @@ public class TableConfigsRestletResource {
       Preconditions.checkState(rawTableName.equals(schemaName),
           "'tableName': %s must be equal to 'schemaName' from 'schema': %s", rawTableName, schema.getSchemaName());
       SchemaUtils.validate(schema);
+      // Parse validation types to skip using TableConfigUtils method
+      Set<TableConfigUtils.ValidationType> skipTypes = TableConfigUtils.parseTypesToSkipString(typesToSkip);
       if (offlineTableConfig != null) {
         String offlineRawTableName = DatabaseUtils.translateTableName(
             TableNameBuilder.extractRawTableName(offlineTableConfig.getTableName()), database);
@@ -592,6 +562,17 @@ public class TableConfigsRestletResource {
             "Name in 'offline' table config: %s must be equal to 'tableName': %s", offlineRawTableName, rawTableName);
         TableConfigUtils.validateTableName(offlineTableConfig);
         TableConfigUtils.validate(offlineTableConfig, schema, typesToSkip);
+        if (!skipTypes.contains(TableConfigUtils.ValidationType.ALL)) {
+          if (!skipTypes.contains(TableConfigUtils.ValidationType.TENANT)) {
+            _pinotHelixResourceManager.validateTableTenantConfig(offlineTableConfig);
+          }
+          if (!skipTypes.contains(TableConfigUtils.ValidationType.MINION_INSTANCES)) {
+            _pinotHelixResourceManager.validateTableTaskMinionInstanceTagConfig(offlineTableConfig);
+          }
+          if (!skipTypes.contains(TableConfigUtils.ValidationType.ACTIVE_TASKS)) {
+            PinotTableRestletResource.tableTasksValidation(offlineTableConfig, _pinotHelixTaskResourceManager);
+          }
+        }
         TaskConfigUtils.validateTaskConfigs(tableConfigs.getOffline(), schema, _pinotTaskManager, typesToSkip);
         TableConfigValidatorRegistry.validate(offlineTableConfig, schema);
       }
@@ -602,6 +583,17 @@ public class TableConfigsRestletResource {
             "Name in 'realtime' table config: %s must be equal to 'tableName': %s", realtimeRawTableName, rawTableName);
         TableConfigUtils.validateTableName(realtimeTableConfig);
         TableConfigUtils.validate(realtimeTableConfig, schema, typesToSkip);
+        if (!skipTypes.contains(TableConfigUtils.ValidationType.ALL)) {
+          if (!skipTypes.contains(TableConfigUtils.ValidationType.TENANT)) {
+            _pinotHelixResourceManager.validateTableTenantConfig(realtimeTableConfig);
+          }
+          if (!skipTypes.contains(TableConfigUtils.ValidationType.MINION_INSTANCES)) {
+            _pinotHelixResourceManager.validateTableTaskMinionInstanceTagConfig(realtimeTableConfig);
+          }
+          if (!skipTypes.contains(TableConfigUtils.ValidationType.ACTIVE_TASKS)) {
+            PinotTableRestletResource.tableTasksValidation(realtimeTableConfig, _pinotHelixTaskResourceManager);
+          }
+        }
         TaskConfigUtils.validateTaskConfigs(tableConfigs.getRealtime(), schema, _pinotTaskManager, typesToSkip);
         TableConfigValidatorRegistry.validate(realtimeTableConfig, schema);
       }

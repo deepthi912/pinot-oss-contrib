@@ -1022,9 +1022,6 @@ public abstract class BaseSingleStageBrokerRequestHandler extends BaseBrokerRequ
 
     brokerResponse.setRLSFiltersApplied(rlsFiltersApplied.get());
 
-    // Record per-server stats on the SSE BrokerResponse so downstream consumers can read it.
-    brokerResponse.setServerStats(serverStats.getServerStats());
-
     // Log query and stats
     _queryLogger.logQueryCompleted(
         new QueryLogger.QueryLogParams(requestContext, tableName, brokerResponse,
@@ -2400,8 +2397,6 @@ public abstract class BaseSingleStageBrokerRequestHandler extends BaseBrokerRequ
     viewSplitResponse.setTimeUsedMs(totalTimeMs);
     augmentStatistics(requestContext, viewSplitResponse);
     viewSplitResponse.setRLSFiltersApplied(rlsFiltersApplied);
-    // Record per-server stats on the SSE BrokerResponse so downstream consumers can read it.
-    viewSplitResponse.setServerStats(serverStats.getServerStats());
     _queryLogger.logQueryCompleted(
         new QueryLogger.QueryLogParams(requestContext, tableName, viewSplitResponse,
             QueryLogger.QueryLogParams.QueryEngine.SINGLE_STAGE, requesterIdentity, serverStats),

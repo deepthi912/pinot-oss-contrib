@@ -44,28 +44,26 @@ public class PredicateEvaluatorProvider {
   /// Builds a [PredicateEvaluator] for a leaf filter on the column backed by `dataSource`. The dictionary is derived
   /// via [#getDictionaryUsableForFiltering], which keeps it only when a dict-consuming filter operator (inverted /
   /// exact range) will actually run for this predicate type on the column's forward-index encoding. The data type is
-  /// taken from the data-source metadata. For REGEXP_LIKE, the FST/IFST text index (when present) is consulted here
-  /// — the upgrade happens only when the dictionary is usable, so no evaluator is built and discarded.
+  /// taken from the data-source metadata.
   public static PredicateEvaluator getPredicateEvaluator(Predicate predicate, DataSource dataSource,
       QueryContext queryContext) {
     Dictionary dictionary = getDictionaryUsableForFiltering(dataSource, queryContext, predicate);
     DataType dataType = dataSource.getDataSourceMetadata().getDataType();
-    return buildEvaluator(predicate, dictionary, dataType, queryContext, dataSource);
+    return buildEvaluator(predicate, dictionary, dataType, queryContext);
   }
 
   /// Builds a [PredicateEvaluator] when the value source and `dictionary` are already in sync by construction: when
   /// `dictionary` is non-null the source produces dict ids decodable by that dictionary; when `dictionary` is null
   /// the source produces raw values. No gating logic runs — the dictionary (if any) is taken as-is, so the caller is
-  /// responsible for the match. FST/IFST evaluators are not considered here since this overload has no `DataSource`
-  /// to read text indexes from.
+  /// responsible for the match.
   // TODO: Always pass in query context
   public static PredicateEvaluator getPredicateEvaluator(Predicate predicate, @Nullable Dictionary dictionary,
       DataType dataType, @Nullable QueryContext queryContext) {
-    return buildEvaluator(predicate, dictionary, dataType, queryContext, null);
+    return buildEvaluator(predicate, dictionary, dataType, queryContext);
   }
 
   private static PredicateEvaluator buildEvaluator(Predicate predicate, @Nullable Dictionary dictionary,
-      DataType dataType, @Nullable QueryContext queryContext, @Nullable DataSource dataSource) {
+      DataType dataType, @Nullable QueryContext queryContext) {
     try {
       if (dictionary != null) {
         // dictionary based predicate evaluators
@@ -85,23 +83,9 @@ public class PredicateEvaluatorProvider {
           case RANGE:
             return RangePredicateEvaluatorFactory.newDictionaryBasedEvaluator((RangePredicate) predicate, dictionary,
                 dataType);
-          case REGEXP_LIKE: {
-            // Prefer FST/IFST text index when present on the data source; otherwise fall back to the generic
-            // dict-based evaluator (dict-id scan or eager dict iteration).
-            RegexpLikePredicate regexpLike = (RegexpLikePredicate) predicate;
-            if (dataSource != null) {
-              if (regexpLike.isCaseInsensitive() && dataSource.getIFSTIndex() != null) {
-                return IFSTBasedRegexpPredicateEvaluatorFactory.newIFSTBasedEvaluator(regexpLike,
-                    dataSource.getIFSTIndex(), dictionary);
-              }
-              if (!regexpLike.isCaseInsensitive() && dataSource.getFSTIndex() != null) {
-                return FSTBasedRegexpPredicateEvaluatorFactory.newFSTBasedEvaluator(regexpLike,
-                    dataSource.getFSTIndex(), dictionary);
-              }
-            }
-            return RegexpLikePredicateEvaluatorFactory.newDictionaryBasedEvaluator(regexpLike, dictionary, dataType,
-                queryContext);
-          }
+          case REGEXP_LIKE:
+            return RegexpLikePredicateEvaluatorFactory.newDictionaryBasedEvaluator((RegexpLikePredicate) predicate,
+                dictionary, dataType, queryContext);
           default:
             throw new UnsupportedOperationException("Unsupported predicate type: " + predicate.getType());
         }

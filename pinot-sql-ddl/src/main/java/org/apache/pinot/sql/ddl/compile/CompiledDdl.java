@@ -41,9 +41,7 @@ public abstract class CompiledDdl {
     return _operation;
   }
 
-  /// Database name from `db.table` or `SHOW TABLES FROM db` / `SHOW MATERIALIZED VIEWS FROM db`;
-  /// may be `null` when no database qualifier is present at the DDL layer (the controller then
-  /// falls back to the `Database` HTTP header and finally to `DEFAULT_DATABASE`).
+  /// Database name from `db.table` or `SHOW TABLES FROM db`; may be `null`.
   @Nullable
   public String getDatabaseName() {
     return _databaseName;

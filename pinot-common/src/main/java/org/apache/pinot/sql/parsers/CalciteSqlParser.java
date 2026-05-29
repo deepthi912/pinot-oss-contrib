@@ -67,13 +67,9 @@ import org.apache.pinot.segment.spi.AggregationFunctionType;
 import org.apache.pinot.sql.FilterKind;
 import org.apache.pinot.sql.parsers.parser.SqlInsertFromFile;
 import org.apache.pinot.sql.parsers.parser.SqlParserImpl;
-import org.apache.pinot.sql.parsers.parser.SqlPinotCreateMaterializedView;
 import org.apache.pinot.sql.parsers.parser.SqlPinotCreateTable;
-import org.apache.pinot.sql.parsers.parser.SqlPinotDropMaterializedView;
 import org.apache.pinot.sql.parsers.parser.SqlPinotDropTable;
-import org.apache.pinot.sql.parsers.parser.SqlPinotShowCreateMaterializedView;
 import org.apache.pinot.sql.parsers.parser.SqlPinotShowCreateTable;
-import org.apache.pinot.sql.parsers.parser.SqlPinotShowMaterializedViews;
 import org.apache.pinot.sql.parsers.parser.SqlPinotShowTables;
 import org.apache.pinot.sql.parsers.rewriter.QueryRewriter;
 import org.apache.pinot.sql.parsers.rewriter.QueryRewriterFactory;
@@ -146,17 +142,11 @@ public class CalciteSqlParser {
         } else {
           throw new SqlCompilationException("SqlNode with executable statement already exist with type: " + sqlType);
         }
-      } else if (sqlNode instanceof SqlPinotShowTables
-          || sqlNode instanceof SqlPinotShowMaterializedViews
-          || sqlNode instanceof SqlPinotCreateTable
-          || sqlNode instanceof SqlPinotShowCreateTable
+      } else if (sqlNode instanceof SqlPinotCreateTable
           || sqlNode instanceof SqlPinotDropTable
-          || sqlNode instanceof SqlPinotCreateMaterializedView
-          || sqlNode instanceof SqlPinotShowCreateMaterializedView
-          || sqlNode instanceof SqlPinotDropMaterializedView) {
+          || sqlNode instanceof SqlPinotShowTables
+          || sqlNode instanceof SqlPinotShowCreateTable) {
         // Pinot-native DDL statements; the controller dispatches these via the DDL endpoint.
-        // Ordering: Catalog → Table → Materialized View, lifecycle CREATE → SHOW CREATE → DROP,
-        // matching `DdlOperation` and `DdlCompiler#compile`.
         if (sqlType == null) {
           sqlType = PinotSqlType.DDL;
           statementNode = sqlNode;
