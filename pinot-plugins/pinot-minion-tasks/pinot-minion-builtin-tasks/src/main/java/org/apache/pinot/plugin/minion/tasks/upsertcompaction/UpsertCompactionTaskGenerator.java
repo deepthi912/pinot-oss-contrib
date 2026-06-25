@@ -35,7 +35,6 @@ import org.apache.pinot.common.exception.InvalidConfigException;
 import org.apache.pinot.common.metadata.segment.SegmentZKMetadata;
 import org.apache.pinot.common.restlet.resources.ValidDocIdsMetadataInfo;
 import org.apache.pinot.common.restlet.resources.ValidDocIdsType;
-import org.apache.pinot.common.utils.ServiceStatus;
 import org.apache.pinot.controller.helix.core.PinotHelixResourceManager;
 import org.apache.pinot.controller.helix.core.minion.generator.BaseTaskGenerator;
 import org.apache.pinot.controller.helix.core.minion.generator.TaskGeneratorUtils;
@@ -327,7 +326,7 @@ public class UpsertCompactionTaskGenerator extends BaseTaskGenerator {
 
   private static boolean isReplicaUsable(String segmentName, SegmentZKMetadata segment,
       ValidDocIdsMetadataInfo replica, boolean logAtWarn) {
-    if (segment.getCrc() != Long.parseLong(replica.getSegmentCrc())) {
+    if (!MinionTaskUtils.isReplicaCrcMatching(String.valueOf(segment.getCrc()), replica.getSegmentCrc())) {
       if (logAtWarn) {
         LOGGER.warn("CRC mismatch for segment: {}, (segmentZKMetadata={}, validDocIdsMetadata={})", segmentName,
             segment.getCrc(), replica.getSegmentCrc());
@@ -336,7 +335,7 @@ public class UpsertCompactionTaskGenerator extends BaseTaskGenerator {
     }
     // Skip replicas whose server is not READY. The bitmap can be inconsistent when an UPDATING segment is
     // overwriting an ONLINE one.
-    if (replica.getServerStatus() != null && !replica.getServerStatus().equals(ServiceStatus.Status.GOOD)) {
+    if (!MinionTaskUtils.isReplicaServerReady(replica.getServerStatus())) {
       if (logAtWarn) {
         LOGGER.warn("Server {} is in {} state, skipping {} generation for segment: {}", replica.getInstanceId(),
             replica.getServerStatus(), MinionConstants.UpsertCompactionTask.TASK_TYPE, segmentName);

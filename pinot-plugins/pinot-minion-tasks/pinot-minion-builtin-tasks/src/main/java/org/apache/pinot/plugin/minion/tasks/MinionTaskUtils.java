@@ -291,6 +291,23 @@ public class MinionTaskUtils {
   }
 
   /**
+   * Per-replica predicate shared by the executor and the task generator: true when the replica's CRC matches the
+   * expected CRC. Both values are compared as strings to match the wire-format the server returns.
+   */
+  public static boolean isReplicaCrcMatching(String expectedCrc, String replicaCrc) {
+    return expectedCrc != null && expectedCrc.equals(replicaCrc);
+  }
+
+  /**
+   * Per-replica predicate shared by the executor and the task generator: true when the replica's reporting server
+   * is in a READY state. {@code null} is treated as ready to preserve existing behavior for responses that don't
+   * carry a server status.
+   */
+  public static boolean isReplicaServerReady(@Nullable ServiceStatus.Status status) {
+    return status == null || status.equals(ServiceStatus.Status.GOOD);
+  }
+
+  /**
    * Returns the validDocIds bitmap from server(s). {@code comparisonMode} is the task config value: UNSAFE,
    * EQUAL (default), or MOST_VALID_DOCS.
    */
@@ -331,7 +348,7 @@ public class MinionTaskUtils {
       // offheap upsert is used because we will need to delete & add all primary keys.
       // `BaseSingleSegmentConversionExecutor.executeTask()` already checks for the crc from the task generator
       // against the crc from the current segment zk metadata, so we don't need to check that here.
-      if (!expectedCrc.equals(crcFromValidDocIdsBitmap)) {
+      if (!isReplicaCrcMatching(expectedCrc, crcFromValidDocIdsBitmap)) {
         if (consensusMode == MinionConstants.ValidDocIdsConsensusMode.UNSAFE) {
           LOGGER.warn("CRC mismatch for segment: {} from endpoint {}, skipping", segmentName, endpoint);
           continue;
@@ -342,8 +359,7 @@ public class MinionTaskUtils {
         }
       }
 
-      if (validDocIdsBitmapResponse.getServerStatus() != null && !validDocIdsBitmapResponse.getServerStatus()
-          .equals(ServiceStatus.Status.GOOD)) {
+      if (!isReplicaServerReady(validDocIdsBitmapResponse.getServerStatus())) {
         if (consensusMode == MinionConstants.ValidDocIdsConsensusMode.UNSAFE) {
           LOGGER.warn("Server {} not READY for segment {}, skipping", validDocIdsBitmapResponse.getInstanceId(),
               segmentName);
