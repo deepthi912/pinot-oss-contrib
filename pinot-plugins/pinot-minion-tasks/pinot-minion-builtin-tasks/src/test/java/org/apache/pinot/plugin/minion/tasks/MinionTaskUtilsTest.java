@@ -25,7 +25,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.apache.helix.HelixAdmin;
-import org.apache.helix.HelixManager;
 import org.apache.helix.model.ExternalView;
 import org.apache.helix.model.InstanceConfig;
 import org.apache.pinot.common.restlet.resources.ValidDocIdsBitmapResponse;
@@ -36,7 +35,6 @@ import org.apache.pinot.controller.helix.core.minion.ClusterInfoAccessor;
 import org.apache.pinot.controller.util.ServerSegmentMetadataReader;
 import org.apache.pinot.core.common.MinionConstants;
 import org.apache.pinot.core.common.MinionConstants.UpsertCompactionTask;
-import org.apache.pinot.minion.MinionContext;
 import org.apache.pinot.spi.config.table.TableConfig;
 import org.apache.pinot.spi.config.table.TableTaskConfig;
 import org.apache.pinot.spi.config.table.TableType;
@@ -359,9 +357,10 @@ public class MinionTaskUtilsTest {
   }
 
   /**
-   * Sets up MinionContext with mock Helix so getServers() returns the given server list.
+   * Builds a mock {@link HelixAdmin} configured so that {@code getServers()} returns the given server list.
+   * Returned via the testInstance's {@code _testHelixAdmin} field so tests can pass it to the method under test.
    */
-  private void setupMinionContextWithServers(String tableNameWithType, String segmentName, String[] servers) {
+  private HelixAdmin setupMockHelixAdmin(String tableNameWithType, String segmentName, String[] servers) {
     ExternalView externalView = new ExternalView(tableNameWithType);
     Map<String, String> assignment = new HashMap<>();
     for (String s : servers) {
@@ -374,12 +373,7 @@ public class MinionTaskUtilsTest {
     for (String server : servers) {
       when(helixAdmin.getInstanceConfig(anyString(), eq(server))).thenReturn(makeInstanceConfig(server));
     }
-
-    HelixManager helixManager = mock(HelixManager.class);
-    when(helixManager.getClusterName()).thenReturn("testCluster");
-    when(helixManager.getClusterManagmentTool()).thenReturn(helixAdmin);
-
-    MinionContext.getInstance().setHelixManager(helixManager);
+    return helixAdmin;
   }
 
   /**
@@ -390,7 +384,7 @@ public class MinionTaskUtilsTest {
   private static RoaringBitmap getValidDocIdFromServerMatchingCrcWithMockedReader(String tableName,
       String segmentName, String expectedCrc, String consensusMode, List<Object> responseOrThrowByCallOrder,
       String[] servers, MinionTaskUtilsTest testInstance) {
-    testInstance.setupMinionContextWithServers(tableName, segmentName, servers);
+    HelixAdmin helixAdmin = testInstance.setupMockHelixAdmin(tableName, segmentName, servers);
     // Shared across all mock instances (production creates one reader per server).
     AtomicInteger callIndex = new AtomicInteger(0);
     try (MockedConstruction<ServerSegmentMetadataReader> ignored = mockConstruction(ServerSegmentMetadataReader.class,
@@ -409,7 +403,7 @@ public class MinionTaskUtilsTest {
               });
         })) {
       return MinionTaskUtils.getValidDocIdFromServerMatchingCrc(tableName, segmentName,
-          ValidDocIdsType.SNAPSHOT.name(), MinionContext.getInstance(), expectedCrc, consensusMode);
+          ValidDocIdsType.SNAPSHOT.name(), "testCluster", helixAdmin, expectedCrc, consensusMode);
     }
   }
 

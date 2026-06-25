@@ -31,6 +31,7 @@ import java.util.Set;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 import org.apache.commons.lang3.StringUtils;
+import org.apache.helix.HelixAdmin;
 import org.apache.helix.task.TaskState;
 import org.apache.pinot.common.exception.InvalidConfigException;
 import org.apache.pinot.common.metadata.segment.SegmentZKMetadata;
@@ -53,6 +54,7 @@ import org.apache.pinot.spi.data.Schema;
 import org.apache.pinot.spi.utils.DataSizeUtils;
 import org.apache.pinot.spi.utils.Enablement;
 import org.apache.pinot.spi.utils.TimeUtils;
+import org.roaringbitmap.RoaringBitmap;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -205,6 +207,13 @@ public class UpsertCompactMergeTaskGenerator extends BaseTaskGenerator {
       long minNumSegments = Long.parseLong(
           taskConfigs.getOrDefault(MinionConstants.UpsertCompactMergeTask.MIN_NUM_SEGMENTS_PER_TASK_KEY,
               String.valueOf(MinionConstants.UpsertCompactMergeTask.DEFAULT_MIN_NUM_SEGMENTS_PER_TASK)));
+      // Bitmap-level consensus pre-check before producing tasks. For EQUAL this enforces actual
+      // RoaringBitmap.equals across replicas (counts can match while bitmaps differ during ingestion races).
+      String consensusModeStr = taskConfigs.getOrDefault(
+          MinionConstants.UpsertCompactionTask.VALID_DOC_IDS_CONSENSUS_MODE_KEY,
+          MinionConstants.UpsertCompactionTask.DEFAULT_VALID_DOC_IDS_CONSENSUS_MODE);
+      String clusterName = pinotHelixResourceManager.getHelixZkManager().getClusterName();
+      HelixAdmin helixAdmin = pinotHelixResourceManager.getHelixZkManager().getClusterManagmentTool();
       for (Map.Entry<Integer, List<List<SegmentMergerMetadata>>> entry
           : segmentSelectionResult.getSegmentsForCompactMergeByPartition().entrySet()) {
         if (numTasks == maxTasks) {
@@ -218,6 +227,30 @@ public class UpsertCompactMergeTaskGenerator extends BaseTaskGenerator {
         //there are no groups with more than minNumSegmentsPerTask segment to merge. Groups are already sorted, so we
         // just check the first entry.
         if (groups.get(0).size() < minNumSegments) {
+          continue;
+        }
+        boolean groupConsensusOk = true;
+        for (SegmentMergerMetadata sm : groups.get(0)) {
+          SegmentZKMetadata sz = sm.getSegmentZKMetadata();
+          try {
+            RoaringBitmap consensusBitmap =
+                MinionTaskUtils.getValidDocIdFromServerMatchingCrc(tableNameWithType, sz.getSegmentName(),
+                    ValidDocIdsType.SNAPSHOT.toString(), clusterName, helixAdmin, String.valueOf(sz.getCrc()),
+                    consensusModeStr);
+            if (consensusBitmap == null) {
+              LOGGER.warn("No bitmap consensus for segment {}, skipping merge group (consensusMode={})",
+                  sz.getSegmentName(), consensusModeStr);
+              groupConsensusOk = false;
+              break;
+            }
+          } catch (IllegalStateException e) {
+            LOGGER.warn("Bitmap consensus check failed for segment {}, skipping merge group (consensusMode={}): {}",
+                sz.getSegmentName(), consensusModeStr, e.getMessage());
+            groupConsensusOk = false;
+            break;
+          }
+        }
+        if (!groupConsensusOk) {
           continue;
         }
         // TODO see if multiple groups of same partition can be added

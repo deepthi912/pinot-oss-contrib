@@ -29,6 +29,7 @@ import java.util.function.Function;
 import java.util.stream.Collectors;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.commons.lang3.tuple.Pair;
+import org.apache.helix.HelixAdmin;
 import org.apache.helix.task.TaskState;
 import org.apache.pinot.common.exception.InvalidConfigException;
 import org.apache.pinot.common.metadata.segment.SegmentZKMetadata;
@@ -49,6 +50,7 @@ import org.apache.pinot.spi.config.table.UpsertConfig;
 import org.apache.pinot.spi.data.Schema;
 import org.apache.pinot.spi.utils.CommonConstants;
 import org.apache.pinot.spi.utils.TimeUtils;
+import org.roaringbitmap.RoaringBitmap;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -178,12 +180,34 @@ public class UpsertCompactionTaskGenerator extends BaseTaskGenerator {
 
       int numTasks = 0;
       int maxTasks = getAndUpdateMaxNumSubTasks(taskConfigs, Integer.MAX_VALUE, tableNameWithType);
+      // Bitmap-level consensus pre-check before producing tasks. For EQUAL this enforces actual
+      // RoaringBitmap.equals across replicas (counts can match while bitmaps differ during ingestion races).
+      String consensusModeStr =
+          taskConfigs.getOrDefault(UpsertCompactionTask.VALID_DOC_IDS_CONSENSUS_MODE_KEY,
+              UpsertCompactionTask.DEFAULT_VALID_DOC_IDS_CONSENSUS_MODE);
+      String clusterName = pinotHelixResourceManager.getHelixZkManager().getClusterName();
+      HelixAdmin helixAdmin = pinotHelixResourceManager.getHelixZkManager().getClusterManagmentTool();
       for (SegmentZKMetadata segment : segmentSelectionResult.getSegmentsForCompaction()) {
         if (numTasks == maxTasks) {
           break;
         }
         if (StringUtils.isBlank(segment.getDownloadUrl())) {
           LOGGER.warn("Skipping segment {} for task {} as download url is empty", segment.getSegmentName(), taskType);
+          continue;
+        }
+        try {
+          RoaringBitmap consensusBitmap =
+              MinionTaskUtils.getValidDocIdFromServerMatchingCrc(tableNameWithType, segment.getSegmentName(),
+                  validDocIdsType.toString(), clusterName, helixAdmin, String.valueOf(segment.getCrc()),
+                  consensusModeStr);
+          if (consensusBitmap == null) {
+            LOGGER.warn("No bitmap consensus for segment {}, skipping task generation (consensusMode={})",
+                segment.getSegmentName(), consensusModeStr);
+            continue;
+          }
+        } catch (IllegalStateException e) {
+          LOGGER.warn("Bitmap consensus check failed for segment {}, skipping task generation (consensusMode={}): {}",
+              segment.getSegmentName(), consensusModeStr, e.getMessage());
           continue;
         }
         Map<String, String> configs = new HashMap<>(getBaseTaskConfigs(tableConfig, List.of(segment.getSegmentName())));

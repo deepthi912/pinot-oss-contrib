@@ -382,14 +382,18 @@ public class MinionTaskUtils {
 
   /**
    * Returns the validDocIds bitmap from server(s). {@code comparisonMode} is the task config value: UNSAFE,
-   * EQUAL (default), or MOST_VALID_DOCS.
+   * EQUAL (default), or MOST_VALID_DOCS. EQUAL enforces bitmap-level equality across replicas via
+   * {@code RoaringBitmap.equals}.
+   *
+   * <p>Caller passes the Helix cluster name and admin directly so the method works for both minion-side callers
+   * (which derive them from {@code MinionContext}) and controller-side callers like task generators (which
+   * derive them from {@code PinotHelixResourceManager}).
    */
   @Nullable
   public static RoaringBitmap getValidDocIdFromServerMatchingCrc(String tableNameWithType, String segmentName,
-      String validDocIdsType, MinionContext minionContext, String expectedCrc, String comparisonModeStr) {
+      String validDocIdsType, String clusterName, HelixAdmin helixAdmin, String expectedCrc,
+      String comparisonModeStr) {
     MinionConstants.ValidDocIdsConsensusMode consensusMode = parseValidDocIdsConsensusMode(comparisonModeStr);
-    String clusterName = minionContext.getHelixManager().getClusterName();
-    HelixAdmin helixAdmin = minionContext.getHelixManager().getClusterManagmentTool();
     List<String> servers = getServers(segmentName, tableNameWithType, helixAdmin, clusterName);
     List<RoaringBitmap> matchingBitmaps = new ArrayList<>();
 
