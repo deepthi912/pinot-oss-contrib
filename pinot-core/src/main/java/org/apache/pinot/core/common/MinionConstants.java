@@ -264,9 +264,12 @@ public class MinionConstants {
     public static final String NUM_SEGMENTS_BATCH_PER_SERVER_REQUEST = "numSegmentsBatchPerServerRequest";
 
     /**
-     * Valid doc ids consensus mode used by the executor only (generator unchanged). Values: UNSAFE, EQUAL,
+     * Valid doc ids consensus mode used by both the task generator and the executor. Values: UNSAFE, EQUAL,
      * MOST_VALID_DOCS. UNSAFE = use first server with matching CRC and READY; EQUAL = require all replicas
-     * to have the same valid doc set (default); MOST_VALID_DOCS = use replica with most valid docs.
+     * to agree (bitmap consensus in the executor, count consensus in the generator) (default);
+     * MOST_VALID_DOCS = use replica with most valid docs. In EQUAL and MOST_VALID_DOCS, the generator skips
+     * scheduling a segment when any replica fails to return validDocIds metadata, reports a non-GOOD server
+     * status, or has a CRC mismatch.
      */
     public static final String VALID_DOC_IDS_CONSENSUS_MODE_KEY = "validDocIdsConsensusMode";
 

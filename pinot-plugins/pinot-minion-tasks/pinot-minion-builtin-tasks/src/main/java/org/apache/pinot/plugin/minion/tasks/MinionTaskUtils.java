@@ -66,8 +66,11 @@ import org.slf4j.LoggerFactory;
 public class MinionTaskUtils {
   private static final Logger LOGGER = LoggerFactory.getLogger(MinionTaskUtils.class);
 
-  /** Package-private for testing: parses validDocIdsComparisonMode config string. */
-  static MinionConstants.ValidDocIdsConsensusMode parseValidDocIdsConsensusMode(String value) {
+  /**
+   * Parses the validDocIdsConsensusMode config string. Defaults to {@code EQUAL} when the value is null or blank.
+   * Used by both the executor (bitmap-level consensus) and the task generator (metadata-level consensus).
+   */
+  public static MinionConstants.ValidDocIdsConsensusMode parseValidDocIdsConsensusMode(String value) {
     if (value == null || value.isBlank()) {
       return MinionConstants.ValidDocIdsConsensusMode.EQUAL;
     }

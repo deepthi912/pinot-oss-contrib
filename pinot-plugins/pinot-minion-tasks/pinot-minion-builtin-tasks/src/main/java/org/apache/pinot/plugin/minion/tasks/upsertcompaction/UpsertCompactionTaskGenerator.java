@@ -27,6 +27,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.function.Function;
 import java.util.stream.Collectors;
+import javax.annotation.Nullable;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.commons.lang3.tuple.Pair;
 import org.apache.helix.task.TaskState;
@@ -160,7 +161,8 @@ public class UpsertCompactionTaskGenerator extends BaseTaskGenerator {
           completedSegments.stream().collect(Collectors.toMap(SegmentZKMetadata::getSegmentName, Function.identity()));
 
       SegmentSelectionResult segmentSelectionResult =
-          processValidDocIdsMetadata(taskConfigs, completedSegmentsMap, validDocIdsMetadataList);
+          processValidDocIdsMetadata(taskConfigs, completedSegmentsMap, validDocIdsMetadataList,
+              tableConfig.getReplication());
       int skippedSegmentsCount = validDocIdsMetadataList.size()
               - segmentSelectionResult.getSegmentsForCompaction().size()
               - segmentSelectionResult.getSegmentsForDeletion().size();
@@ -207,13 +209,15 @@ public class UpsertCompactionTaskGenerator extends BaseTaskGenerator {
   @VisibleForTesting
   public static SegmentSelectionResult processValidDocIdsMetadata(Map<String, String> taskConfigs,
       Map<String, SegmentZKMetadata> completedSegmentsMap,
-      Map<String, List<ValidDocIdsMetadataInfo>> validDocIdsMetadataInfoMap) {
+      Map<String, List<ValidDocIdsMetadataInfo>> validDocIdsMetadataInfoMap, int expectedReplicas) {
     double invalidRecordsThresholdPercent = Double.parseDouble(
         taskConfigs.getOrDefault(UpsertCompactionTask.INVALID_RECORDS_THRESHOLD_PERCENT,
             String.valueOf(DEFAULT_INVALID_RECORDS_THRESHOLD_PERCENT)));
     long invalidRecordsThresholdCount = Long.parseLong(
         taskConfigs.getOrDefault(UpsertCompactionTask.INVALID_RECORDS_THRESHOLD_COUNT,
             String.valueOf(DEFAULT_INVALID_RECORDS_THRESHOLD_COUNT)));
+    MinionConstants.ValidDocIdsConsensusMode consensusMode = MinionTaskUtils.parseValidDocIdsConsensusMode(
+        taskConfigs.get(UpsertCompactionTask.VALID_DOC_IDS_CONSENSUS_MODE_KEY));
     List<Pair<SegmentZKMetadata, Long>> segmentsForCompaction = new ArrayList<>();
     List<String> segmentsForDeletion = new ArrayList<>();
     for (String segmentName : validDocIdsMetadataInfoMap.keySet()) {
@@ -223,43 +227,28 @@ public class UpsertCompactionTaskGenerator extends BaseTaskGenerator {
         continue;
       }
       SegmentZKMetadata segment = completedSegmentsMap.get(segmentName);
-      for (ValidDocIdsMetadataInfo validDocIdsMetadata : validDocIdsMetadataInfoMap.get(segmentName)) {
-        long totalInvalidDocs = validDocIdsMetadata.getTotalInvalidDocs();
+      ValidDocIdsMetadataInfo chosen = chooseConsistentReplica(segmentName, segment,
+          validDocIdsMetadataInfoMap.get(segmentName), consensusMode, expectedReplicas);
+      if (chosen == null) {
+        continue;
+      }
 
-        // Skip segments if the crc from zk metadata and server does not match. They may be being reloaded.
-        if (segment.getCrc() != Long.parseLong(validDocIdsMetadata.getSegmentCrc())) {
-          LOGGER.warn("CRC mismatch for segment: {}, (segmentZKMetadata={}, validDocIdsMetadata={})", segmentName,
-              segment.getCrc(), validDocIdsMetadata.getSegmentCrc());
-          continue;
-        }
-
-        // skipping segments for which their servers are not in READY state. The bitmaps would be inconsistent when
-        // server is NOT READY as UPDATING segments might be updating the ONLINE segments
-        if (validDocIdsMetadata.getServerStatus() != null && !validDocIdsMetadata.getServerStatus()
-            .equals(ServiceStatus.Status.GOOD)) {
-          LOGGER.warn("Server {} is in {} state, skipping {} generation for segment: {}",
-              validDocIdsMetadata.getInstanceId(), validDocIdsMetadata.getServerStatus(),
-              MinionConstants.UpsertCompactionTask.TASK_TYPE, segmentName);
-          continue;
-        }
-
-        long totalDocs = validDocIdsMetadata.getTotalDocs();
-        double invalidRecordPercent = ((double) totalInvalidDocs / totalDocs) * 100;
-        if (totalInvalidDocs == totalDocs) {
-          LOGGER.debug("Segment {} contains only invalid records, adding it to the deletion list", segmentName);
-          segmentsForDeletion.add(segment.getSegmentName());
-        } else if (invalidRecordPercent >= invalidRecordsThresholdPercent
-            && totalInvalidDocs >= invalidRecordsThresholdCount) {
-          LOGGER.debug("Segment {} contains {} invalid records out of {} total records "
-                  + "(count threshold: {}, percent threshold: {}), adding it to the compaction list", segmentName,
-              totalInvalidDocs, totalDocs, invalidRecordsThresholdCount, invalidRecordsThresholdPercent);
-          segmentsForCompaction.add(Pair.of(segment, totalInvalidDocs));
-        } else {
-          LOGGER.debug("Segment {} contains {} invalid records out of {} total records "
-                  + "(count threshold: {}, percent threshold: {}), skipping it for compaction", segmentName,
-              totalInvalidDocs, totalDocs, invalidRecordsThresholdCount, invalidRecordsThresholdPercent);
-        }
-        break;
+      long totalInvalidDocs = chosen.getTotalInvalidDocs();
+      long totalDocs = chosen.getTotalDocs();
+      double invalidRecordPercent = ((double) totalInvalidDocs / totalDocs) * 100;
+      if (totalInvalidDocs == totalDocs) {
+        LOGGER.debug("Segment {} contains only invalid records, adding it to the deletion list", segmentName);
+        segmentsForDeletion.add(segment.getSegmentName());
+      } else if (invalidRecordPercent >= invalidRecordsThresholdPercent
+          && totalInvalidDocs >= invalidRecordsThresholdCount) {
+        LOGGER.debug("Segment {} contains {} invalid records out of {} total records "
+                + "(count threshold: {}, percent threshold: {}), adding it to the compaction list", segmentName,
+            totalInvalidDocs, totalDocs, invalidRecordsThresholdCount, invalidRecordsThresholdPercent);
+        segmentsForCompaction.add(Pair.of(segment, totalInvalidDocs));
+      } else {
+        LOGGER.debug("Segment {} contains {} invalid records out of {} total records "
+                + "(count threshold: {}, percent threshold: {}), skipping it for compaction", segmentName,
+            totalInvalidDocs, totalDocs, invalidRecordsThresholdCount, invalidRecordsThresholdPercent);
       }
     }
     segmentsForCompaction.sort((o1, o2) -> {
@@ -273,6 +262,88 @@ public class UpsertCompactionTaskGenerator extends BaseTaskGenerator {
 
     return new SegmentSelectionResult(
         segmentsForCompaction.stream().map(Map.Entry::getKey).collect(Collectors.toList()), segmentsForDeletion);
+  }
+
+  /**
+   * Picks a single {@link ValidDocIdsMetadataInfo} replica to drive the per-segment decision, honoring the
+   * configured consensus mode. Returns {@code null} when the segment should be skipped — either because no
+   * replica is usable (CRC mismatch / non-GOOD server status) or because replicas disagree under EQUAL mode.
+   * In EQUAL and MOST_VALID_DOCS modes, any per-replica issue (CRC mismatch, non-GOOD status, or fewer
+   * replicas than {@code expectedReplicas}) causes the whole segment to be skipped to avoid scheduling a
+   * task on an inconsistent view. {@code expectedReplicas <= 0} disables the replica-count check.
+   */
+  @Nullable
+  @VisibleForTesting
+  static ValidDocIdsMetadataInfo chooseConsistentReplica(String segmentName, SegmentZKMetadata segment,
+      @Nullable List<ValidDocIdsMetadataInfo> replicas, MinionConstants.ValidDocIdsConsensusMode mode,
+      int expectedReplicas) {
+    if (replicas == null || replicas.isEmpty()) {
+      return null;
+    }
+    if (mode == MinionConstants.ValidDocIdsConsensusMode.UNSAFE) {
+      for (ValidDocIdsMetadataInfo replica : replicas) {
+        if (!isReplicaUsable(segmentName, segment, replica, false)) {
+          continue;
+        }
+        return replica;
+      }
+      return null;
+    }
+    if (expectedReplicas > 0 && replicas.size() < expectedReplicas) {
+      LOGGER.warn("Segment {} returned validDocIds metadata from only {} of {} replicas (consensusMode={}); "
+          + "skipping task generation to avoid replica inconsistency", segmentName, replicas.size(), expectedReplicas,
+          mode);
+      return null;
+    }
+    for (ValidDocIdsMetadataInfo replica : replicas) {
+      if (!isReplicaUsable(segmentName, segment, replica, true)) {
+        LOGGER.warn("Skipping task generation for segment {} due to per-replica issue (consensusMode={})", segmentName,
+            mode);
+        return null;
+      }
+    }
+    if (mode == MinionConstants.ValidDocIdsConsensusMode.EQUAL) {
+      ValidDocIdsMetadataInfo first = replicas.get(0);
+      for (ValidDocIdsMetadataInfo replica : replicas) {
+        if (replica.getTotalDocs() != first.getTotalDocs()
+            || replica.getTotalValidDocs() != first.getTotalValidDocs()
+            || replica.getTotalInvalidDocs() != first.getTotalInvalidDocs()) {
+          LOGGER.warn("Replicas disagree on valid doc counts for segment {} (consensusMode=EQUAL); "
+              + "skipping task generation", segmentName);
+          return null;
+        }
+      }
+      return first;
+    }
+    // MOST_VALID_DOCS: pick the replica reporting the most valid docs.
+    ValidDocIdsMetadataInfo chosen = replicas.get(0);
+    for (ValidDocIdsMetadataInfo replica : replicas) {
+      if (replica.getTotalValidDocs() > chosen.getTotalValidDocs()) {
+        chosen = replica;
+      }
+    }
+    return chosen;
+  }
+
+  private static boolean isReplicaUsable(String segmentName, SegmentZKMetadata segment,
+      ValidDocIdsMetadataInfo replica, boolean logAtWarn) {
+    if (segment.getCrc() != Long.parseLong(replica.getSegmentCrc())) {
+      if (logAtWarn) {
+        LOGGER.warn("CRC mismatch for segment: {}, (segmentZKMetadata={}, validDocIdsMetadata={})", segmentName,
+            segment.getCrc(), replica.getSegmentCrc());
+      }
+      return false;
+    }
+    // Skip replicas whose server is not READY. The bitmap can be inconsistent when an UPDATING segment is
+    // overwriting an ONLINE one.
+    if (replica.getServerStatus() != null && !replica.getServerStatus().equals(ServiceStatus.Status.GOOD)) {
+      if (logAtWarn) {
+        LOGGER.warn("Server {} is in {} state, skipping {} generation for segment: {}", replica.getInstanceId(),
+            replica.getServerStatus(), MinionConstants.UpsertCompactionTask.TASK_TYPE, segmentName);
+      }
+      return false;
+    }
+    return true;
   }
 
   @VisibleForTesting

@@ -233,13 +233,13 @@ public class UpsertCompactionTaskGeneratorTest {
     // no completed segments scenario, there shouldn't be any segment selected for compaction
     UpsertCompactionTaskGenerator.SegmentSelectionResult segmentSelectionResult =
         UpsertCompactionTaskGenerator.processValidDocIdsMetadata(compactionConfigs, new HashMap<>(),
-            validDocIdsMetadataInfo);
+            validDocIdsMetadataInfo, 1);
     assertEquals(segmentSelectionResult.getSegmentsForCompaction().size(), 0);
 
     // test with valid crc and thresholds
     segmentSelectionResult =
         UpsertCompactionTaskGenerator.processValidDocIdsMetadata(compactionConfigs, _completedSegmentsMap,
-            validDocIdsMetadataInfo);
+            validDocIdsMetadataInfo, 1);
     assertEquals(segmentSelectionResult.getSegmentsForCompaction().size(), 1);
     assertEquals(segmentSelectionResult.getSegmentsForDeletion().size(), 1);
     assertEquals(segmentSelectionResult.getSegmentsForCompaction().get(0).getSegmentName(),
@@ -250,7 +250,7 @@ public class UpsertCompactionTaskGeneratorTest {
     compactionConfigs = getCompactionConfigs("60", "10");
     segmentSelectionResult =
         UpsertCompactionTaskGenerator.processValidDocIdsMetadata(compactionConfigs, _completedSegmentsMap,
-            validDocIdsMetadataInfo);
+            validDocIdsMetadataInfo, 1);
     assertTrue(segmentSelectionResult.getSegmentsForCompaction().isEmpty());
     assertEquals(segmentSelectionResult.getSegmentsForDeletion().size(), 1);
     assertEquals(segmentSelectionResult.getSegmentsForDeletion().get(0), _completedSegment2.getSegmentName());
@@ -259,7 +259,7 @@ public class UpsertCompactionTaskGeneratorTest {
     compactionConfigs = getCompactionConfigs("0", "10");
     segmentSelectionResult =
         UpsertCompactionTaskGenerator.processValidDocIdsMetadata(compactionConfigs, _completedSegmentsMap,
-            validDocIdsMetadataInfo);
+            validDocIdsMetadataInfo, 1);
     assertEquals(segmentSelectionResult.getSegmentsForDeletion().size(), 1);
     assertEquals(segmentSelectionResult.getSegmentsForCompaction().size(), 1);
     assertEquals(segmentSelectionResult.getSegmentsForCompaction().get(0).getSegmentName(),
@@ -270,7 +270,7 @@ public class UpsertCompactionTaskGeneratorTest {
     compactionConfigs = getCompactionConfigs("30", "0");
     segmentSelectionResult =
         UpsertCompactionTaskGenerator.processValidDocIdsMetadata(compactionConfigs, _completedSegmentsMap,
-            validDocIdsMetadataInfo);
+            validDocIdsMetadataInfo, 1);
     assertEquals(segmentSelectionResult.getSegmentsForDeletion().size(), 1);
     assertEquals(segmentSelectionResult.getSegmentsForCompaction().size(), 1);
     assertEquals(segmentSelectionResult.getSegmentsForCompaction().get(0).getSegmentName(),
@@ -289,7 +289,7 @@ public class UpsertCompactionTaskGeneratorTest {
     });
     segmentSelectionResult =
         UpsertCompactionTaskGenerator.processValidDocIdsMetadata(compactionConfigs, _completedSegmentsMap,
-            validDocIdsMetadataInfo);
+            validDocIdsMetadataInfo, 1);
 
     // completedSegment is supposed to be filtered out
     Assert.assertEquals(segmentSelectionResult.getSegmentsForCompaction().size(), 0);
@@ -314,7 +314,7 @@ public class UpsertCompactionTaskGeneratorTest {
     compactionConfigs = getCompactionConfigs("30", "0");
     segmentSelectionResult =
         UpsertCompactionTaskGenerator.processValidDocIdsMetadata(compactionConfigs, _completedSegmentsMap,
-            validDocIdsMetadataInfo);
+            validDocIdsMetadataInfo, 1);
     Assert.assertEquals(segmentSelectionResult.getSegmentsForCompaction().size(), 2);
     Assert.assertEquals(segmentSelectionResult.getSegmentsForDeletion().size(), 0);
     assertEquals(segmentSelectionResult.getSegmentsForCompaction().get(0).getSegmentName(),
@@ -488,5 +488,100 @@ public class UpsertCompactionTaskGeneratorTest {
       idealState.setPartitionState(segmentName, "Server_0", "ONLINE");
     }
     return idealState;
+  }
+
+  @Test
+  public void testProcessValidDocIdsMetadataConsensusModes()
+      throws IOException {
+    Map<String, String> compactionConfigs = getCompactionConfigs("1", "10");
+
+    // 3-replica payload: two agree (50/100), one disagrees (40/100).
+    String disagreeJson = "{\"" + _completedSegment.getSegmentName() + "\": ["
+        + replicaJson(_completedSegment, 50, 50, "GOOD", "server1")
+        + ", " + replicaJson(_completedSegment, 50, 50, "GOOD", "server2")
+        + ", " + replicaJson(_completedSegment, 60, 40, "GOOD", "server3") + "]}";
+    Map<String, List<ValidDocIdsMetadataInfo>> disagreeMetadata =
+        JsonUtils.stringToObject(disagreeJson, new TypeReference<>() {
+        });
+
+    // EQUAL (default): replicas disagree -> skip segment entirely.
+    UpsertCompactionTaskGenerator.SegmentSelectionResult result =
+        UpsertCompactionTaskGenerator.processValidDocIdsMetadata(compactionConfigs, _completedSegmentsMap,
+            disagreeMetadata, 3);
+    assertEquals(result.getSegmentsForCompaction().size(), 0);
+    assertEquals(result.getSegmentsForDeletion().size(), 0);
+
+    // MOST_VALID_DOCS: pick the replica with the most valid docs (60 valid -> 40 invalid).
+    Map<String, String> mostValidDocsConfigs = new HashMap<>(compactionConfigs);
+    mostValidDocsConfigs.put(UpsertCompactionTask.VALID_DOC_IDS_CONSENSUS_MODE_KEY, "MOST_VALID_DOCS");
+    result = UpsertCompactionTaskGenerator.processValidDocIdsMetadata(mostValidDocsConfigs, _completedSegmentsMap,
+        disagreeMetadata, 3);
+    assertEquals(result.getSegmentsForCompaction().size(), 1);
+    assertEquals(result.getSegmentsForCompaction().get(0).getSegmentName(), _completedSegment.getSegmentName());
+
+    // UNSAFE: take the first usable replica, like the pre-existing behavior.
+    Map<String, String> unsafeConfigs = new HashMap<>(compactionConfigs);
+    unsafeConfigs.put(UpsertCompactionTask.VALID_DOC_IDS_CONSENSUS_MODE_KEY, "UNSAFE");
+    result = UpsertCompactionTaskGenerator.processValidDocIdsMetadata(unsafeConfigs, _completedSegmentsMap,
+        disagreeMetadata, 3);
+    assertEquals(result.getSegmentsForCompaction().size(), 1);
+  }
+
+  @Test
+  public void testProcessValidDocIdsMetadataSkipsWhenReplicaHasIssue()
+      throws IOException {
+    Map<String, String> compactionConfigs = getCompactionConfigs("1", "10");
+
+    // Two replicas agree on counts, one returns non-GOOD server status -> skip segment in EQUAL.
+    String json = "{\"" + _completedSegment.getSegmentName() + "\": ["
+        + replicaJson(_completedSegment, 50, 50, "GOOD", "server1")
+        + ", " + replicaJson(_completedSegment, 50, 50, "GOOD", "server2")
+        + ", " + replicaJson(_completedSegment, 50, 50, "STARTING", "server3") + "]}";
+    Map<String, List<ValidDocIdsMetadataInfo>> metadata =
+        JsonUtils.stringToObject(json, new TypeReference<>() {
+        });
+
+    UpsertCompactionTaskGenerator.SegmentSelectionResult result =
+        UpsertCompactionTaskGenerator.processValidDocIdsMetadata(compactionConfigs, _completedSegmentsMap, metadata, 3);
+    assertEquals(result.getSegmentsForCompaction().size(), 0);
+
+    // Same fixture in UNSAFE mode -> first GOOD replica is used and the segment IS scheduled.
+    Map<String, String> unsafeConfigs = new HashMap<>(compactionConfigs);
+    unsafeConfigs.put(UpsertCompactionTask.VALID_DOC_IDS_CONSENSUS_MODE_KEY, "UNSAFE");
+    result = UpsertCompactionTaskGenerator.processValidDocIdsMetadata(unsafeConfigs, _completedSegmentsMap, metadata,
+        3);
+    assertEquals(result.getSegmentsForCompaction().size(), 1);
+  }
+
+  @Test
+  public void testProcessValidDocIdsMetadataSkipsWhenReplicasMissing()
+      throws IOException {
+    Map<String, String> compactionConfigs = getCompactionConfigs("1", "10");
+
+    // Only two replicas responded but three are expected. EQUAL/MOST_VALID_DOCS must skip the segment.
+    String json = "{\"" + _completedSegment.getSegmentName() + "\": ["
+        + replicaJson(_completedSegment, 50, 50, "GOOD", "server1")
+        + ", " + replicaJson(_completedSegment, 50, 50, "GOOD", "server2") + "]}";
+    Map<String, List<ValidDocIdsMetadataInfo>> metadata =
+        JsonUtils.stringToObject(json, new TypeReference<>() {
+        });
+
+    UpsertCompactionTaskGenerator.SegmentSelectionResult result =
+        UpsertCompactionTaskGenerator.processValidDocIdsMetadata(compactionConfigs, _completedSegmentsMap, metadata, 3);
+    assertEquals(result.getSegmentsForCompaction().size(), 0);
+
+    // expectedReplicas <= 0 disables the replica-count check, so EQUAL still selects when remaining replicas agree.
+    result = UpsertCompactionTaskGenerator.processValidDocIdsMetadata(compactionConfigs, _completedSegmentsMap,
+        metadata, 0);
+    assertEquals(result.getSegmentsForCompaction().size(), 1);
+  }
+
+  private static String replicaJson(SegmentZKMetadata segment, long totalValidDocs, long totalInvalidDocs,
+      String serverStatus, String instanceId) {
+    return "{\"totalValidDocs\": " + totalValidDocs + ", \"totalInvalidDocs\": " + totalInvalidDocs
+        + ", \"segmentName\": \"" + segment.getSegmentName() + "\", \"totalDocs\": "
+        + (totalValidDocs + totalInvalidDocs) + ", \"segmentCrc\": \"" + segment.getCrc()
+        + "\", \"segmentCreationTimeMillis\": 1234567890, \"serverStatus\": \"" + serverStatus
+        + "\", \"instanceId\": \"" + instanceId + "\"}";
   }
 }
