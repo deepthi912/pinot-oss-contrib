@@ -36,6 +36,7 @@ import org.apache.helix.model.InstanceConfig;
 import org.apache.pinot.common.auth.AuthProviderUtils;
 import org.apache.pinot.common.auth.NullAuthProvider;
 import org.apache.pinot.common.restlet.resources.ValidDocIdsBitmapResponse;
+import org.apache.pinot.common.restlet.resources.ValidDocIdsMetadataInfo;
 import org.apache.pinot.common.restlet.resources.ValidDocIdsType;
 import org.apache.pinot.common.utils.RoaringBitmapUtils;
 import org.apache.pinot.common.utils.ServiceStatus;
@@ -305,6 +306,78 @@ public class MinionTaskUtils {
    */
   public static boolean isReplicaServerReady(@Nullable ServiceStatus.Status status) {
     return status == null || status.equals(ServiceStatus.Status.GOOD);
+  }
+
+  /**
+   * Cross-replica consensus resolver shared by upsert task generators. Given the per-replica metadata for one
+   * segment, returns a single {@link ValidDocIdsMetadataInfo} to drive the per-segment scheduling decision, or
+   * {@code null} to skip the segment.
+   *
+   * - {@code UNSAFE}: returns the first replica with matching CRC and READY server; {@code null} if none.
+   * - {@code EQUAL}: requires (a) at least {@code expectedReplicas} responses, (b) every replica has matching
+   *   CRC and READY server, (c) all replicas report the same {@code totalDocs}, {@code totalValidDocs}, and
+   *   {@code totalInvalidDocs}. Returns the first replica when consistent; {@code null} otherwise.
+   * - {@code MOST_VALID_DOCS}: same per-replica requirements as {@code EQUAL} plus the replica-count check,
+   *   then returns the replica with the highest {@code totalValidDocs}.
+   *
+   * {@code expectedReplicas <= 0} disables the replica-count check.
+   */
+  @Nullable
+  public static ValidDocIdsMetadataInfo chooseValidDocIdsReplica(String segmentName, long expectedCrc,
+      @Nullable List<ValidDocIdsMetadataInfo> replicas, MinionConstants.ValidDocIdsConsensusMode mode,
+      int expectedReplicas) {
+    if (replicas == null || replicas.isEmpty()) {
+      return null;
+    }
+    String expectedCrcStr = String.valueOf(expectedCrc);
+    if (mode == MinionConstants.ValidDocIdsConsensusMode.UNSAFE) {
+      for (ValidDocIdsMetadataInfo replica : replicas) {
+        if (isReplicaCrcMatching(expectedCrcStr, replica.getSegmentCrc())
+            && isReplicaServerReady(replica.getServerStatus())) {
+          return replica;
+        }
+      }
+      return null;
+    }
+    if (expectedReplicas > 0 && replicas.size() < expectedReplicas) {
+      LOGGER.warn("Segment {} returned validDocIds metadata from only {} of {} replicas (consensusMode={}); "
+          + "skipping task generation", segmentName, replicas.size(), expectedReplicas, mode);
+      return null;
+    }
+    for (ValidDocIdsMetadataInfo replica : replicas) {
+      if (!isReplicaCrcMatching(expectedCrcStr, replica.getSegmentCrc())) {
+        LOGGER.warn("CRC mismatch for segment: {} on server {} (zkCrc={}, serverCrc={}); skipping task generation "
+            + "(consensusMode={})", segmentName, replica.getInstanceId(), expectedCrcStr, replica.getSegmentCrc(),
+            mode);
+        return null;
+      }
+      if (!isReplicaServerReady(replica.getServerStatus())) {
+        LOGGER.warn("Server {} is in {} state for segment: {}; skipping task generation (consensusMode={})",
+            replica.getInstanceId(), replica.getServerStatus(), segmentName, mode);
+        return null;
+      }
+    }
+    if (mode == MinionConstants.ValidDocIdsConsensusMode.EQUAL) {
+      ValidDocIdsMetadataInfo first = replicas.get(0);
+      for (ValidDocIdsMetadataInfo replica : replicas) {
+        if (replica.getTotalDocs() != first.getTotalDocs()
+            || replica.getTotalValidDocs() != first.getTotalValidDocs()
+            || replica.getTotalInvalidDocs() != first.getTotalInvalidDocs()) {
+          LOGGER.warn("Replicas disagree on valid doc counts for segment {} (consensusMode=EQUAL); "
+              + "skipping task generation", segmentName);
+          return null;
+        }
+      }
+      return first;
+    }
+    // MOST_VALID_DOCS: pick the replica reporting the most valid docs.
+    ValidDocIdsMetadataInfo chosen = replicas.get(0);
+    for (ValidDocIdsMetadataInfo replica : replicas) {
+      if (replica.getTotalValidDocs() > chosen.getTotalValidDocs()) {
+        chosen = replica;
+      }
+    }
+    return chosen;
   }
 
   /**

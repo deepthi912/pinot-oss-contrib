@@ -44,6 +44,7 @@ import org.apache.pinot.controller.helix.core.minion.generator.TaskGeneratorUtil
 import org.apache.pinot.controller.util.ServerSegmentMetadataReader;
 import org.apache.pinot.core.common.MinionConstants;
 import org.apache.pinot.core.minion.PinotTaskConfig;
+import org.apache.pinot.plugin.minion.tasks.MinionTaskUtils;
 import org.apache.pinot.spi.annotations.minion.TaskGenerator;
 import org.apache.pinot.spi.config.table.TableConfig;
 import org.apache.pinot.spi.config.table.TableType;
@@ -187,7 +188,7 @@ public class UpsertCompactMergeTaskGenerator extends BaseTaskGenerator {
 
       SegmentSelectionResult segmentSelectionResult =
           processValidDocIdsMetadata(tableNameWithType, taskConfigs, candidateSegmentsMap, validDocIdsMetadataList,
-              alreadyMergedSegments, _clusterInfoAccessor.getControllerMetrics());
+              alreadyMergedSegments, _clusterInfoAccessor.getControllerMetrics(), tableConfig.getReplication());
 
       if (!segmentSelectionResult.getSegmentsForDeletion().isEmpty()) {
         pinotHelixResourceManager.deleteSegments(tableNameWithType, segmentSelectionResult.getSegmentsForDeletion(),
@@ -250,7 +251,7 @@ public class UpsertCompactMergeTaskGenerator extends BaseTaskGenerator {
   public static SegmentSelectionResult processValidDocIdsMetadata(String tableNameWithType,
       Map<String, String> taskConfigs, Map<String, SegmentZKMetadata> candidateSegmentsMap,
       Map<String, List<ValidDocIdsMetadataInfo>> validDocIdsMetadataInfoMap, Set<String> alreadyMergedSegments,
-      ControllerMetrics controllerMetrics) {
+      ControllerMetrics controllerMetrics, int expectedReplicas) {
     Map<Integer, List<SegmentMergerMetadata>> segmentsEligibleForCompactMerge = new HashMap<>();
     Set<String> segmentsForDeletion = new HashSet<>();
 
@@ -267,6 +268,10 @@ public class UpsertCompactMergeTaskGenerator extends BaseTaskGenerator {
     long minNumSegments = Long.parseLong(
         taskConfigs.getOrDefault(MinionConstants.UpsertCompactMergeTask.MIN_NUM_SEGMENTS_PER_TASK_KEY,
             String.valueOf(MinionConstants.UpsertCompactMergeTask.DEFAULT_MIN_NUM_SEGMENTS_PER_TASK)));
+    // Use the UpsertCompactionTask consensus mode key to stay consistent with UpsertCompactMergeTaskExecutor,
+    // which reads from the same key when calling MinionTaskUtils.getValidDocIdFromServerMatchingCrc.
+    MinionConstants.ValidDocIdsConsensusMode consensusMode = MinionTaskUtils.parseValidDocIdsConsensusMode(
+        taskConfigs.get(MinionConstants.UpsertCompactionTask.VALID_DOC_IDS_CONSENSUS_MODE_KEY));
 
     // default to Long.MAX_VALUE to avoid size-based compaction by default
     long outputSegmentMaxSizeInBytes = Long.MAX_VALUE;
@@ -293,41 +298,34 @@ public class UpsertCompactMergeTaskGenerator extends BaseTaskGenerator {
         continue;
       }
       SegmentZKMetadata segment = candidateSegmentsMap.get(segmentName);
+      ValidDocIdsMetadataInfo selected = MinionTaskUtils.chooseValidDocIdsReplica(segmentName, segment.getCrc(),
+          validDocIdsMetadataInfoMap.get(segmentName), consensusMode, expectedReplicas);
+      if (selected == null) {
+        continue;
+      }
 
-      // Process with existing logic using the first replica with matching CRC (since all have consensus)
-      for (ValidDocIdsMetadataInfo validDocIdsMetadata : validDocIdsMetadataInfoMap.get(segmentName)) {
-        long totalInvalidDocs = validDocIdsMetadata.getTotalInvalidDocs();
-        long totalValidDocs = validDocIdsMetadata.getTotalValidDocs();
-        long segmentSizeInBytes = validDocIdsMetadata.getSegmentSizeInBytes();
+      long totalInvalidDocs = selected.getTotalInvalidDocs();
+      long totalValidDocs = selected.getTotalValidDocs();
+      long segmentSizeInBytes = selected.getSegmentSizeInBytes();
+      long totalDocs = selected.getTotalDocs();
 
-        // Skip segments if the crc from zk metadata and server does not match. They may be getting reloaded.
-        if (segment.getCrc() != Long.parseLong(validDocIdsMetadata.getSegmentCrc())) {
-          LOGGER.warn("CRC mismatch for segment: {}, (segmentZKMetadata={}, validDocIdsMetadata={})", segmentName,
-              segment.getCrc(), validDocIdsMetadata.getSegmentCrc());
+      if (totalInvalidDocs == totalDocs) {
+        // segments eligible for deletion with no valid records
+        segmentsForDeletion.add(segmentName);
+      } else if (alreadyMergedSegments.contains(segmentName)) {
+        LOGGER.debug("Segment {} already merged. Skipping it for {}", segmentName,
+            MinionConstants.UpsertCompactMergeTask.TASK_TYPE);
+      } else {
+        Integer partitionID = SegmentUtils.getPartitionIdFromSegmentName(segmentName);
+        if (partitionID == null) {
+          LOGGER.warn("Partition ID not found for segment: {}, skipping it for {}", segmentName,
+              MinionConstants.UpsertCompactMergeTask.TASK_TYPE);
           continue;
         }
-
-        // segments eligible for deletion with no valid records
-        long totalDocs = validDocIdsMetadata.getTotalDocs();
-        if (totalInvalidDocs == totalDocs) {
-          segmentsForDeletion.add(segmentName);
-        } else if (alreadyMergedSegments.contains(segmentName)) {
-          LOGGER.debug("Segment {} already merged. Skipping it for {}", segmentName,
-              MinionConstants.UpsertCompactMergeTask.TASK_TYPE);
-          break;
-        } else {
-          Integer partitionID = SegmentUtils.getPartitionIdFromSegmentName(segmentName);
-          if (partitionID == null) {
-            LOGGER.warn("Partition ID not found for segment: {}, skipping it for {}", segmentName,
-                MinionConstants.UpsertCompactMergeTask.TASK_TYPE);
-            continue;
-          }
-          double expectedSegmentSizeAfterCompaction = (segmentSizeInBytes * totalValidDocs * 1.0) / totalDocs;
-          segmentsEligibleForCompactMerge.computeIfAbsent(partitionID, k -> new ArrayList<>())
-              .add(new SegmentMergerMetadata(segment, totalValidDocs, totalInvalidDocs,
-                  expectedSegmentSizeAfterCompaction));
-        }
-        break;
+        double expectedSegmentSizeAfterCompaction = (segmentSizeInBytes * totalValidDocs * 1.0) / totalDocs;
+        segmentsEligibleForCompactMerge.computeIfAbsent(partitionID, k -> new ArrayList<>())
+            .add(new SegmentMergerMetadata(segment, totalValidDocs, totalInvalidDocs,
+                expectedSegmentSizeAfterCompaction));
       }
     }
 

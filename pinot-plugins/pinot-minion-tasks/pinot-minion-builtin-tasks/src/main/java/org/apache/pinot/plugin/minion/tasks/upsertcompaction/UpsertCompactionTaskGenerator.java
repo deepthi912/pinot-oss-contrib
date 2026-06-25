@@ -225,98 +225,27 @@ public class UpsertCompactionTaskGenerator extends BaseTaskGenerator {
         continue;
       }
       SegmentZKMetadata segment = completedSegmentsMap.get(segmentName);
-      for (ValidDocIdsMetadataInfo validDocIdsMetadata : validDocIdsMetadataInfoMap.get(segmentName)) {
-        // selected starts as the current per-replica entry and may be reassigned below when consensus mode is
-        // EQUAL/MOST_VALID_DOCS so the threshold compare runs on the agreed-upon counts.
-        ValidDocIdsMetadataInfo selected = validDocIdsMetadata;
-        long totalInvalidDocs = selected.getTotalInvalidDocs();
-
-        // Skip segments if the crc from zk metadata and server does not match. They may be being reloaded.
-        if (!MinionTaskUtils.isReplicaCrcMatching(String.valueOf(segment.getCrc()), selected.getSegmentCrc())) {
-          LOGGER.warn("CRC mismatch for segment: {}, (segmentZKMetadata={}, validDocIdsMetadata={})", segmentName,
-              segment.getCrc(), selected.getSegmentCrc());
-          continue;
-        }
-
-        // skipping segments for which their servers are not in READY state. The bitmaps would be inconsistent when
-        // server is NOT READY as UPDATING segments might be updating the ONLINE segments
-        if (!MinionTaskUtils.isReplicaServerReady(selected.getServerStatus())) {
-          LOGGER.warn("Server {} is in {} state, skipping {} generation for segment: {}", selected.getInstanceId(),
-              selected.getServerStatus(), MinionConstants.UpsertCompactionTask.TASK_TYPE, segmentName);
-          continue;
-        }
-
-        // Cross-replica consensus check (skipped under UNSAFE so the loop falls through to the first usable replica).
-        // In EQUAL and MOST_VALID_DOCS we require every replica to be usable (matching CRC AND server READY), plus a
-        // mode-specific agreement check on the valid/invalid doc counts.
-        if (consensusMode != MinionConstants.ValidDocIdsConsensusMode.UNSAFE) {
-          List<ValidDocIdsMetadataInfo> replicas = validDocIdsMetadataInfoMap.get(segmentName);
-          if (expectedReplicas > 0 && replicas.size() < expectedReplicas) {
-            LOGGER.warn("Segment {} returned validDocIds metadata from only {} of {} replicas (consensusMode={}); "
-                + "skipping task generation", segmentName, replicas.size(), expectedReplicas, consensusMode);
-            break;
-          }
-          boolean allReplicasUsable = true;
-          for (ValidDocIdsMetadataInfo r : replicas) {
-            if (!MinionTaskUtils.isReplicaCrcMatching(String.valueOf(segment.getCrc()), r.getSegmentCrc())
-                || !MinionTaskUtils.isReplicaServerReady(r.getServerStatus())) {
-              allReplicasUsable = false;
-              break;
-            }
-          }
-          if (!allReplicasUsable) {
-            LOGGER.warn("Segment {} has at least one unusable replica (CRC mismatch or server not READY); "
-                + "skipping (consensusMode={})", segmentName, consensusMode);
-            break;
-          }
-          if (consensusMode == MinionConstants.ValidDocIdsConsensusMode.EQUAL) {
-            ValidDocIdsMetadataInfo first = replicas.get(0);
-            boolean countsAgree = true;
-            for (ValidDocIdsMetadataInfo r : replicas) {
-              if (r.getTotalDocs() != first.getTotalDocs() || r.getTotalValidDocs() != first.getTotalValidDocs()
-                  || r.getTotalInvalidDocs() != first.getTotalInvalidDocs()) {
-                countsAgree = false;
-                break;
-              }
-            }
-            if (!countsAgree) {
-              LOGGER.warn("Replicas disagree on valid doc counts for segment {} (consensusMode=EQUAL); "
-                  + "skipping task generation", segmentName);
-              break;
-            }
-            // Use the (consistent) first replica's counts for the threshold compare below.
-            selected = first;
-            totalInvalidDocs = first.getTotalInvalidDocs();
-          } else {
-            // MOST_VALID_DOCS: pick the replica reporting the most valid docs.
-            ValidDocIdsMetadataInfo chosen = replicas.get(0);
-            for (ValidDocIdsMetadataInfo r : replicas) {
-              if (r.getTotalValidDocs() > chosen.getTotalValidDocs()) {
-                chosen = r;
-              }
-            }
-            selected = chosen;
-            totalInvalidDocs = chosen.getTotalInvalidDocs();
-          }
-        }
-
-        long totalDocs = selected.getTotalDocs();
-        double invalidRecordPercent = ((double) totalInvalidDocs / totalDocs) * 100;
-        if (totalInvalidDocs == totalDocs) {
-          LOGGER.debug("Segment {} contains only invalid records, adding it to the deletion list", segmentName);
-          segmentsForDeletion.add(segment.getSegmentName());
-        } else if (invalidRecordPercent >= invalidRecordsThresholdPercent
-            && totalInvalidDocs >= invalidRecordsThresholdCount) {
-          LOGGER.debug("Segment {} contains {} invalid records out of {} total records "
-                  + "(count threshold: {}, percent threshold: {}), adding it to the compaction list", segmentName,
-              totalInvalidDocs, totalDocs, invalidRecordsThresholdCount, invalidRecordsThresholdPercent);
-          segmentsForCompaction.add(Pair.of(segment, totalInvalidDocs));
-        } else {
-          LOGGER.debug("Segment {} contains {} invalid records out of {} total records "
-                  + "(count threshold: {}, percent threshold: {}), skipping it for compaction", segmentName,
-              totalInvalidDocs, totalDocs, invalidRecordsThresholdCount, invalidRecordsThresholdPercent);
-        }
-        break;
+      ValidDocIdsMetadataInfo selected = MinionTaskUtils.chooseValidDocIdsReplica(segmentName, segment.getCrc(),
+          validDocIdsMetadataInfoMap.get(segmentName), consensusMode, expectedReplicas);
+      if (selected == null) {
+        continue;
+      }
+      long totalInvalidDocs = selected.getTotalInvalidDocs();
+      long totalDocs = selected.getTotalDocs();
+      double invalidRecordPercent = ((double) totalInvalidDocs / totalDocs) * 100;
+      if (totalInvalidDocs == totalDocs) {
+        LOGGER.debug("Segment {} contains only invalid records, adding it to the deletion list", segmentName);
+        segmentsForDeletion.add(segment.getSegmentName());
+      } else if (invalidRecordPercent >= invalidRecordsThresholdPercent
+          && totalInvalidDocs >= invalidRecordsThresholdCount) {
+        LOGGER.debug("Segment {} contains {} invalid records out of {} total records "
+                + "(count threshold: {}, percent threshold: {}), adding it to the compaction list", segmentName,
+            totalInvalidDocs, totalDocs, invalidRecordsThresholdCount, invalidRecordsThresholdPercent);
+        segmentsForCompaction.add(Pair.of(segment, totalInvalidDocs));
+      } else {
+        LOGGER.debug("Segment {} contains {} invalid records out of {} total records "
+                + "(count threshold: {}, percent threshold: {}), skipping it for compaction", segmentName,
+            totalInvalidDocs, totalDocs, invalidRecordsThresholdCount, invalidRecordsThresholdPercent);
       }
     }
     segmentsForCompaction.sort((o1, o2) -> {
