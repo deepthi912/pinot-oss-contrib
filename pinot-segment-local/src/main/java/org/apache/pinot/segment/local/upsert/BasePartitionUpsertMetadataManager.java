@@ -685,18 +685,46 @@ public abstract class BasePartitionUpsertMetadataManager implements PartitionUps
       // segment replacement is done.
       validDocIdsForOldSegment = getValidDocIdsForOldSegment(oldSegment);
     }
-    if (validDocIdsForOldSegment != null && !validDocIdsForOldSegment.isEmpty()) {
-      if (shouldRevertMetadataOnInconsistency(oldSegment)) {
-        // If there are still valid docs in the old segment, validate and revert the metadata of the
-        // consuming segment in place
-        revertSegmentUpsertMetadata(oldSegment, segmentName, validDocIdsForOldSegment);
-        return;
-      }
-      _logger.warn("Found {} primary keys not replaced for segment: {}",
-          validDocIdsForOldSegment.getCardinality(), segmentName);
-      updateInconsistentRowsMetric(segmentName, validDocIdsForOldSegment.getCardinality());
-      removeSegment(oldSegment, validDocIdsForOldSegment);
+    finalizeOldSegmentReplacement(oldSegment, validDocIdsForOldSegment);
+  }
+
+  /// Single choke point for finalizing the disposition of an old segment after replacement.
+  /// Handles three cases:
+  /// - `null`/empty residual valid docs: subclass-specific cleanup via [#onOldSegmentFullyReplaced].
+  /// - Non-empty residual valid docs in revert-on-inconsistency mode: [#revertSegmentUpsertMetadata].
+  /// - Non-empty residual valid docs otherwise: warn, [#updateInconsistentRowsMetric], then
+  ///   [#removeSegment(IndexSegment, MutableRoaringBitmap)].
+  ///
+  /// Callers must invoke this after the segment-replacement impl completes, regardless of
+  /// whether any residual valid docs remain — the empty-bitmap branch is what lets subclasses
+  /// unlink a fully-replaced segment from their own maps.
+  protected final void finalizeOldSegmentReplacement(@Nullable IndexSegment oldSegment,
+      @Nullable MutableRoaringBitmap validDocIdsForOldSegment) {
+    if (oldSegment == null) {
+      return;
     }
+    if (validDocIdsForOldSegment == null || validDocIdsForOldSegment.isEmpty()) {
+      onOldSegmentFullyReplaced(oldSegment);
+      return;
+    }
+    String segmentName = oldSegment.getSegmentName();
+    if (shouldRevertMetadataOnInconsistency(oldSegment)) {
+      // If there are still valid docs in the old segment, validate and revert the metadata of the
+      // consuming segment in place
+      revertSegmentUpsertMetadata(oldSegment, segmentName, validDocIdsForOldSegment);
+      return;
+    }
+    _logger.warn("Found {} primary keys not replaced for segment: {}",
+        validDocIdsForOldSegment.getCardinality(), segmentName);
+    updateInconsistentRowsMetric(segmentName, validDocIdsForOldSegment.getCardinality());
+    removeSegment(oldSegment, validDocIdsForOldSegment);
+  }
+
+  /// Hook invoked when an old segment is fully replaced (no residual valid docs remain).
+  /// Subclasses can override to unlink the segment from subclass-specific bookkeeping (e.g. a
+  /// segment-id map). The default implementation is a no-op — the OSS base does not maintain
+  /// any per-segment state that survives replacement.
+  protected void onOldSegmentFullyReplaced(IndexSegment oldSegment) {
   }
 
   /// Determines whether metadata should be reverted when inconsistencies are detected during segment replacement.
