@@ -277,22 +277,21 @@ public class ConcurrentMapPartitionUpsertMetadataManagerForConsistentDeletes
         doAddOrReplaceSegment((ImmutableSegmentImpl) segment, validDocIds, queryableDocIds, recordInfoIterator,
             oldSegment, validDocIdsForOldSegment);
       }
-      if (validDocIdsForOldSegment != null && !validDocIdsForOldSegment.isEmpty()) {
-        if (shouldRevertMetadataOnInconsistency(oldSegment)) {
-          revertAndRemoveSegment(oldSegment, validDocIdsForOldSegment);
-          return;
-        }
-        _logger.warn("Found {} primary keys not replaced for segment: {}",
-            validDocIdsForOldSegment.getCardinality(), segmentName);
-        updateInconsistentRowsMetric(segmentName, validDocIdsForOldSegment.getCardinality());
-      }
-      // we want to always remove a segment in case of enableDeletedKeysCompactionConsistency = true
-      // this is to account for the removal of primary-key in the to-be-removed segment and reduce
-      // distinctSegmentCount by 1
-      doRemoveSegment(oldSegment);
+      finalizeOldSegmentReplacement(oldSegment, validDocIdsForOldSegment);
     } finally {
       segmentLock.unlock();
     }
+  }
+
+  @Override
+  protected void onOldSegmentFullyReplaced(IndexSegment oldSegment) {
+    doRemoveSegment(oldSegment);
+  }
+
+  @Override
+  protected void removeSegmentAfterInconsistentReplacement(IndexSegment oldSegment,
+      MutableRoaringBitmap validDocIdsForOldSegment) {
+    doRemoveSegment(oldSegment);
   }
 
   @Override

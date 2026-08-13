@@ -696,16 +696,23 @@ public abstract class BasePartitionUpsertMetadataManager implements PartitionUps
       onOldSegmentFullyReplaced(oldSegment);
       return;
     }
-    if (!shouldRevertMetadataOnInconsistency(oldSegment)) {
-      String segmentName = oldSegment.getSegmentName();
-      _logger.warn("Found {} primary keys not replaced for segment: {}",
-          validDocIdsForOldSegment.getCardinality(), segmentName);
-      updateInconsistentRowsMetric(segmentName, validDocIdsForOldSegment.getCardinality());
+    if (shouldRevertMetadataOnInconsistency(oldSegment)) {
+      revertAndRemoveSegment(oldSegment, validDocIdsForOldSegment);
+      return;
     }
-    dispatchRevertOrRemove(oldSegment, validDocIdsForOldSegment);
+    String segmentName = oldSegment.getSegmentName();
+    _logger.warn("Found {} primary keys not replaced for segment: {}",
+        validDocIdsForOldSegment.getCardinality(), segmentName);
+    updateInconsistentRowsMetric(segmentName, validDocIdsForOldSegment.getCardinality());
+    removeSegmentAfterInconsistentReplacement(oldSegment, validDocIdsForOldSegment);
   }
 
   protected void onOldSegmentFullyReplaced(IndexSegment oldSegment) {
+  }
+
+  protected void removeSegmentAfterInconsistentReplacement(IndexSegment oldSegment,
+      MutableRoaringBitmap validDocIdsForOldSegment) {
+    removeSegment(oldSegment, validDocIdsForOldSegment);
   }
 
   /// Determines whether metadata should be reverted when inconsistencies are detected during segment replacement.
