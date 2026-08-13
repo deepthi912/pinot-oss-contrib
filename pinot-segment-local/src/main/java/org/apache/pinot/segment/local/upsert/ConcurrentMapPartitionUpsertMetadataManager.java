@@ -232,7 +232,7 @@ public class ConcurrentMapPartitionUpsertMetadataManager extends BasePartitionUp
   }
 
   @Override
-  protected void revertAndRemoveSegment(IndexSegment segment, MutableRoaringBitmap validDocIds) {
+  protected void doRevertAndRemoveSegment(IndexSegment segment, MutableRoaringBitmap validDocIds) {
     try (PrimaryKeyReader primaryKeyReader = new PrimaryKeyReader(segment, _primaryKeyColumns)) {
       Iterator<Map.Entry<Integer, PrimaryKey>> primaryKeyIterator =
           UpsertUtils.getRecordIterator(primaryKeyReader, validDocIds);

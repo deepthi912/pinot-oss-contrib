@@ -88,7 +88,7 @@ public class DummyTableUpsertMetadataManager extends BaseTableUpsertMetadataMana
     }
 
     @Override
-    protected void revertAndRemoveSegment(IndexSegment segment, MutableRoaringBitmap validDocIds) {
+    protected void doRevertAndRemoveSegment(IndexSegment segment, MutableRoaringBitmap validDocIds) {
     }
 
     @Override

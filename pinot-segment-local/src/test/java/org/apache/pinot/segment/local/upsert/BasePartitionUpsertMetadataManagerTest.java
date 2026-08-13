@@ -1119,7 +1119,7 @@ public class BasePartitionUpsertMetadataManagerTest {
     }
 
     @Override
-    protected void revertAndRemoveSegment(IndexSegment segment, MutableRoaringBitmap validDocIds) {
+    protected void doRevertAndRemoveSegment(IndexSegment segment, MutableRoaringBitmap validDocIds) {
     }
 
     @Override

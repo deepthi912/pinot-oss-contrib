@@ -688,16 +688,6 @@ public abstract class BasePartitionUpsertMetadataManager implements PartitionUps
     finalizeOldSegmentReplacement(oldSegment, validDocIdsForOldSegment);
   }
 
-  /// Single choke point for finalizing the disposition of an old segment after replacement.
-  /// Handles three cases:
-  /// - `null`/empty residual valid docs: subclass-specific cleanup via [#onOldSegmentFullyReplaced].
-  /// - Non-empty residual valid docs in revert-on-inconsistency mode: [#revertSegmentUpsertMetadata].
-  /// - Non-empty residual valid docs otherwise: warn, [#updateInconsistentRowsMetric], then
-  ///   [#removeSegment(IndexSegment, MutableRoaringBitmap)].
-  ///
-  /// Callers must invoke this after the segment-replacement impl completes, regardless of
-  /// whether any residual valid docs remain — the empty-bitmap branch is what lets subclasses
-  /// unlink a fully-replaced segment from their own maps.
   protected final void finalizeOldSegmentReplacement(@Nullable IndexSegment oldSegment,
       @Nullable MutableRoaringBitmap validDocIdsForOldSegment) {
     if (oldSegment == null) {
@@ -707,23 +697,15 @@ public abstract class BasePartitionUpsertMetadataManager implements PartitionUps
       onOldSegmentFullyReplaced(oldSegment);
       return;
     }
-    String segmentName = oldSegment.getSegmentName();
-    if (shouldRevertMetadataOnInconsistency(oldSegment)) {
-      // If there are still valid docs in the old segment, validate and revert the metadata of the
-      // consuming segment in place
-      revertSegmentUpsertMetadata(oldSegment, segmentName, validDocIdsForOldSegment);
-      return;
+    if (!shouldRevertMetadataOnInconsistency(oldSegment)) {
+      String segmentName = oldSegment.getSegmentName();
+      _logger.warn("Found {} primary keys not replaced for segment: {}",
+          validDocIdsForOldSegment.getCardinality(), segmentName);
+      updateInconsistentRowsMetric(segmentName, validDocIdsForOldSegment.getCardinality());
     }
-    _logger.warn("Found {} primary keys not replaced for segment: {}",
-        validDocIdsForOldSegment.getCardinality(), segmentName);
-    updateInconsistentRowsMetric(segmentName, validDocIdsForOldSegment.getCardinality());
-    removeSegment(oldSegment, validDocIdsForOldSegment);
+    dispatchRevertOrRemove(oldSegment, validDocIdsForOldSegment);
   }
 
-  /// Hook invoked when an old segment is fully replaced (no residual valid docs remain).
-  /// Subclasses can override to unlink the segment from subclass-specific bookkeeping (e.g. a
-  /// segment-id map). The default implementation is a no-op — the OSS base does not maintain
-  /// any per-segment state that survives replacement.
   protected void onOldSegmentFullyReplaced(IndexSegment oldSegment) {
   }
 
@@ -740,29 +722,6 @@ public abstract class BasePartitionUpsertMetadataManager implements PartitionUps
         && _context.isTableTypeInconsistentDuringConsumption();
   }
 
-  /// Reverts segment upsert metadata. Invokes [#revertAndRemoveSegment] **directly** — no
-  /// second dispatch through [#removeSegment(IndexSegment, MutableRoaringBitmap)] — so the
-  /// revert decision happens exactly once at the outer call site.
-  protected void revertSegmentUpsertMetadata(IndexSegment oldSegment, String segmentName,
-      MutableRoaringBitmap validDocIdsForOldSegment) {
-    _logger.info("Inconsistencies noticed for the segment: {} across servers, reverting the metadata to resolve...",
-        segmentName);
-    // Revert the keys in the segment to previous location and remove the newly added keys
-    revertAndRemoveSegment(oldSegment, validDocIdsForOldSegment);
-    if (getPrevKeyToRecordLocationSize() == 0) {
-      _logger.info("Successfully resolved inconsistency for segment: {} across servers", segmentName);
-      return;
-    }
-    int numKeysStillNotReplaced = getPrevKeyToRecordLocationSize();
-    if (numKeysStillNotReplaced > 0) {
-      _logger.warn("Found {} primary keys not replaced for segment: {} after revert attempt",
-          numKeysStillNotReplaced, segmentName);
-      updateInconsistentRowsMetric(segmentName, numKeysStillNotReplaced);
-      // Clear the map when inconsistencies still exist for the consuming segments
-      clearPrevKeyToRecordLocation();
-    }
-  }
-
   protected void updateInconsistentRowsMetric(String segmentName, int numKeysStillNotReplaced) {
     if (_partialUpsertHandler != null) {
       _serverMetrics.addMeteredTableValue(_tableNameWithType, ServerMeter.PARTIAL_UPSERT_KEYS_NOT_REPLACED,
@@ -777,9 +736,6 @@ public abstract class BasePartitionUpsertMetadataManager implements PartitionUps
     return oldSegment.getValidDocIds() != null ? oldSegment.getValidDocIds().getMutableRoaringBitmap() : null;
   }
 
-  /// Removes the metadata of the given segment for every doc in `validDocIds`. Pure removal —
-  /// no revert decision here. Subclasses own the `PrimaryKeyReader` lifecycle and iterator
-  /// construction; the base only decides *when* to call this vs `revertAndRemoveSegment`.
   protected abstract void removeSegment(IndexSegment segment, MutableRoaringBitmap validDocIds);
 
   @Override
@@ -821,11 +777,7 @@ public abstract class BasePartitionUpsertMetadataManager implements PartitionUps
     }
 
     _logger.info("Removing {} primary keys for segment: {}", validDocIds.getCardinality(), segmentName);
-    if (shouldRevertMetadataOnInconsistency(segment)) {
-      revertSegmentUpsertMetadata(segment, segmentName, validDocIds);
-    } else {
-      removeSegment(segment, validDocIds);
-    }
+    dispatchRevertOrRemove(segment, validDocIds);
 
     // Update metrics
     long numPrimaryKeys = getNumPrimaryKeys();
@@ -1161,10 +1113,31 @@ public abstract class BasePartitionUpsertMetadataManager implements PartitionUps
     }
   }
 
-  /// Reverts the metadata of the given segment for every doc in `validDocIds` back to the previous
-  /// segment's record location, then removes the segment. Subclasses own the `PrimaryKeyReader`
-  /// lifecycle and iterator construction; the base only decides *when* to call this.
-  protected abstract void revertAndRemoveSegment(IndexSegment segment, MutableRoaringBitmap validDocIds);
+  protected final void revertAndRemoveSegment(IndexSegment segment, MutableRoaringBitmap validDocIds) {
+    String segmentName = segment.getSegmentName();
+    _logger.info("Inconsistencies noticed for the segment: {} across servers, reverting the metadata to resolve...",
+        segmentName);
+    doRevertAndRemoveSegment(segment, validDocIds);
+    int numKeysStillNotReplaced = getPrevKeyToRecordLocationSize();
+    if (numKeysStillNotReplaced == 0) {
+      _logger.info("Successfully resolved inconsistency for segment: {} across servers", segmentName);
+      return;
+    }
+    _logger.warn("Found {} primary keys not replaced for segment: {} after revert attempt",
+        numKeysStillNotReplaced, segmentName);
+    updateInconsistentRowsMetric(segmentName, numKeysStillNotReplaced);
+    clearPrevKeyToRecordLocation();
+  }
+
+  protected final void dispatchRevertOrRemove(IndexSegment segment, MutableRoaringBitmap validDocIds) {
+    if (shouldRevertMetadataOnInconsistency(segment)) {
+      revertAndRemoveSegment(segment, validDocIds);
+    } else {
+      removeSegment(segment, validDocIds);
+    }
+  }
+
+  protected abstract void doRevertAndRemoveSegment(IndexSegment segment, MutableRoaringBitmap validDocIds);
 
   /// Removes all primary keys that have comparison value smaller than (largestSeenComparisonValue - TTL).
   protected abstract void doRemoveExpiredPrimaryKeys();

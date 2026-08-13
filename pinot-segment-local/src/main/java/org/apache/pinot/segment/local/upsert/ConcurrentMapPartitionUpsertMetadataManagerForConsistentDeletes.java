@@ -246,11 +246,7 @@ public class ConcurrentMapPartitionUpsertMetadataManagerForConsistentDeletes
     // to properly decrement distinctSegmentCount for every key that was ever in the segment.
     MutableRoaringBitmap allDocIds = new MutableRoaringBitmap();
     allDocIds.add(0L, segment.getSegmentMetadata().getTotalDocs());
-    if (shouldRevertMetadataOnInconsistency(segment)) {
-      revertSegmentUpsertMetadata(segment, segmentName, allDocIds);
-    } else {
-      removeSegment(segment, allDocIds);
-    }
+    dispatchRevertOrRemove(segment, allDocIds);
     // Update metrics
     long numPrimaryKeys = getNumPrimaryKeys();
     updatePrimaryKeyGauge(numPrimaryKeys);
@@ -283,7 +279,7 @@ public class ConcurrentMapPartitionUpsertMetadataManagerForConsistentDeletes
       }
       if (validDocIdsForOldSegment != null && !validDocIdsForOldSegment.isEmpty()) {
         if (shouldRevertMetadataOnInconsistency(oldSegment)) {
-          revertSegmentUpsertMetadata(oldSegment, segmentName, validDocIdsForOldSegment);
+          revertAndRemoveSegment(oldSegment, validDocIdsForOldSegment);
           return;
         }
         _logger.warn("Found {} primary keys not replaced for segment: {}",
@@ -299,7 +295,6 @@ public class ConcurrentMapPartitionUpsertMetadataManagerForConsistentDeletes
     }
   }
 
-  @Override
   @Override
   protected void removeSegment(IndexSegment segment, MutableRoaringBitmap validDocIds) {
     // We need to decrease the distinctSegmentCount for each unique primary key in this deleting segment by 1
@@ -334,7 +329,7 @@ public class ConcurrentMapPartitionUpsertMetadataManagerForConsistentDeletes
   }
 
   @Override
-  protected void revertAndRemoveSegment(IndexSegment segment, MutableRoaringBitmap validDocIds) {
+  protected void doRevertAndRemoveSegment(IndexSegment segment, MutableRoaringBitmap validDocIds) {
     // We need to decrease the distinctSegmentCount for each unique primary key in this deleting segment by 1
     // as the occurrence of the key in this segment is being removed. We are taking a set of unique primary keys
     // to avoid double counting the same key in the same segment.
