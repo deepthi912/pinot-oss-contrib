@@ -740,13 +740,15 @@ public abstract class BasePartitionUpsertMetadataManager implements PartitionUps
         && _context.isTableTypeInconsistentDuringConsumption();
   }
 
-  /// Reverts segment upsert metadata
+  /// Reverts segment upsert metadata. Invokes [#revertAndRemoveSegment] **directly** — no
+  /// second dispatch through [#removeSegment(IndexSegment, MutableRoaringBitmap)] — so the
+  /// revert decision happens exactly once at the outer call site.
   protected void revertSegmentUpsertMetadata(IndexSegment oldSegment, String segmentName,
       MutableRoaringBitmap validDocIdsForOldSegment) {
     _logger.info("Inconsistencies noticed for the segment: {} across servers, reverting the metadata to resolve...",
         segmentName);
     // Revert the keys in the segment to previous location and remove the newly added keys
-    removeSegment(oldSegment, validDocIdsForOldSegment);
+    revertAndRemoveSegment(oldSegment, validDocIdsForOldSegment);
     if (getPrevKeyToRecordLocationSize() == 0) {
       _logger.info("Successfully resolved inconsistency for segment: {} across servers", segmentName);
       return;
@@ -775,12 +777,10 @@ public abstract class BasePartitionUpsertMetadataManager implements PartitionUps
     return oldSegment.getValidDocIds() != null ? oldSegment.getValidDocIds().getMutableRoaringBitmap() : null;
   }
 
+  /// Removes the metadata of the given segment for every doc in `validDocIds`. Pure removal —
+  /// no revert decision here. Subclasses own the `PrimaryKeyReader` lifecycle and iterator
+  /// construction; the base only decides *when* to call this vs `revertAndRemoveSegment`.
   protected abstract void removeSegment(IndexSegment segment, MutableRoaringBitmap validDocIds);
-
-  protected void removeSegment(IndexSegment segment, Iterator<PrimaryKey> primaryKeyIterator) {
-    throw new UnsupportedOperationException("Both removeSegment(segment, validDocID) and "
-        + "removeSegment(segment, pkIterator) are not implemented. Implement one of them to support removal.");
-  }
 
   @Override
   public void removeSegment(IndexSegment segment) {
@@ -1161,8 +1161,10 @@ public abstract class BasePartitionUpsertMetadataManager implements PartitionUps
     }
   }
 
-  protected abstract void revertAndRemoveSegment(IndexSegment segment,
-      Iterator<Map.Entry<Integer, PrimaryKey>> primaryKeyIterator);
+  /// Reverts the metadata of the given segment for every doc in `validDocIds` back to the previous
+  /// segment's record location, then removes the segment. Subclasses own the `PrimaryKeyReader`
+  /// lifecycle and iterator construction; the base only decides *when* to call this.
+  protected abstract void revertAndRemoveSegment(IndexSegment segment, MutableRoaringBitmap validDocIds);
 
   /// Removes all primary keys that have comparison value smaller than (largestSeenComparisonValue - TTL).
   protected abstract void doRemoveExpiredPrimaryKeys();

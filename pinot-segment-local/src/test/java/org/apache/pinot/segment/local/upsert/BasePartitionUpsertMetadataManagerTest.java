@@ -1119,12 +1119,7 @@ public class BasePartitionUpsertMetadataManagerTest {
     }
 
     @Override
-    protected void revertAndRemoveSegment(IndexSegment segment,
-        Iterator<Map.Entry<Integer, PrimaryKey>> primaryKeyIterator) {
-    }
-
-    @Override
-    protected void removeSegment(IndexSegment segment, Iterator<PrimaryKey> primaryKeyIterator) {
+    protected void revertAndRemoveSegment(IndexSegment segment, MutableRoaringBitmap validDocIds) {
     }
 
     @Override

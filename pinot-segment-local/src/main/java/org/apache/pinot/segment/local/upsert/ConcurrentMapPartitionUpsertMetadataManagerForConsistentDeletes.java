@@ -243,39 +243,19 @@ public class ConcurrentMapPartitionUpsertMetadataManagerForConsistentDeletes
         segment instanceof ImmutableSegment ? "immutable" : "mutable", segmentName, getNumPrimaryKeys());
     long startTimeMs = System.currentTimeMillis();
     // For ConsistentDeletes, we need to iterate over ALL docs in the segment (not just valid ones)
-    // to properly decrement distinctSegmentCount for every key that was ever in the segment
-    try (PrimaryKeyReader primaryKeyReader = new PrimaryKeyReader(segment, _primaryKeyColumns)) {
-      if (shouldRevertMetadataOnInconsistency(segment)) {
-        revertAndRemoveSegment(segment,
-            UpsertUtils.getRecordIterator(primaryKeyReader, segment.getSegmentMetadata().getTotalDocs()));
-      } else {
-        removeSegment(segment,
-            UpsertUtils.getPrimaryKeyIterator(primaryKeyReader, segment.getSegmentMetadata().getTotalDocs()));
-      }
-    } catch (Exception e) {
-      throw new RuntimeException(
-          String.format("Caught exception while removing segment: %s, table: %s", segment.getSegmentName(),
-              _tableNameWithType), e);
+    // to properly decrement distinctSegmentCount for every key that was ever in the segment.
+    MutableRoaringBitmap allDocIds = new MutableRoaringBitmap();
+    allDocIds.add(0L, segment.getSegmentMetadata().getTotalDocs());
+    if (shouldRevertMetadataOnInconsistency(segment)) {
+      revertSegmentUpsertMetadata(segment, segmentName, allDocIds);
+    } else {
+      removeSegment(segment, allDocIds);
     }
     // Update metrics
     long numPrimaryKeys = getNumPrimaryKeys();
     updatePrimaryKeyGauge(numPrimaryKeys);
     _logger.info("Finished removing segment: {} in {}ms, current primary key count: {}", segmentName,
         System.currentTimeMillis() - startTimeMs, numPrimaryKeys);
-  }
-
-  protected void removeSegment(IndexSegment segment, MutableRoaringBitmap validDocIds) {
-    try (PrimaryKeyReader primaryKeyReader = new PrimaryKeyReader(segment, _primaryKeyColumns)) {
-      if (shouldRevertMetadataOnInconsistency(segment)) {
-        revertAndRemoveSegment(segment, UpsertUtils.getRecordIterator(primaryKeyReader, validDocIds));
-      } else {
-        removeSegment(segment, UpsertUtils.getPrimaryKeyIterator(primaryKeyReader, validDocIds));
-      }
-    } catch (Exception e) {
-      throw new RuntimeException(
-          String.format("Caught exception while removing segment: %s, table: %s, message: %s", segment.getSegmentName(),
-              _tableNameWithType, e.getMessage()), e);
-    }
   }
 
   @Override
@@ -320,94 +300,108 @@ public class ConcurrentMapPartitionUpsertMetadataManagerForConsistentDeletes
   }
 
   @Override
-  protected void removeSegment(IndexSegment segment, Iterator<PrimaryKey> primaryKeyIterator) {
+  @Override
+  protected void removeSegment(IndexSegment segment, MutableRoaringBitmap validDocIds) {
     // We need to decrease the distinctSegmentCount for each unique primary key in this deleting segment by 1
     // as the occurrence of the key in this segment is being removed. We are taking a set of unique primary keys
     // to avoid double counting the same key in the same segment.
     Set<Object> uniquePrimaryKeys = new HashSet<>();
-    while (primaryKeyIterator.hasNext()) {
-      PrimaryKey primaryKey = primaryKeyIterator.next();
-      _primaryKeyToRecordLocationMap.computeIfPresent(HashUtils.hashPrimaryKey(primaryKey, _hashFunction),
-          (pk, recordLocation) -> {
-            if (recordLocation.getSegment() == segment) {
-              if (_context.isTableTypeInconsistentDuringConsumption() && segment instanceof MutableSegment) {
-                _previousKeyToRecordLocationMap.remove(pk);
+    try (PrimaryKeyReader primaryKeyReader = new PrimaryKeyReader(segment, _primaryKeyColumns)) {
+      Iterator<PrimaryKey> primaryKeyIterator = UpsertUtils.getPrimaryKeyIterator(primaryKeyReader, validDocIds);
+      while (primaryKeyIterator.hasNext()) {
+        PrimaryKey primaryKey = primaryKeyIterator.next();
+        _primaryKeyToRecordLocationMap.computeIfPresent(HashUtils.hashPrimaryKey(primaryKey, _hashFunction),
+            (pk, recordLocation) -> {
+              if (recordLocation.getSegment() == segment) {
+                if (_context.isTableTypeInconsistentDuringConsumption() && segment instanceof MutableSegment) {
+                  _previousKeyToRecordLocationMap.remove(pk);
+                }
+                return null;
               }
-              return null;
-            }
-            if (!uniquePrimaryKeys.add(pk)) {
-              return recordLocation;
-            }
-            return new RecordLocation(recordLocation.getSegment(), recordLocation.getDocId(),
-                recordLocation.getComparisonValue(),
-                RecordLocation.decrementSegmentCount(recordLocation.getDistinctSegmentCount()));
-          });
+              if (!uniquePrimaryKeys.add(pk)) {
+                return recordLocation;
+              }
+              return new RecordLocation(recordLocation.getSegment(), recordLocation.getDocId(),
+                  recordLocation.getComparisonValue(),
+                  RecordLocation.decrementSegmentCount(recordLocation.getDistinctSegmentCount()));
+            });
+      }
+    } catch (Exception e) {
+      throw new RuntimeException(
+          String.format("Caught exception while removing segment: %s, table: %s, message: %s", segment.getSegmentName(),
+              _tableNameWithType, e.getMessage()), e);
     }
   }
 
   @Override
-  protected void revertAndRemoveSegment(IndexSegment segment,
-      Iterator<Map.Entry<Integer, PrimaryKey>> primaryKeyIterator) {
+  protected void revertAndRemoveSegment(IndexSegment segment, MutableRoaringBitmap validDocIds) {
     // We need to decrease the distinctSegmentCount for each unique primary key in this deleting segment by 1
     // as the occurrence of the key in this segment is being removed. We are taking a set of unique primary keys
     // to avoid double counting the same key in the same segment.
     Set<Object> uniquePrimaryKeys = new HashSet<>();
-    while (primaryKeyIterator.hasNext()) {
-      Map.Entry<Integer, PrimaryKey> primaryKeyEntry = primaryKeyIterator.next();
-      PrimaryKey primaryKey = primaryKeyEntry.getValue();
-      int docId = primaryKeyEntry.getKey();
-      _primaryKeyToRecordLocationMap.computeIfPresent(HashUtils.hashPrimaryKey(primaryKey, _hashFunction),
-          (pk, recordLocation) -> {
-            if (recordLocation.getSegment() == segment) {
-              RecordLocation prevLocation = _previousKeyToRecordLocationMap.remove(pk);
-              if (prevLocation == null) {
-                return null;
-              }
-              // Revert to previous segment location
-              IndexSegment prevSegment = prevLocation.getSegment();
-              ThreadSafeMutableRoaringBitmap prevValidDocIds = prevSegment.getValidDocIds();
-              if (prevValidDocIds != null) {
-                try (UpsertUtils.RecordInfoReader recordInfoReader = new UpsertUtils.RecordInfoReader(prevSegment,
-                    _primaryKeyColumns, _comparisonColumns, _deleteRecordColumn)) {
-                  int prevDocId = prevLocation.getDocId();
-                  RecordInfo recordInfo = recordInfoReader.getRecordInfo(prevDocId);
-                  replaceDocId(prevSegment, prevValidDocIds, prevSegment.getQueryableDocIds(), segment, docId,
-                      prevDocId, recordInfo);
-                  if (!uniquePrimaryKeys.add(pk)) {
-                    return prevLocation;
-                  }
-                  return new RecordLocation(prevLocation.getSegment(), prevLocation.getDocId(),
-                      prevLocation.getComparisonValue(),
-                      RecordLocation.decrementSegmentCount(prevLocation.getDistinctSegmentCount()));
-                } catch (Exception e) {
-                  _logger.error("Failed to revert to previous segment: {}, removing key", prevSegment.getSegmentName(),
-                      e);
+    try (PrimaryKeyReader primaryKeyReader = new PrimaryKeyReader(segment, _primaryKeyColumns)) {
+      Iterator<Map.Entry<Integer, PrimaryKey>> primaryKeyIterator =
+          UpsertUtils.getRecordIterator(primaryKeyReader, validDocIds);
+      while (primaryKeyIterator.hasNext()) {
+        Map.Entry<Integer, PrimaryKey> primaryKeyEntry = primaryKeyIterator.next();
+        PrimaryKey primaryKey = primaryKeyEntry.getValue();
+        int docId = primaryKeyEntry.getKey();
+        _primaryKeyToRecordLocationMap.computeIfPresent(HashUtils.hashPrimaryKey(primaryKey, _hashFunction),
+            (pk, recordLocation) -> {
+              if (recordLocation.getSegment() == segment) {
+                RecordLocation prevLocation = _previousKeyToRecordLocationMap.remove(pk);
+                if (prevLocation == null) {
                   return null;
                 }
+                // Revert to previous segment location
+                IndexSegment prevSegment = prevLocation.getSegment();
+                ThreadSafeMutableRoaringBitmap prevValidDocIds = prevSegment.getValidDocIds();
+                if (prevValidDocIds != null) {
+                  try (UpsertUtils.RecordInfoReader recordInfoReader = new UpsertUtils.RecordInfoReader(prevSegment,
+                      _primaryKeyColumns, _comparisonColumns, _deleteRecordColumn)) {
+                    int prevDocId = prevLocation.getDocId();
+                    RecordInfo recordInfo = recordInfoReader.getRecordInfo(prevDocId);
+                    replaceDocId(prevSegment, prevValidDocIds, prevSegment.getQueryableDocIds(), segment, docId,
+                        prevDocId, recordInfo);
+                    if (!uniquePrimaryKeys.add(pk)) {
+                      return prevLocation;
+                    }
+                    return new RecordLocation(prevLocation.getSegment(), prevLocation.getDocId(),
+                        prevLocation.getComparisonValue(),
+                        RecordLocation.decrementSegmentCount(prevLocation.getDistinctSegmentCount()));
+                  } catch (Exception e) {
+                    _logger.error("Failed to revert to previous segment: {}, removing key", prevSegment.getSegmentName(),
+                        e);
+                    return null;
+                  }
+                } else {
+                  // Should not happen
+                  _logger.error("Failed to find valid doc ids in previous segment: {}, removing key",
+                      prevSegment.getSegmentName());
+                  return null;
+                }
+              } else if (recordLocation.getSegment() instanceof ImmutableSegmentImpl) {
+                // The consuming segment's key is in a different immutable segment
+                _previousKeyToRecordLocationMap.remove(pk);
               } else {
-                // Should not happen
-                _logger.error("Failed to find valid doc ids in previous segment: {}, removing key",
-                    prevSegment.getSegmentName());
-                return null;
+                _logger.warn(
+                    "Consuming segment: {} has added the primary key for docId: {} from the segment: {}, suggesting"
+                        + " that consumption is occurring concurrently with segment replacement, which is undesirable "
+                        + "for consistency between replicas for the table: {}.",
+                    recordLocation.getSegment().getSegmentName(), primaryKeyEntry.getKey(), segment.getSegmentName(),
+                    _tableNameWithType);
               }
-            } else if (recordLocation.getSegment() instanceof ImmutableSegmentImpl) {
-              // The consuming segment's key is in a different immutable segment
-              _previousKeyToRecordLocationMap.remove(pk);
-            } else {
-              _logger.warn(
-                  "Consuming segment: {} has added the primary key for docId: {} from the segment: {}, suggesting"
-                      + " that consumption is occurring concurrently with segment replacement, which is undesirable "
-                      + "for consistency between replicas for the table: {}.",
-                  recordLocation.getSegment().getSegmentName(), primaryKeyEntry.getKey(), segment.getSegmentName(),
-                  _tableNameWithType);
-            }
-            if (!uniquePrimaryKeys.add(pk)) {
-              return recordLocation;
-            }
-            return new RecordLocation(recordLocation.getSegment(), recordLocation.getDocId(),
-                recordLocation.getComparisonValue(),
-                RecordLocation.decrementSegmentCount(recordLocation.getDistinctSegmentCount()));
-          });
+              if (!uniquePrimaryKeys.add(pk)) {
+                return recordLocation;
+              }
+              return new RecordLocation(recordLocation.getSegment(), recordLocation.getDocId(),
+                  recordLocation.getComparisonValue(),
+                  RecordLocation.decrementSegmentCount(recordLocation.getDistinctSegmentCount()));
+            });
+      }
+    } catch (Exception e) {
+      throw new RuntimeException(String.format("Caught exception while reverting segment: %s, table: %s, message: %s",
+          segment.getSegmentName(), _tableNameWithType, e.getMessage()), e);
     }
   }
 
