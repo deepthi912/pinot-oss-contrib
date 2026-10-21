@@ -23,11 +23,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
 
-/// Where one query's segments actually executed, accumulated across the combine's worker threads.
-///
-/// Reported once per query (trace entry `GPU_SUMMARY` and a debug log line) so a client can verify that every
-/// segment ran on the GPU, with device-measured kernel time, rather than only that the GPU path was planned.
-/// Thread-safe.
+/// Where one query's segments actually executed, accumulated across the combine's worker threads. Thread-safe.
 public final class GpuQueryStats {
   private final String _backendName;
   private final int _numSegments;
@@ -57,17 +53,14 @@ public final class GpuQueryStats {
     _segmentsNoMatchingDocs.incrementAndGet();
   }
 
-  /// The segment used the regular CPU plan because it is not eligible (e.g. consuming, star-tree).
   void recordIneligible() {
     _segmentsIneligible.incrementAndGet();
   }
 
-  /// The filter matched too few documents for the GPU to pay off; the segment ran on the CPU.
   void recordSelectiveOnCpu() {
     _segmentsSelectiveOnCpu.incrementAndGet();
   }
 
-  /// The column could not be resident within the GPU memory budget; the segment ran on the CPU.
   void recordNotResident() {
     _segmentsNotResident.incrementAndGet();
   }
@@ -78,6 +71,10 @@ public final class GpuQueryStats {
 
   public int getSegmentsOnGpu() {
     return _segmentsOnGpu.get();
+  }
+
+  public int getSegmentsIneligible() {
+    return _segmentsIneligible.get();
   }
 
   public int getSegmentsSelectiveOnCpu() {

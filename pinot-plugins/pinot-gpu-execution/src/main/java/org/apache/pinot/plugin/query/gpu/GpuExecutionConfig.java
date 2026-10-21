@@ -23,14 +23,8 @@ import java.util.List;
 import org.apache.pinot.spi.env.PinotConfiguration;
 
 
-/// Server-level GPU execution settings. Immutable and thread-safe.
-///
-/// The keys live under the query executor prefix (`pinot.server.query.executor.`), next to
-/// `plan.maker.class`, and are read from the server config at startup; changing them requires a restart.
-/// (Applying them from cluster configs at runtime needs a server hook to register the plan maker as a cluster config
-/// listener; planned as a follow-up.)
-///
-/// [#isEnabled()] is the master switch: when it is `false` no query option can enable GPU execution.
+/// Server-level GPU execution settings under `pinot.server.query.executor.gpu.*`, read at startup (changes need a
+/// restart). `gpu.enabled` is the master switch: when false, no query option enables the GPU. Immutable.
 public final class GpuExecutionConfig {
   public static final String ENABLED = "gpu.enabled";
   public static final String BACKENDS = "gpu.backends";
@@ -39,7 +33,6 @@ public final class GpuExecutionConfig {
 
   public static final List<GpuBackendType> DEFAULT_BACKENDS =
       List.of(GpuBackendType.CUDA, GpuBackendType.METAL, GpuBackendType.CPU);
-  /// Below this many rows in the queried segments, the fixed cost of a GPU call outweighs the work it saves.
   public static final long DEFAULT_MIN_ROWS = 10_000_000L;
   public static final long DEFAULT_CACHE_MAX_BYTES = 2L * 1024 * 1024 * 1024;
 
@@ -65,7 +58,6 @@ public final class GpuExecutionConfig {
     return new GpuExecutionConfig(false, DEFAULT_BACKENDS, DEFAULT_MIN_ROWS, DEFAULT_CACHE_MAX_BYTES);
   }
 
-  /// Reads the settings from the query executor config subset; missing keys take their defaults.
   public static GpuExecutionConfig fromQueryExecutorConfig(PinotConfiguration queryExecutorConfig) {
     return fromValues(queryExecutorConfig.getProperty(ENABLED), queryExecutorConfig.getProperty(BACKENDS),
         queryExecutorConfig.getProperty(MIN_ROWS), queryExecutorConfig.getProperty(CACHE_MAX_BYTES));
@@ -87,7 +79,6 @@ public final class GpuExecutionConfig {
         cacheMaxBytes != null ? Long.parseLong(cacheMaxBytes.trim()) : DEFAULT_CACHE_MAX_BYTES);
   }
 
-  /// CPU is the last resort: always present, always last, and backends are not repeated.
   private static List<GpuBackendType> withCpuLast(List<GpuBackendType> backends) {
     List<GpuBackendType> order = new ArrayList<>();
     for (GpuBackendType type : backends) {
@@ -103,7 +94,6 @@ public final class GpuExecutionConfig {
     return _enabled;
   }
 
-  /// Backends to try, in order; always ends with [GpuBackendType#CPU].
   public List<GpuBackendType> getBackends() {
     return _backends;
   }

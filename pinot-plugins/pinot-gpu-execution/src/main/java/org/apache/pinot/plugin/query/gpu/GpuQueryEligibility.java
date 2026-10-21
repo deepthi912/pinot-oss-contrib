@@ -33,22 +33,12 @@ import org.apache.pinot.segment.spi.datasource.DataSourceMetadata;
 import org.apache.pinot.segment.spi.index.reader.ForwardIndexReader;
 
 
-/// Decides whether a query, on a given segment, can run on the GPU path. Every check returns `null` when the GPU
-/// path applies and a short reason otherwise; anything not explicitly supported stays on the regular CPU plan.
-///
-/// Supported so far (grows one operator at a time):
-/// - `SELECT col, COUNT(*) FROM t [WHERE ...] GROUP BY col [ORDER BY ...] [LIMIT n]`
-/// - `col` is a single-value, dictionary-encoded column of a sealed (immutable) segment.
-///
-/// Stateless and thread-safe.
-///
-/// Aggregations without GROUP BY are excluded on purpose: Pinot answers `COUNT(*)` from segment metadata or index
-/// bitmaps without scanning, which no GPU can beat.
+/// Decides whether a query, on a given segment, can run on the GPU path. Every check returns `null` when the GPU path
+/// applies and a short reason otherwise; anything not explicitly supported stays on the regular CPU plan. Stateless.
 public final class GpuQueryEligibility {
   private GpuQueryEligibility() {
   }
 
-  /// Segment-independent checks; call after the query options have been applied to the context.
   @Nullable
   public static String checkQuery(QueryContext queryContext) {
     if (!QueryContextUtils.isAggregationQuery(queryContext)) {
@@ -76,11 +66,10 @@ public final class GpuQueryEligibility {
     if (queryContext.isNullHandlingEnabled()) {
       return "null handling enabled";
     }
-    if (queryContext.isServerReturnFinalResult() || queryContext.isServerReturnFinalResultKeyUnpartitioned()) {
-      return "server returns final results";
+    if (queryContext.isServerReturnFinalResultKeyUnpartitioned()) {
+      return "server returns final results with unpartitioned keys";
     }
     if (queryContext.isUnsafeTrim() && queryContext.getEffectiveSegmentGroupTrimSize() > 0) {
-      // The CPU group-by trims each segment by ORDER BY on the aggregation; untrimmed GPU groups could differ.
       return "segment group trim on aggregation order";
     }
     if (queryContext.getLimit() == 0) {
@@ -92,7 +81,6 @@ public final class GpuQueryEligibility {
     return null;
   }
 
-  /// Checks for one segment, after [#checkQuery] passed.
   @Nullable
   public static String checkSegment(IndexSegment segment, QueryContext queryContext) {
     if (!(segment instanceof ImmutableSegment)) {
@@ -112,18 +100,14 @@ public final class GpuQueryEligibility {
       return "column " + column + " has no dictionary";
     }
     if (!dataSource.getDictionary().isSorted()) {
-      // Group order comes from dictionary order when the query orders by the group key.
       return "column " + column + " has an unsorted dictionary";
     }
     if (metadata.getCardinality() >= queryContext.getNumGroupsLimit()) {
-      // Keeps results identical to the CPU path, which stops adding groups at the limit.
       return "cardinality reaches numGroupsLimit";
     }
     return null;
   }
 
-  /// With null handling disabled (required above), `COUNT(*)` and `COUNT(col)` both count every row and expose no
-  /// input expressions.
   private static boolean isCountStar(AggregationFunction function) {
     return function.getType() == AggregationFunctionType.COUNT && function.getInputExpressions().isEmpty();
   }

@@ -28,9 +28,9 @@ import java.util.Locale;
 import javax.annotation.Nullable;
 
 
-/// Locates the Metal backend's native library: the path in system property [#LIBRARY_PATH_PROPERTY] when set,
-/// otherwise the copy packaged in the plugin jar (built on macOS by the `gpu-metal-native` Maven profile), extracted
-/// to a temporary file. Thread-safe.
+/// Locates the Metal backend's native library: the path in system property [#LIBRARY_PATH_PROPERTY] when set, otherwise
+/// the copy packaged in the plugin jar (built on macOS by the `gpu-metal-native` Maven profile), extracted to a
+/// temporary file. Thread-safe.
 public final class MetalNativeLibrary {
   public static final String LIBRARY_PATH_PROPERTY = "pinot.gpu.metal.library";
   static final String RESOURCE = "/native/darwin-aarch64/libpinot_gpu_metal.dylib";
@@ -45,7 +45,6 @@ public final class MetalNativeLibrary {
         System.getProperty("os.arch"));
   }
 
-  /// Where the library can be loaded from, or `null` if it is neither configured nor packaged.
   @Nullable
   public static String describeSource() {
     String configured = System.getProperty(LIBRARY_PATH_PROPERTY);
@@ -55,7 +54,6 @@ public final class MetalNativeLibrary {
     return MetalNativeLibrary.class.getResource(RESOURCE) != null ? "classpath:" + RESOURCE : null;
   }
 
-  /// Returns a filesystem path to the library, extracting the packaged copy on first use.
   public static synchronized Path resolve() {
     String configured = System.getProperty(LIBRARY_PATH_PROPERTY);
     if (configured != null) {

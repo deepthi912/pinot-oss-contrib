@@ -30,8 +30,8 @@ import org.apache.pinot.segment.spi.SegmentContext;
 
 
 /// Segment plan for a GPU group-by. Keeps Pinot's CPU filter (indexes); when the segment's star-tree index can serve
-/// the query, the regular [GroupByPlanNode] is used instead, since pre-aggregated data beats any scan.
-/// Not thread-safe; used by one planning thread.
+/// the query, the regular [GroupByPlanNode] is used instead, since pre-aggregated data beats any scan. Not thread-safe;
+/// used by one planning thread.
 public class GpuGroupByPlanNode implements PlanNode {
   private final SegmentContext _segmentContext;
   private final QueryContext _queryContext;

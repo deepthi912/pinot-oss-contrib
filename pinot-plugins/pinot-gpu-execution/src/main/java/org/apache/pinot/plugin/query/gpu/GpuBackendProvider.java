@@ -18,23 +18,16 @@
  */
 package org.apache.pinot.plugin.query.gpu;
 
-/// Discovers and creates one [GpuBackend]. Providers are loaded with [java.util.ServiceLoader] through this plugin's
-/// class loader, so a provider must be on the same class path as the plugin (packaged in its jar, or next to it on
-/// the server class path); discovery across isolated plugin realms is not supported yet.
-///
-/// Contract: [#getType()] is never [GpuBackendType#CPU] (CPU is the built-in last resort and such providers are
-/// ignored), the created backend reports the same type, and only the first provider of each type is used.
+/// Discovers and creates one [GpuBackend], loaded with [java.util.ServiceLoader] from the plugin's class path.
+/// Contract: [#getType()] is never CPU and matches the created backend; only the first provider per type is used.
 public interface GpuBackendProvider {
 
   GpuBackendType getType();
 
-  /// Checks whether the hardware, driver and native library are present. Called once at server startup.
   Availability probe();
 
-  /// Creates the backend. Only called after a successful [#probe()].
   GpuBackend create();
 
-  /// Result of [#probe()]: whether the backend can be used here, and why (shown in logs and query decisions).
   final class Availability {
     private final boolean _available;
     private final String _detail;

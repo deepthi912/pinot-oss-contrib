@@ -22,13 +22,9 @@ import java.util.Locale;
 
 
 /// Execution backends for GPU query execution, in the default preference order: CUDA, then Metal, then CPU.
-///
-/// [#CPU] means the regular Pinot CPU plan; it is always available and always tried last. CUDA is reserved for the
-/// cuDF backend, which ships separately; when no CUDA provider is present it is skipped.
 public enum GpuBackendType {
   CUDA, METAL, CPU;
 
-  /// Parses `cuda`, `metal` or `cpu`, case-insensitive.
   public static GpuBackendType fromId(String id) {
     try {
       return valueOf(id.trim().toUpperCase(Locale.ROOT));

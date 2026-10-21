@@ -21,31 +21,20 @@ package org.apache.pinot.plugin.query.gpu;
 import javax.annotation.Nullable;
 
 
-/// A GPU execution backend (CUDA, Metal) for the per-row part of server-side aggregation queries.
-///
-/// Pinot keeps filtering on the CPU, where its indexes live, and hands the backend the matching documents as a
-/// bitmap; the backend runs the aggregation over device-resident columns. Operators are added one at a time, so this
-/// interface grows with each supported operator.
-///
-/// Implementations must be thread-safe: one instance serves all concurrent queries of a server. A [GpuColumn] may only
-/// be passed back to the backend that created it.
+/// A GPU execution backend (CUDA, Metal) for the per-row part of server-side aggregation queries. thread-safe: one
+/// instance serves all concurrent queries of a server.
 public interface GpuBackend extends AutoCloseable {
 
   GpuBackendType getType();
 
-  /// Human-readable name including the device, e.g. `metal(Apple M2 Max)`.
   String getName();
 
-  /// Copies `values[0, length)` into device memory and returns the resident column.
+  /// Copies `values[0, length)` to the device. The returned column may only be passed back to this backend.
   GpuColumn uploadIntColumn(int[] values, int length);
 
-  /// `SELECT groupKey, COUNT(*) ... GROUP BY groupKey` over dictionary ids.
-  ///
-  /// @param groupKeys dictionary ids of the group-by column, one per document, all in `[0, cardinality)`
-  /// @param cardinality dictionary cardinality of the group-by column
-  /// @param matchingDocsWords bitmap of matching documents, bit `d` of word `d >>> 5` set when document `d` matches;
-  ///                          `null` when every document matches
-  /// @return the number of matching documents per dictionary id (length `cardinality`) and the device time
+  /// Counts matching rows per dictionary id. `groupKeys` holds one id in `[0, cardinality)` per document;
+  /// `matchingDocsWords` sets bit `docId & 31` of word `docId >>> 5` for each matching document, or is `null` when all
+  /// match. Returns counts of length `cardinality`, indexed by dictionary id.
   GpuGroupByCountResult groupByCount(GpuColumn groupKeys, int cardinality, @Nullable int[] matchingDocsWords);
 
   @Override

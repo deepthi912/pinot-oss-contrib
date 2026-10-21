@@ -30,37 +30,22 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 
-/// Chooses the backend for each query, in the configured order (CUDA, then Metal, then CPU by default), within what
-/// the server config allows and as steered by query options.
-///
-/// Every backend is probed once at construction; unavailable ones are skipped with the reason recorded. A backend
-/// that fails to be created is marked unavailable so later queries skip it cheaply. Each [Decision] carries which
-/// backend was chosen, why, and every backend skipped on the way.
-///
-/// Thread-safe: decisions read a volatile config snapshot, and backends are created at most once. [#close()] must run
-/// after every [GpuColumnCache] holding columns of these backends has been closed.
+/// Chooses the backend for each query, in the configured order (CUDA, then Metal, then CPU by default), within what the
+/// server config allows and as steered by query options. Thread-safe: decisions read a volatile config snapshot, and
+/// backends are created at most once.
 public class GpuBackendRouter implements AutoCloseable {
   private static final Logger LOGGER = LoggerFactory.getLogger(GpuBackendRouter.class);
 
-  /// Why a query got the backend it got.
   public enum Reason {
-    /// `gpu.enabled` is false: the master switch.
     DISABLED_BY_CONFIG,
-    /// Query option `useGpu=false`.
     DISABLED_BY_QUERY,
-    /// Fewer rows than `gpu.min.rows`, and the query did not set `useGpu=true`.
     BELOW_MIN_ROWS,
-    /// A GPU backend was chosen automatically.
     GPU_SELECTED,
-    /// A GPU backend was chosen because the query set `useGpu=true`.
     GPU_FORCED,
-    /// The query asked for `gpuBackend=cpu`.
     CPU_REQUESTED,
-    /// GPU execution was wanted but no GPU backend is available on this server.
     NO_GPU_AVAILABLE
   }
 
-  /// The backend chosen for one query. [#getBackend()] is `null` when the query runs on the regular CPU plan.
   public static final class Decision {
     @Nullable
     private final GpuBackend _backend;
@@ -86,7 +71,6 @@ public class GpuBackendRouter implements AutoCloseable {
       return _reason;
     }
 
-    /// Backends tried before the chosen one, each with the reason it was skipped.
     public List<String> getSkipped() {
       return _skipped;
     }
@@ -141,12 +125,10 @@ public class GpuBackendRouter implements AutoCloseable {
     _config = config;
   }
 
-  /// Whether each GPU backend can be used on this server, and why.
   public Map<GpuBackendType, GpuBackendProvider.Availability> getAvailability() {
     return Map.copyOf(_availability);
   }
 
-  /// Chooses the backend for a query over segments holding `numRows` documents in total.
   public Decision decide(GpuQueryOptions options, long numRows) {
     GpuExecutionConfig config = _config;
     if (!config.isEnabled()) {
@@ -182,7 +164,6 @@ public class GpuBackendRouter implements AutoCloseable {
         return new Decision(backend, forced ? Reason.GPU_FORCED : Reason.GPU_SELECTED, skipped);
       }
     }
-    // Unreachable: CPU is always last in the order.
     return new Decision(null, Reason.NO_GPU_AVAILABLE, skipped);
   }
 

@@ -61,12 +61,11 @@ import static org.testng.Assert.assertTrue;
 
 
 /// Runs every query through the regular CPU plan maker and through [GpuPlanMaker], end to end (segment plan, combine,
-/// data table serialization, broker reduce), and requires identical rows and scan statistics. Also asserts whether
-/// the GPU backend was called, so eligible queries are proven to take the GPU path and others the CPU path.
+/// data table serialization, broker reduce), and requires identical rows and scan statistics. Also asserts whether the
+/// GPU backend was called, so eligible queries are proven to take the GPU path and others the CPU path.
 public class GpuGroupByQueriesTest extends BaseQueriesTest {
   private static final File INDEX_DIR = new File(FileUtils.getTempDirectory(), "GpuGroupByQueriesTest");
   private static final String TABLE = "testTable";
-  /// Not a multiple of 32, so the last word of the filter bitmap is partial.
   private static final int NUM_ROWS_PER_SEGMENT = 20_003;
   private static final String QUERY =
       "SELECT dimStr, COUNT(*) FROM testTable GROUP BY dimStr ORDER BY dimStr LIMIT 1000";
@@ -125,7 +124,6 @@ public class GpuGroupByQueriesTest extends BaseQueriesTest {
     _corruptPlanMaker = gpuPlanMaker(List.of(_corruptProvider));
   }
 
-  /// `providers == null` uses real ServiceLoader discovery.
   private static GpuPlanMaker gpuPlanMaker(List<GpuBackendProvider> providers) {
     GpuPlanMaker planMaker = providers != null ? new GpuPlanMaker(providers) : new GpuPlanMaker();
     planMaker.init(new PinotConfiguration(
@@ -168,7 +166,6 @@ public class GpuGroupByQueriesTest extends BaseQueriesTest {
     return new Object[][]{
         {QUERY},
         {"SELECT dimInt, COUNT(*) FROM testTable GROUP BY dimInt ORDER BY dimInt LIMIT 2000"},
-        // More than 1024 groups: the Metal backend switches to its device-memory kernel.
         {"SELECT dimHigh, COUNT(*) FROM testTable GROUP BY dimHigh ORDER BY dimHigh LIMIT 10000"},
         {"SELECT dimLong, COUNT(*) FROM testTable GROUP BY dimLong ORDER BY dimLong LIMIT 100"},
         {"SELECT dimFloat, COUNT(*) FROM testTable GROUP BY dimFloat ORDER BY dimFloat LIMIT 100"},
@@ -180,12 +177,17 @@ public class GpuGroupByQueriesTest extends BaseQueriesTest {
         {"SELECT dimStr, COUNT(*) FROM testTable GROUP BY dimStr ORDER BY COUNT(*) DESC, dimStr LIMIT 5"},
         {"SELECT dimStr, COUNT(*) AS c FROM testTable GROUP BY dimStr HAVING c > 400 ORDER BY dimStr LIMIT 1000"},
         {"SELECT dimStr, COUNT(*), COUNT(*) FROM testTable GROUP BY dimStr ORDER BY dimStr LIMIT 1000"},
-        // COUNT(column) counts every row when null handling is disabled.
         {"SELECT dimStr, COUNT(metric) FROM testTable GROUP BY dimStr ORDER BY dimStr LIMIT 1000"},
-        // LIMIT below the number of groups: exercises the per-segment trim of the sorted combine, both directions.
         {"SELECT dimInt, COUNT(*) FROM testTable GROUP BY dimInt ORDER BY dimInt LIMIT 7"},
         {"SELECT dimInt, COUNT(*) FROM testTable GROUP BY dimInt ORDER BY dimInt DESC LIMIT 7"},
-        {"SELECT dimStr, COUNT(*) FROM testTable WHERE metric > 0 GROUP BY dimStr ORDER BY dimStr DESC LIMIT 3"}
+        {"SELECT dimStr, COUNT(*) FROM testTable WHERE metric > 0 GROUP BY dimStr ORDER BY dimStr DESC LIMIT 3"},
+        {"SET numGroupsLimit = 1001; "
+            + "SELECT dimInt, COUNT(*) FROM testTable GROUP BY dimInt ORDER BY dimInt LIMIT 2000"},
+        {"SET numGroupsWarningLimit = 10; " + QUERY},
+        // Set by the broker whenever one server serves the query; final results are produced after the combine.
+        {"SET serverReturnFinalResult = true; " + QUERY},
+        {"SET serverReturnFinalResult = true; "
+            + "SELECT dimStr, COUNT(*) FROM testTable GROUP BY dimStr ORDER BY COUNT(*) DESC, dimStr LIMIT 5"}
     };
   }
 
@@ -203,7 +205,11 @@ public class GpuGroupByQueriesTest extends BaseQueriesTest {
         {"SET enableNullHandling = true; " + QUERY},
         {"SET useGpu = false; " + QUERY},
         {"SET gpuBackend = 'cpu'; " + QUERY},
-        // Selective filters (under 1 in 16 documents per segment) run on the CPU at execution time.
+        // dimInt has 1000 values per segment: at or below the groups limit the CPU group-by caps groups.
+        {"SET numGroupsLimit = 500; "
+            + "SELECT dimInt, COUNT(*) FROM testTable GROUP BY dimInt ORDER BY dimInt LIMIT 2000"},
+        {"SET numGroupsLimit = 1000; "
+            + "SELECT dimInt, COUNT(*) FROM testTable GROUP BY dimInt ORDER BY dimInt LIMIT 2000"},
         {"SELECT dimInt, COUNT(*) FROM testTable WHERE dimStr IN ('s1', 's2', 's3') GROUP BY dimInt "
             + "ORDER BY dimInt LIMIT 2000"},
         {"SELECT dimStr, COUNT(*) FROM testTable WHERE dimInt < 20 GROUP BY dimStr ORDER BY dimStr LIMIT 1000"}
@@ -220,7 +226,6 @@ public class GpuGroupByQueriesTest extends BaseQueriesTest {
     assertSameResults(query, _gpuPlanMaker, _gpuProvider, false);
   }
 
-  /// No document matches, so there is nothing to aggregate and the GPU is not called; results must still match.
   @Test
   public void testNoMatchingDocuments() {
     String query =
@@ -237,7 +242,6 @@ public class GpuGroupByQueriesTest extends BaseQueriesTest {
     assertEquals(stats.getSegmentsFallback(), _indexSegments.size(), stats.toString());
   }
 
-  /// Counts that do not add up to the matching documents (stale or corrupt device data) must never reach the result.
   @Test
   public void testCorruptDeviceResultsFallBackToCpu()
       throws Exception {
@@ -269,8 +273,6 @@ public class GpuGroupByQueriesTest extends BaseQueriesTest {
     assertEquals(_gpuProvider.getNumUploads(), uploads, "second query must reuse the resident columns");
   }
 
-  /// With real provider discovery, a machine without a usable GPU backend must run every query on the regular CPU
-  /// plan and produce the same results. Runs everywhere, including Linux CI.
   @Test
   public void testDiscoveryWithoutGpuDegradesToCpu() {
     if (new MetalGpuBackendProvider().probe().isAvailable()) {
@@ -284,8 +286,6 @@ public class GpuGroupByQueriesTest extends BaseQueriesTest {
     }
   }
 
-  /// The real Metal backend, discovered through ServiceLoader. Runs on Apple Silicon when the plugin was built with
-  /// `-Dpinot.gpu.metal=true`; skipped elsewhere.
   @Test
   public void testMetalBackendEndToEnd()
       throws Exception {
@@ -301,7 +301,6 @@ public class GpuGroupByQueriesTest extends BaseQueriesTest {
       assertSameResponse(getBrokerResponse(sql, metalPlanMaker), getBrokerResponse(sql, _cpuPlanMaker), sql);
     }
 
-    // Every segment ran on the GPU with device-measured time, and none fell back to the CPU.
     for (String sql : List.of("SELECT dimInt, COUNT(*) FROM testTable GROUP BY dimInt ORDER BY dimInt LIMIT 2000",
         "SELECT dimHigh, COUNT(*) FROM testTable GROUP BY dimHigh ORDER BY dimHigh LIMIT 10000")) {
       GpuQueryStats stats = executeAndGetStats(metalPlanMaker, sql);
@@ -310,7 +309,6 @@ public class GpuGroupByQueriesTest extends BaseQueriesTest {
       assertTrue(stats.getDeviceTimeNs() > 0, stats.toString());
     }
 
-    // The device itself must report execution time: proof the kernel ran on the GPU, not just that it was planned.
     GpuBackend metal = metalPlanMaker.getRouter().decide(GpuQueryOptions.NONE, 1).getBackend();
     int[] keys = new int[1_000_000];
     for (int i = 0; i < keys.length; i++) {
@@ -326,7 +324,6 @@ public class GpuGroupByQueriesTest extends BaseQueriesTest {
     metalPlanMaker.getRouter().close();
   }
 
-  /// Plans and executes on the server only, returning where the segments actually ran.
   private GpuQueryStats executeAndGetStats(GpuPlanMaker planMaker, String query)
       throws Exception {
     QueryContext queryContext = QueryContextConverterUtils.getQueryContext(query);
@@ -372,6 +369,7 @@ public class GpuGroupByQueriesTest extends BaseQueriesTest {
     assertEquals(actual.getNumEntriesScannedPostFilter(), expected.getNumEntriesScannedPostFilter(), query);
     assertEquals(actual.getNumSegmentsMatched(), expected.getNumSegmentsMatched(), query);
     assertEquals(actual.isNumGroupsLimitReached(), expected.isNumGroupsLimitReached(), query);
+    assertEquals(actual.isNumGroupsWarningLimitReached(), expected.isNumGroupsWarningLimitReached(), query);
     assertEquals(actual.getTotalDocs(), expected.getTotalDocs(), query);
   }
 

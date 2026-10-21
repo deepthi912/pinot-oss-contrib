@@ -29,8 +29,8 @@ import org.slf4j.LoggerFactory;
 
 
 /// Instance plan of a query routed to a GPU backend. Executes the regular plan, then reports where this server's
-/// segments actually ran ([GpuQueryStats]) from the query's own thread: as a trace entry and, for traced queries, as
-/// an INFO log line tagged with the request id (debug level otherwise). Used by one query thread; not thread-safe.
+/// segments actually ran ([GpuQueryStats]) from the query's own thread: as a trace entry and, for traced queries, as an
+/// INFO log line tagged with the request id (debug level otherwise). Used by one query thread; not thread-safe.
 public class GpuInstancePlan implements Plan {
   private static final Logger LOGGER = LoggerFactory.getLogger(GpuInstancePlan.class);
   public static final String TRACE_KEY = "GPU_SUMMARY";
@@ -65,8 +65,6 @@ public class GpuInstancePlan implements Plan {
       throws TimeoutException {
     InstanceResponseBlock response = _delegate.execute();
     if (TraceContext.traceEnabled()) {
-      // Also log it: the broker keys trace info by host, so with several servers on one host only one server's
-      // trace survives. The request id matches the broker response, so every server's summary can be collected.
       TraceContext.logInfo(TRACE_KEY, _stats.toString());
       LOGGER.info("{} requestId={} {}", TRACE_KEY, requestId(), _stats);
     } else {

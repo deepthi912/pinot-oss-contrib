@@ -35,13 +35,8 @@ import org.apache.pinot.plugin.query.gpu.GpuGroupByCountResult;
 
 
 /// Experimental Apple GPU backend on Metal, called through the FFM API (native code: `src/main/native/metal_ops.mm`).
-///
-/// Apple Silicon has unified memory, so a resident column is page-aligned off-heap memory that Metal wraps without
-/// copying; registering it once and reusing it across queries avoids the per-call cost of mapping large buffers.
-///
 /// Thread-safe: Metal command queues accept concurrent submissions, and each call uses its own native buffers.
 public class MetalGpuBackend implements GpuBackend {
-  /// Apple Silicon page size; Metal no-copy buffers need page-aligned address and length.
   private static final long PAGE_SIZE = 16 * 1024;
   private static final int ERROR_LENGTH = 1024;
   private static final AddressLayout ADDRESS = ValueLayout.ADDRESS;
@@ -126,7 +121,6 @@ public class MetalGpuBackend implements GpuBackend {
         if (status != 0) {
           throw new IllegalStateException("Metal group-by failed: " + error.getString(0));
         }
-        // GPU start/end timestamps of the command buffer, measured by the device itself.
         long deviceTimeNs = Math.round(gpuMillis.get(ValueLayout.JAVA_DOUBLE, 0) * 1_000_000);
         return new GpuGroupByCountResult(counts.toArray(ValueLayout.JAVA_LONG), deviceTimeNs);
       } finally {
@@ -183,7 +177,6 @@ public class MetalGpuBackend implements GpuBackend {
     }
   }
 
-  /// Page-aligned off-heap copy of a column, registered with Metal once.
   private final class MetalColumn implements GpuColumn {
     private final Arena _arena;
     private final MemorySegment _pin;

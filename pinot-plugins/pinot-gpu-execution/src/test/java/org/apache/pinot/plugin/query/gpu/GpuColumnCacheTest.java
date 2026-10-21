@@ -24,6 +24,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import org.apache.pinot.plugin.query.gpu.JavaGpuBackendProvider.JavaColumn;
 import org.testng.annotations.Test;
 
@@ -36,15 +37,24 @@ import static org.testng.Assert.assertTrue;
 
 
 public class GpuColumnCacheTest {
+  private static final long WINDOW_MS = 1_000;
+  private final AtomicLong _nowNs = new AtomicLong();
 
-  /// A column of `ints` 4-byte values; [JavaColumn] fails on use or free after free.
+  private GpuColumnCache cache(long maxBytes) {
+    return new GpuColumnCache(maxBytes, WINDOW_MS, _nowNs::get);
+  }
+
+  private void idle() {
+    _nowNs.addAndGet(TimeUnit.MILLISECONDS.toNanos(WINDOW_MS + 1));
+  }
+
   private static JavaColumn column(int ints) {
     return new JavaColumn(new int[ints]);
   }
 
   @Test
   public void testHitReusesColumn() {
-    GpuColumnCache cache = new GpuColumnCache(1000);
+    GpuColumnCache cache = cache(1000);
     AtomicInteger loads = new AtomicInteger();
     JavaColumn first;
     try (GpuColumnCache.Lease lease = cache.acquire("a", 40, () -> {
@@ -65,16 +75,16 @@ public class GpuColumnCacheTest {
 
   @Test
   public void testLruEvictionFreesIdleColumns() {
-    GpuColumnCache cache = new GpuColumnCache(100);
+    GpuColumnCache cache = cache(100);
     JavaColumn a = column(10);
     JavaColumn b = column(10);
     cache.acquire("a", 40, () -> a).close();
     cache.acquire("b", 40, () -> b).close();
+    idle();
     cache.acquire("a", 40, () -> {
       throw new AssertionError("a must still be resident");
     }).close();
     cache.acquire("c", 40, () -> column(10)).close();
-    // b was least recently used.
     assertTrue(b.isClosed());
     assertFalse(a.isClosed());
     assertEquals(cache.getNumResidentColumns(), 2);
@@ -83,22 +93,23 @@ public class GpuColumnCacheTest {
 
   @Test
   public void testLeasedColumnIsFreedOnlyAfterRelease() {
-    GpuColumnCache cache = new GpuColumnCache(50);
+    GpuColumnCache cache = cache(50);
     JavaColumn a = column(10);
     GpuColumnCache.Lease lease = cache.acquire("a", 40, () -> a);
-    cache.acquire("b", 40, () -> column(10)).close();
-    // a was evicted but is still leased: usable, not freed.
+    idle();
+    // "a" is evicted for "b", but its bytes stay counted while leased, so "b" still does not fit.
+    assertNull(cache.acquire("b", 40, () -> column(10)));
     assertFalse(a.isClosed());
     assertEquals(((JavaColumn) lease.getColumn()).values().length, 10);
     lease.close();
     assertTrue(a.isClosed());
-    // Releasing twice is a no-op (JavaColumn would fail on a second free).
     lease.close();
+    cache.acquire("b", 40, () -> column(10)).close();
   }
 
   @Test
   public void testColumnLargerThanBudgetIsRefused() {
-    GpuColumnCache cache = new GpuColumnCache(100);
+    GpuColumnCache cache = cache(100);
     assertNull(cache.acquire("big", 101, () -> {
       throw new AssertionError("must not load a column that cannot be resident");
     }));
@@ -106,21 +117,56 @@ public class GpuColumnCacheTest {
   }
 
   @Test
-  public void testShrinkingTheBudgetEvicts() {
-    GpuColumnCache cache = new GpuColumnCache(100);
+  public void testRecentlyUsedColumnsAreNotEvicted() {
+    GpuColumnCache cache = cache(100);
     JavaColumn a = column(10);
     JavaColumn b = column(10);
     cache.acquire("a", 40, () -> a).close();
     cache.acquire("b", 40, () -> b).close();
-    cache.setMaxBytes(40);
+    assertNull(cache.acquire("c", 40, () -> {
+      throw new AssertionError("must not load when only recently used columns could be evicted");
+    }));
+    assertFalse(a.isClosed());
+    assertFalse(b.isClosed());
+    assertEquals(cache.getNumResidentColumns(), 2);
+  }
+
+  @Test
+  public void testPartialEvictionThenDenialFreesEvicted() {
+    GpuColumnCache cache = cache(100);
+    JavaColumn a = column(10);
+    JavaColumn b = column(10);
+    cache.acquire("a", 40, () -> a).close();
+    idle();
+    cache.acquire("b", 40, () -> b).close();
+    // Needs 80 bytes: evicting idle "a" frees 40, then recently used "b" is protected, so the load is denied.
+    assertNull(cache.acquire("c", 80, () -> {
+      throw new AssertionError("must not load");
+    }));
     assertTrue(a.isClosed());
     assertFalse(b.isClosed());
-    assertEquals(cache.getResidentBytes(), 40);
+  }
+
+  @Test
+  public void testEvictedLeasedColumnsCountAgainstBudget() {
+    GpuColumnCache cache = cache(100);
+    GpuColumnCache.Lease lease = cache.acquire("a", 40, () -> column(10));
+    idle();
+    cache.acquire("b", 40, () -> column(10)).close();
+    idle();
+    // "a" (still leased) and "b" are evicted for "c"; a's bytes stay counted until its lease is released.
+    cache.acquire("c", 60, () -> column(15)).close();
+    idle();
+    assertNull(cache.acquire("d", 61, () -> {
+      throw new AssertionError("leased bytes must still count");
+    }));
+    lease.close();
+    cache.acquire("d", 61, () -> column(15)).close();
   }
 
   @Test
   public void testFailedLoadPropagatesAndNextAcquireRetries() {
-    GpuColumnCache cache = new GpuColumnCache(100);
+    GpuColumnCache cache = cache(100);
     assertThrows(IllegalStateException.class, () -> cache.acquire("a", 40, () -> {
       throw new IllegalStateException("device out of memory");
     }));
@@ -132,7 +178,7 @@ public class GpuColumnCacheTest {
   @Test
   public void testConcurrentMissesShareOneLoad()
       throws Exception {
-    GpuColumnCache cache = new GpuColumnCache(1000);
+    GpuColumnCache cache = cache(1000);
     AtomicInteger loads = new AtomicInteger();
     CountDownLatch loading = new CountDownLatch(1);
     CountDownLatch release = new CountDownLatch(1);
@@ -157,7 +203,6 @@ public class GpuColumnCacheTest {
         });
       }
       assertTrue(loading.await(10, TimeUnit.SECONDS));
-      // While one thread loads, the cache stays usable for other keys.
       cache.acquire("other", 40, () -> column(10)).close();
       release.countDown();
       for (Future<?> future : futures) {
@@ -171,7 +216,7 @@ public class GpuColumnCacheTest {
 
   @Test
   public void testCloseFreesIdleNowAndLeasedOnRelease() {
-    GpuColumnCache cache = new GpuColumnCache(1000);
+    GpuColumnCache cache = cache(1000);
     JavaColumn idle = column(10);
     JavaColumn leased = column(10);
     cache.acquire("idle", 40, () -> idle).close();

@@ -23,14 +23,8 @@ import java.util.Map;
 import javax.annotation.Nullable;
 
 
-/// Per-query GPU options, set like any other query option, e.g. `SET useGpu = true; SELECT ...`.
-///
-/// - `useGpu`: `true` uses the GPU even below the configured minimum row count, `false` keeps the query on the
-///   CPU, absent lets the server config decide.
-/// - `gpuBackend`: `cuda`, `metal` or `cpu`, tried first; an unavailable backend still falls back along the
-///   configured order.
-///
-/// Neither option can enable GPU execution when [GpuExecutionConfig#isEnabled()] is `false`. Immutable.
+/// Per-query options: `useGpu` (true forces the GPU above no size gate, false forces the CPU) and `gpuBackend`
+/// (backend to try first). Both only apply when the server enables GPU execution. Immutable.
 public final class GpuQueryOptions {
   public static final String USE_GPU = "useGpu";
   public static final String GPU_BACKEND = "gpuBackend";
@@ -47,7 +41,6 @@ public final class GpuQueryOptions {
     _preferredBackend = preferredBackend;
   }
 
-  /// Option keys are matched case-insensitively.
   public static GpuQueryOptions fromQueryOptions(@Nullable Map<String, String> queryOptions) {
     if (queryOptions == null || queryOptions.isEmpty()) {
       return NONE;
@@ -83,13 +76,11 @@ public final class GpuQueryOptions {
     }
   }
 
-  /// `null` when the option is absent.
   @Nullable
   public Boolean getUseGpu() {
     return _useGpu;
   }
 
-  /// `null` when the option is absent.
   @Nullable
   public GpuBackendType getPreferredBackend() {
     return _preferredBackend;

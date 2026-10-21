@@ -31,11 +31,8 @@ import javax.annotation.Nullable;
 public class JavaGpuBackendProvider implements GpuBackendProvider {
 
   public enum Behavior {
-    /// Correct results.
     CORRECT,
-    /// Every group-by call throws, as a device failure would.
     FAIL,
-    /// Every group-by call returns counts that are off by one, as stale or corrupt device data would.
     CORRUPT
   }
 
@@ -114,7 +111,6 @@ public class JavaGpuBackendProvider implements GpuBackendProvider {
     };
   }
 
-  /// Column that fails loudly when used or freed after it was freed.
   static final class JavaColumn implements GpuColumn {
     private final int[] _values;
     private volatile boolean _closed;

@@ -17,14 +17,6 @@
  * under the License.
  */
 // Experimental Metal (Apple GPU) kernels for Pinot server-side GROUP BY over dictionary-encoded columns.
-//
-// Exposes a plain C ABI that Java calls through the FFM API (see MetalGpuBackend.java).
-// Shaders are compiled from source at runtime, so only the Command Line Tools are needed (no offline `metal`).
-//
-// Exact 64-bit sums without 64-bit atomics: Metal only has 32-bit atomic add, so each int32 value is biased to
-// unsigned (u = v + 2^31) and split into narrow pieces whose partial sums cannot overflow a uint32 within a bounded
-// slice of rows. A fold kernel then combines the pieces into 64-bit accumulators. The Java side recovers the signed
-// sum as (long) sumU - count * 2^31.
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -60,8 +52,7 @@ inline bool passes(device const uint* filter, uint hasFilter, uint r) {
   return hasFilter == 0 || ((filter[r >> 5] >> (r & 31)) & 1u) != 0;
 }
 
-// Low cardinality: every threadgroup aggregates its slice (<= 65536 rows) in threadgroup memory, then writes one
-// partial row per threadgroup. 16-bit halves are safe: 65536 * 65535 < 2^32.
+// Low cardinality: per-threadgroup atomics over <= 65536 rows; 16-bit halves cannot overflow (65536 * 65535 < 2^32).
 kernel void gb_local(device const int* dictIds [[buffer(0)]],
                      device const int* values [[buffer(1)]],
                      device const uint* filter [[buffer(2)]],
@@ -99,8 +90,7 @@ kernel void gb_local(device const int* dictIds [[buffer(0)]],
   }
 }
 
-// High cardinality: one thread per row, device-memory atomics into a single partial table. Byte pieces are safe for
-// up to 16M rows per group per batch: 255 * 2^24 < 2^32. The host folds after every batch of <= 2^24 rows.
+// High cardinality: device-memory atomics on byte pieces, folded every 2^24 rows (255 * 2^24 < 2^32).
 kernel void gb_global(device const int* dictIds [[buffer(0)]],
                       device const int* values [[buffer(1)]],
                       device const uint* filter [[buffer(2)]],
@@ -208,8 +198,7 @@ void setError(char* err, int32_t errLen, NSString* message) {
   snprintf(err, (size_t) errLen, "%s", message.UTF8String);
 }
 
-// Wraps caller memory without copying when it is page aligned (Pinot segments are mmapped, so this is the realistic
-// path); otherwise falls back to a copy so callers can still pass arbitrary memory.
+// Wraps page-aligned caller memory without copying (unified memory); otherwise copies.
 id<MTLBuffer> wrap(Context* ctx, const void* ptr, int64_t bytes) {
   static const uintptr_t pageSize = (uintptr_t) getpagesize();
   if (ptr == nullptr || bytes <= 0) {
@@ -287,9 +276,7 @@ const char* mg_device_name(void* handle) {
   return static_cast<Context*>(handle)->deviceName;
 }
 
-// Registers caller memory with the GPU once and returns a retained buffer handle. Wrapping a large region costs
-// milliseconds (the driver maps every page), so callers pin resident columns once and reuse the handle across
-// queries, like a GPU segment cache. The memory must stay alive until mg_unpin.
+// Registers memory with the GPU once and returns a retained handle; release with mg_unpin.
 void* mg_pin(void* handle, const void* ptr, int64_t bytes) {
   @autoreleasepool {
     id<MTLBuffer> buffer = wrap(static_cast<Context*>(handle), ptr, bytes);
@@ -303,8 +290,7 @@ void mg_unpin(void* buffer) {
   }
 }
 
-// GROUP BY dictId: COUNT(*) and, when valuePin is non-null, SUM(value). outSumU (may be null when valuePin is null)
-// receives sum(value + 2^31) per group (see file comment).
+// GROUP BY dictId: COUNT(*), plus SUM(value) when valuePin is set; sums are of (value + 2^31) per group.
 int32_t mg_group_by(void* handle, void* dictPin, void* valuePin, void* filterPin, int32_t numRows,
     int32_t numGroups, uint64_t* outSumU, uint64_t* outCount, double* gpuMs, char* err, int32_t errLen) {
   @autoreleasepool {

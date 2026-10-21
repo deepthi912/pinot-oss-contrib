@@ -19,17 +19,13 @@
 package org.apache.pinot.plugin.query.gpu;
 
 /// A column resident in a backend's device memory (or registered with it, for unified-memory devices).
-///
-/// Created by [GpuBackend#uploadIntColumn] and owned by the [GpuColumnCache]; [#close()] releases the device memory
-/// and must be called exactly once, after the last query using the column has finished.
 public interface GpuColumn extends AutoCloseable {
 
-  /// Number of values (one per document of the segment).
   int getNumValues();
 
-  /// Device memory held by this column, used for the cache's byte budget.
   long getSizeInBytes();
 
+  /// Frees the device memory; called exactly once, after the last use.
   @Override
   void close();
 }

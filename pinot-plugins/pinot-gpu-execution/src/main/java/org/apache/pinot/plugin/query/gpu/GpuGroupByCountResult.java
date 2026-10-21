@@ -18,10 +18,7 @@
  */
 package org.apache.pinot.plugin.query.gpu;
 
-/// Result of [GpuBackend#groupByCount]: the per-group counts plus the device's own execution time.
-///
-/// The device time comes from the GPU (e.g. Metal command buffer start/end timestamps), not from a host clock, so a
-/// positive value proves the work executed on the device. Backends that cannot measure it report `-1`. Immutable.
+/// Result of [GpuBackend#groupByCount]: the per-group counts plus the device's own execution time. Immutable.
 public final class GpuGroupByCountResult {
   private final long[] _counts;
   private final long _deviceTimeNs;
@@ -31,12 +28,10 @@ public final class GpuGroupByCountResult {
     _deviceTimeNs = deviceTimeNs;
   }
 
-  /// Number of matching documents per dictionary id.
   public long[] getCounts() {
     return _counts;
   }
 
-  /// Time the device spent executing the work, in nanoseconds, or `-1` when not measured.
   public long getDeviceTimeNs() {
     return _deviceTimeNs;
   }

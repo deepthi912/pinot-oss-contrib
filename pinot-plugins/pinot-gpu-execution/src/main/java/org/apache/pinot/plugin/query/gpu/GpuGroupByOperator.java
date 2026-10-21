@@ -53,22 +53,12 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 
-/// Segment-level `SELECT col, COUNT(*) ... GROUP BY col` on a GPU backend.
-///
-/// 1. CPU: Pinot's filter operator (indexes) produces the matching documents as a bitmap.
-/// 2. GPU: the backend counts matching documents per dictionary id over the column's resident dictionary ids.
-/// 3. CPU: non-empty groups become [IntermediateRecord]s keyed by the dictionary value, exactly as the CPU
-///    group-by produces them, so the regular combine operator and broker reduce handle them unchanged.
-///
-/// The segment runs on the regular CPU [GroupByOperator] instead, reusing the filter result, when the filter is
-/// selective, when the column cannot be resident within the GPU memory budget, or when the backend fails or returns
-/// counts that do not add up to the matching documents (logged as a fallback). Cancellation and timeouts propagate.
-/// Not thread-safe; like every segment operator it is used by one thread.
+/// Segment-level `SELECT col, COUNT(*) ... GROUP BY col` on a GPU backend. Not thread-safe; like every segment operator
+/// it is used by one thread.
 public class GpuGroupByOperator extends BaseOperator<GroupByResultsBlock> {
   private static final Logger LOGGER = LoggerFactory.getLogger(GpuGroupByOperator.class);
   private static final String EXPLAIN_NAME = "GPU_GROUP_BY";
   private static final int READ_CHUNK_SIZE = 10_000;
-  /// Segments where fewer than 1 in this many documents match the filter run on the CPU.
   static final int SELECTIVE_FILTER_RATIO = 16;
 
   private final SegmentContext _segmentContext;
@@ -98,7 +88,6 @@ public class GpuGroupByOperator extends BaseOperator<GroupByResultsBlock> {
     _stats = stats;
     _groupByColumn = queryContext.getGroupByExpressions().get(0).getIdentifier();
 
-    // Same layout as GroupByOperator: group-by column first, then one column per aggregation.
     AggregationFunction[] functions = queryContext.getAggregationFunctions();
     String[] columnNames = new String[1 + functions.length];
     ColumnDataType[] columnDataTypes = new ColumnDataType[1 + functions.length];
@@ -116,7 +105,6 @@ public class GpuGroupByOperator extends BaseOperator<GroupByResultsBlock> {
   protected GroupByResultsBlock getNextBlock() {
     QueryThreadContext.checkTerminationAndSampleUsage(EXPLAIN_NAME);
     int numDocs = _indexSegment.getSegmentMetadata().getTotalDocs();
-    // Filtering stays on the CPU (indexes); its result is reused by every path below.
     BaseFilterOperator.FilteredDocIds filteredDocIds = _filterOperator.getFilteredDocIds();
     _numEntriesScannedInFilter = filteredDocIds.getNumEntriesScannedInFilter();
     ImmutableRoaringBitmap matchingDocs = filteredDocIds.getDocIds();
@@ -125,7 +113,6 @@ public class GpuGroupByOperator extends BaseOperator<GroupByResultsBlock> {
       _stats.recordNoMatchingDocs();
       return new GroupByResultsBlock(_dataSchema, List.of(), _queryContext);
     }
-    // The GPU kernel touches every document of the segment, so a selective filter is cheaper on the CPU.
     if (matchingDocs != null && (long) _numDocsScanned * SELECTIVE_FILTER_RATIO < numDocs) {
       _stats.recordSelectiveOnCpu();
       return computeOnCpu(matchingDocs, numDocs);
@@ -134,14 +121,14 @@ public class GpuGroupByOperator extends BaseOperator<GroupByResultsBlock> {
     DataSource dataSource = _indexSegment.getDataSource(_groupByColumn);
     Dictionary dictionary = dataSource.getDictionary();
     int cardinality = dictionary.length();
-    String cacheKey = GpuColumnCache.key(_backend.getType(), _queryContext.getTableName(),
-        _indexSegment.getSegmentName(), _columnCache.instanceId(_indexSegment), _groupByColumn);
+    String cacheKey = GpuColumnCache.cacheKey(_backend.getType(), _queryContext.getTableName(),
+        _indexSegment.getSegmentName(), _columnCache.getOrAssignInstanceId(_indexSegment), _groupByColumn);
     long[] counts;
+    int numGroups = 0;
     try {
       GpuColumnCache.Lease lease = _columnCache.acquire(cacheKey, (long) numDocs * Integer.BYTES,
           () -> _backend.uploadIntColumn(readDictIds(dataSource, numDocs), numDocs));
       if (lease == null) {
-        // Cannot be resident within the GPU memory budget: loading it for one query costs more than it saves.
         _stats.recordNotResident();
         return computeOnCpu(matchingDocs, numDocs);
       }
@@ -155,11 +142,17 @@ public class GpuGroupByOperator extends BaseOperator<GroupByResultsBlock> {
             matchingDocs != null ? toWords(matchingDocs, numDocs) : null);
       }
       counts = result.getCounts();
-      // Every matching document lands in exactly one group; anything else means stale or corrupt device data.
+      if (counts.length != cardinality) {
+        throw new IllegalStateException("GPU returned " + counts.length + " groups, dictionary has " + cardinality);
+      }
       long total = 0;
       for (long count : counts) {
         total += count;
+        if (count != 0) {
+          numGroups++;
+        }
       }
+      // Stale or corrupt device data must never reach the result: recompute on CPU.
       if (total != _numDocsScanned) {
         throw new IllegalStateException("GPU counted " + total + " documents, filter matched " + _numDocsScanned);
       }
@@ -177,14 +170,10 @@ public class GpuGroupByOperator extends BaseOperator<GroupByResultsBlock> {
     _stats.recordGpuExecution(_numDocsScanned, _deviceTimeNs);
     traceExecution(_deviceTimeNs, false, null);
 
-    // Dictionaries of immutable segments are sorted, so walking dictionary ids in order yields groups sorted by value.
-    // When the query orders by the group key and the sorted combine is used, emit groups in ORDER BY order, trimmed to
-    // the segment trim size, as the CPU group-by does; otherwise the order does not matter.
     boolean sorted = _queryContext.shouldSortAggregateUnderSafeTrim();
     boolean ascending = !sorted || _queryContext.getOrderByExpressions().get(0).isAsc();
     int maxGroups = sorted && _queryContext.getEffectiveSegmentGroupTrimSize() > 0
         ? _queryContext.getEffectiveSegmentGroupTrimSize() : Integer.MAX_VALUE;
-    // Every aggregation is COUNT(*) (see GpuQueryEligibility), so each gets the same count.
     int numAggregations = _queryContext.getAggregationFunctions().length;
     List<IntermediateRecord> records = new ArrayList<>();
     for (int i = 0; i < cardinality && records.size() < maxGroups; i++) {
@@ -201,11 +190,10 @@ public class GpuGroupByOperator extends BaseOperator<GroupByResultsBlock> {
       }
     }
     GroupByResultsBlock resultsBlock = new GroupByResultsBlock(_dataSchema, records, _queryContext);
-    resultsBlock.setNumGroupsWarningLimitReached(records.size() >= _queryContext.getNumGroupsWarningLimit());
+    resultsBlock.setNumGroupsWarningLimitReached(numGroups >= _queryContext.getNumGroupsWarningLimit());
     return resultsBlock;
   }
 
-  /// Runs the regular CPU group-by over the documents the filter already matched, without filtering again.
   private GroupByResultsBlock computeOnCpu(@Nullable ImmutableRoaringBitmap matchingDocs, int numDocs) {
     BaseFilterOperator filter = matchingDocs != null ? new BitmapBasedFilterOperator(matchingDocs, false, numDocs)
         : new MatchAllFilterOperator(numDocs);
@@ -216,9 +204,6 @@ public class GpuGroupByOperator extends BaseOperator<GroupByResultsBlock> {
     return _cpuOperator.nextBlock();
   }
 
-  /// With `trace=true`, records where this segment actually executed, so clients can verify GPU execution rather
-  /// than just the plan: the backend, the device-measured kernel time (positive only when the GPU ran the work), the
-  /// documents aggregated, and whether the segment fell back to the CPU.
   private void traceExecution(long deviceTimeNs, boolean fallback, @Nullable String fallbackReason) {
     if (!TraceContext.traceEnabled()) {
       return;
@@ -235,12 +220,10 @@ public class GpuGroupByOperator extends BaseOperator<GroupByResultsBlock> {
     TraceContext.logInfo(EXPLAIN_NAME, info.toString());
   }
 
-  /// Device-measured execution time of the last GPU call in nanoseconds, or `-1` if not measured or not run.
   public long getDeviceTimeNs() {
     return _deviceTimeNs;
   }
 
-  /// Reads the whole column's dictionary ids once; the result stays resident on the GPU across queries.
   @SuppressWarnings("unchecked")
   private static int[] readDictIds(DataSource dataSource, int numDocs) {
     ForwardIndexReader<ForwardIndexReaderContext> reader =
@@ -266,7 +249,6 @@ public class GpuGroupByOperator extends BaseOperator<GroupByResultsBlock> {
     return dictIds;
   }
 
-  /// Converts the matching documents to the backend's bitmap format in batches rather than one callback per document.
   private static int[] toWords(ImmutableRoaringBitmap docIds, int numDocs) {
     int[] words = new int[(numDocs + 31) >>> 5];
     BatchIterator iterator = docIds.getBatchIterator();
@@ -295,7 +277,6 @@ public class GpuGroupByOperator extends BaseOperator<GroupByResultsBlock> {
   public ExecutionStatistics getExecutionStatistics() {
     long totalDocs = _indexSegment.getSegmentMetadata().getTotalDocs();
     if (_cpuOperator != null) {
-      // The CPU operator re-read the filter result from a bitmap; the filter cost was paid by _filterOperator.
       ExecutionStatistics cpu = _cpuOperator.getExecutionStatistics();
       return new ExecutionStatistics(cpu.getNumDocsScanned(), _numEntriesScannedInFilter,
           cpu.getNumEntriesScannedPostFilter(), totalDocs);
