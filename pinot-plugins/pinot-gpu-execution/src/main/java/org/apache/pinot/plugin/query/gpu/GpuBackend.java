@@ -29,13 +29,34 @@ public interface GpuBackend extends AutoCloseable {
 
   String getName();
 
-  /// Copies `values[0, length)` to the device. The returned column may only be passed back to this backend.
-  GpuColumn uploadIntColumn(int[] values, int length);
+  /// Fills `buffer[0, length)` with the values of rows `[start, start + length)`.
+  interface IntChunkReader {
+    void read(int start, int length, int[] buffer);
+  }
 
-  /// Counts matching rows per dictionary id. `groupKeys` holds one id in `[0, cardinality)` per document;
-  /// `matchingDocsWords` sets bit `docId & 31` of word `docId >>> 5` for each matching document, or is `null` when all
-  /// match. Returns counts of length `cardinality`, indexed by dictionary id.
-  GpuGroupByCountResult groupByCount(GpuColumn groupKeys, int cardinality, @Nullable int[] matchingDocsWords);
+  /// Loads `numValues` values chunk by chunk into device memory, without materializing the whole column on the heap.
+  /// The returned column may only be passed back to this backend.
+  GpuColumn uploadIntColumn(int numValues, IntChunkReader reader);
+
+  default GpuColumn uploadIntColumn(int[] values, int length) {
+    return uploadIntColumn(length, (start, chunk, buffer) -> System.arraycopy(values, start, buffer, 0, chunk));
+  }
+
+  /// Uploads a per-query filter bitmap (bit `docId & 31` of word `docId >>> 5` per matching document).
+  default GpuColumn uploadFilter(int[] words) {
+    return uploadIntColumn(words, words.length);
+  }
+
+  /// Counts matching rows per group and, when `values` is set, sums its values exactly as 64-bit integers.
+  /// `groupKeys` holds one group id in `[0, numGroups)` per document, or is `null` for a single group.
+  /// `matchingDocs` comes from [#uploadFilter], so one upload serves every call for a segment; `null` means all
+  /// documents match.
+  GpuAggregationResult aggregate(@Nullable GpuColumn groupKeys, int numGroups, @Nullable GpuColumn values, int numDocs,
+      @Nullable GpuColumn matchingDocs);
+
+  /// Marks the distinct (group, id) pairs among matching documents; `ids` are in `[0, cardinality)`.
+  GpuDistinctResult distinct(@Nullable GpuColumn groupKeys, int numGroups, GpuColumn ids, int cardinality,
+      int numDocs, @Nullable GpuColumn matchingDocs);
 
   @Override
   void close();

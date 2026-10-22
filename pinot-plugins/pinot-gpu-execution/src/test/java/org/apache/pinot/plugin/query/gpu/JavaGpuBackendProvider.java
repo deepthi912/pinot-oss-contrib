@@ -18,7 +18,6 @@
  */
 package org.apache.pinot.plugin.query.gpu;
 
-import java.util.Arrays;
 import java.util.concurrent.atomic.AtomicInteger;
 import javax.annotation.Nullable;
 
@@ -33,7 +32,10 @@ public class JavaGpuBackendProvider implements GpuBackendProvider {
   public enum Behavior {
     CORRECT,
     FAIL,
-    CORRUPT
+    // Counts that don't add up to the filtered documents.
+    CORRUPT,
+    // Correct counts, but no sums and empty distinct bitmaps: reaches the checks after the count validation.
+    CORRUPT_VALUES
   }
 
   private final GpuBackendType _type;
@@ -80,35 +82,79 @@ public class JavaGpuBackendProvider implements GpuBackendProvider {
       }
 
       @Override
-      public GpuColumn uploadIntColumn(int[] values, int length) {
+      public GpuColumn uploadIntColumn(int numValues, IntChunkReader reader) {
         _numUploads.incrementAndGet();
-        return new JavaColumn(Arrays.copyOf(values, length));
+        int[] values = new int[numValues];
+        // Odd chunk size above the reader's internal chunk so tests cover partial and multi-read chunks.
+        int[] buffer = new int[12_345];
+        for (int start = 0; start < numValues; start += buffer.length) {
+          int length = Math.min(buffer.length, numValues - start);
+          reader.read(start, length, buffer);
+          System.arraycopy(buffer, 0, values, start, length);
+        }
+        return new JavaColumn(values);
       }
 
       @Override
-      public GpuGroupByCountResult groupByCount(GpuColumn groupKeys, int cardinality,
-          @Nullable int[] matchingDocsWords) {
+      public GpuColumn uploadFilter(int[] words) {
+        return new JavaColumn(words.clone());
+      }
+
+      @Override
+      public GpuAggregationResult aggregate(@Nullable GpuColumn groupKeys, int numGroups, @Nullable GpuColumn values,
+          int numDocs, @Nullable GpuColumn matchingDocs) {
         _numGroupByCalls.incrementAndGet();
         if (_behavior == Behavior.FAIL) {
           throw new IllegalStateException("simulated device failure");
         }
-        int[] keys = ((JavaColumn) groupKeys).values();
-        long[] counts = new long[cardinality];
-        for (int docId = 0; docId < keys.length; docId++) {
-          if (matchingDocsWords == null || (matchingDocsWords[docId >>> 5] >>> (docId & 31) & 1) != 0) {
-            counts[keys[docId]]++;
+        int[] matchingDocsWords = matchingDocs != null ? ((JavaColumn) matchingDocs).values() : null;
+        int[] keys = groupKeys != null ? ((JavaColumn) groupKeys).values() : null;
+        int[] vals = values != null ? ((JavaColumn) values).values() : null;
+        long[] counts = new long[numGroups];
+        long[] sums = vals != null ? new long[numGroups] : null;
+        for (int docId = 0; docId < numDocs; docId++) {
+          if (matches(matchingDocsWords, docId)) {
+            int g = keys != null ? keys[docId] : 0;
+            counts[g]++;
+            if (sums != null) {
+              sums[g] += vals[docId];
+            }
           }
         }
         if (_behavior == Behavior.CORRUPT) {
           counts[0]++;
         }
-        return new GpuGroupByCountResult(counts, -1);
+        return new GpuAggregationResult(counts, _behavior == Behavior.CORRUPT_VALUES ? null : sums, -1);
+      }
+
+      @Override
+      public GpuDistinctResult distinct(@Nullable GpuColumn groupKeys, int numGroups, GpuColumn ids,
+          int cardinality, int numDocs, @Nullable GpuColumn matchingDocs) {
+        _numGroupByCalls.incrementAndGet();
+        if (_behavior == Behavior.FAIL) {
+          throw new IllegalStateException("simulated device failure");
+        }
+        int[] matchingDocsWords = matchingDocs != null ? ((JavaColumn) matchingDocs).values() : null;
+        int[] keys = groupKeys != null ? ((JavaColumn) groupKeys).values() : null;
+        int[] idValues = ((JavaColumn) ids).values();
+        int[] words = new int[(int) (((long) numGroups * cardinality + 31) >>> 5)];
+        for (int docId = 0; docId < numDocs; docId++) {
+          if (matches(matchingDocsWords, docId)) {
+            long bit = (long) (keys != null ? keys[docId] : 0) * cardinality + idValues[docId];
+            words[(int) (bit >>> 5)] |= 1 << (bit & 31);
+          }
+        }
+        return new GpuDistinctResult(_behavior == Behavior.CORRUPT_VALUES ? new int[words.length] : words, -1);
       }
 
       @Override
       public void close() {
       }
     };
+  }
+
+  private static boolean matches(@Nullable int[] words, int docId) {
+    return words == null || (words[docId >>> 5] >>> (docId & 31) & 1) != 0;
   }
 
   static final class JavaColumn implements GpuColumn {

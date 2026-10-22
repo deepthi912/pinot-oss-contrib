@@ -37,6 +37,15 @@ struct Params {
   uint rowsPerSlice;  // rows owned by one threadgroup (local kernel only)
   uint rowOffset;     // first row of this dispatch (global kernel only)
   uint hasValues;     // 0 = COUNT only, no value column bound
+  uint hasKeys;       // 0 = no GROUP BY: every row is group 0
+};
+
+struct DistinctParams {
+  uint numRows;
+  uint numGroups;
+  uint cardinality;
+  uint hasFilter;
+  uint hasKeys;
 };
 
 struct FoldParams {
@@ -73,7 +82,7 @@ kernel void gb_local(device const int* dictIds [[buffer(0)]],
   uint end = min(start + p.rowsPerSlice, p.numRows);
   for (uint r = start + tid; r < end; r += tgsize) {
     if (!passes(filter, p.hasFilter, r)) continue;
-    uint g = (uint) dictIds[r];
+    uint g = p.hasKeys ? (uint) dictIds[r] : 0u;
     if (g >= G) continue;
     if (p.hasValues) {
       uint u = as_type<uint>(values[r]) ^ 0x80000000u;
@@ -101,7 +110,7 @@ kernel void gb_global(device const int* dictIds [[buffer(0)]],
   uint r = gid + p.rowOffset;
   if (!passes(filter, p.hasFilter, r)) return;
   uint G = p.numGroups;
-  uint g = (uint) dictIds[r];
+  uint g = p.hasKeys ? (uint) dictIds[r] : 0u;
   if (g >= G) return;
   if (p.hasValues) {
     uint u = as_type<uint>(values[r]) ^ 0x80000000u;
@@ -141,18 +150,21 @@ kernel void gb_fold(device uint* partials [[buffer(0)]],
   accCount[g] += c;
 }
 
-// Exact DISTINCTCOUNT on dictionary ids: set one bit per seen id. Read first to avoid hammering hot words.
-kernel void distinct_mark(device const int* dictIds [[buffer(0)]],
-                          device const uint* filter [[buffer(1)]],
-                          device atomic_uint* bits [[buffer(2)]],
-                          constant Params& p [[buffer(3)]],
-                          uint gid [[thread_position_in_grid]]) {
+// Exact DISTINCTCOUNT: sets bit (group * cardinality + id) for every matching row.
+kernel void distinct_pairs(device const int* keys [[buffer(0)]],
+                           device const int* ids [[buffer(1)]],
+                           device const uint* filter [[buffer(2)]],
+                           device atomic_uint* bits [[buffer(3)]],
+                           constant DistinctParams& p [[buffer(4)]],
+                           uint gid [[thread_position_in_grid]]) {
   if (gid >= p.numRows) return;
   if (!passes(filter, p.hasFilter, gid)) return;
-  uint g = (uint) dictIds[gid];
-  if (g >= p.numGroups) return;
-  uint mask = 1u << (g & 31);
-  device atomic_uint* word = &bits[g >> 5];
+  uint g = p.hasKeys ? (uint) keys[gid] : 0u;
+  uint id = (uint) ids[gid];
+  if (g >= p.numGroups || id >= p.cardinality) return;
+  uint bit = g * p.cardinality + id;
+  uint mask = 1u << (bit & 31);
+  device atomic_uint* word = &bits[bit >> 5];
   if ((atomic_load_explicit(word, memory_order_relaxed) & mask) == 0) {
     atomic_fetch_or_explicit(word, mask, memory_order_relaxed);
   }
@@ -168,7 +180,18 @@ struct Params {
   uint32_t rowsPerSlice;
   uint32_t rowOffset;
   uint32_t hasValues;
+  uint32_t hasKeys;
 };
+
+struct DistinctParams {
+  uint32_t numRows;
+  uint32_t numGroups;
+  uint32_t cardinality;
+  uint32_t hasFilter;
+  uint32_t hasKeys;
+};
+
+constexpr uint64_t kMaxDistinctBits = 1ull << 28;
 
 struct FoldParams {
   uint32_t numGroups;
@@ -188,7 +211,7 @@ struct Context {
   id<MTLComputePipelineState> gbLocal;
   id<MTLComputePipelineState> gbGlobal;
   id<MTLComputePipelineState> gbFold;
-  id<MTLComputePipelineState> distinctMark;
+  id<MTLComputePipelineState> distinctPairs;
   id<MTLBuffer> empty;  // bound when there is no filter bitmap
   char deviceName[256];
 };
@@ -255,8 +278,8 @@ void* mg_create(char* err, int32_t errLen) {
     ctx->gbLocal = pipeline(device, library, @"gb_local", &error);
     ctx->gbGlobal = pipeline(device, library, @"gb_global", &error);
     ctx->gbFold = pipeline(device, library, @"gb_fold", &error);
-    ctx->distinctMark = pipeline(device, library, @"distinct_mark", &error);
-    if (ctx->gbLocal == nil || ctx->gbGlobal == nil || ctx->gbFold == nil || ctx->distinctMark == nil) {
+    ctx->distinctPairs = pipeline(device, library, @"distinct_pairs", &error);
+    if (ctx->gbLocal == nil || ctx->gbGlobal == nil || ctx->gbFold == nil || ctx->distinctPairs == nil) {
       setError(err, errLen, error ? error.localizedDescription : @"pipeline creation failed");
       delete ctx;
       return nullptr;
@@ -301,7 +324,7 @@ int32_t mg_group_by(void* handle, void* dictPin, void* valuePin, void* filterPin
     }
     uint32_t rows = (uint32_t) numRows;
     uint32_t groups = (uint32_t) numGroups;
-    id<MTLBuffer> dictBuf = (__bridge id<MTLBuffer>) dictPin;
+    id<MTLBuffer> dictBuf = dictPin != nullptr ? (__bridge id<MTLBuffer>) dictPin : ctx->empty;
     id<MTLBuffer> valueBuf = valuePin != nullptr ? (__bridge id<MTLBuffer>) valuePin : ctx->empty;
     id<MTLBuffer> filterBuf = filterPin != nullptr ? (__bridge id<MTLBuffer>) filterPin : ctx->empty;
     id<MTLBuffer> accSum = [ctx->device newBufferWithLength:groups * sizeof(uint64_t)
@@ -313,7 +336,12 @@ int32_t mg_group_by(void* handle, void* dictPin, void* valuePin, void* filterPin
 
     id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
     id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];  // serial dispatch: each dispatch sees the last
-    Params p = {rows, groups, filterPin != nullptr ? 1u : 0u, 0, 0, valuePin != nullptr ? 1u : 0u};
+    if (accSum == nil || accCount == nil) {
+      setError(err, errLen, @"GPU buffer allocation failed");
+      return -1;
+    }
+    Params p = {rows, groups, filterPin != nullptr ? 1u : 0u, 0, 0, valuePin != nullptr ? 1u : 0u,
+                dictPin != nullptr ? 1u : 0u};
     id<MTLBuffer> partials;
 
     if (rows > 0 && groups <= kLocalMaxGroups) {
@@ -323,6 +351,11 @@ int32_t mg_group_by(void* handle, void* dictPin, void* valuePin, void* filterPin
       p.rowsPerSlice = perSlice;
       partials = [ctx->device newBufferWithLength:(NSUInteger) slices * 3 * groups * sizeof(uint32_t)
                                           options:MTLResourceStorageModePrivate];
+      if (partials == nil) {
+        [enc endEncoding];
+        setError(err, errLen, @"GPU buffer allocation failed");
+        return -1;
+      }
       [enc setComputePipelineState:ctx->gbLocal];
       [enc setBuffer:dictBuf offset:0 atIndex:0];
       [enc setBuffer:valueBuf offset:0 atIndex:1];
@@ -341,6 +374,11 @@ int32_t mg_group_by(void* handle, void* dictPin, void* valuePin, void* filterPin
     } else if (rows > 0) {
       partials = [ctx->device newBufferWithLength:(NSUInteger) 5 * groups * sizeof(uint32_t)
                                           options:MTLResourceStorageModeShared];
+      if (partials == nil) {
+        [enc endEncoding];
+        setError(err, errLen, @"GPU buffer allocation failed");
+        return -1;
+      }
       memset(partials.contents, 0, partials.length);
       FoldParams fp = {groups, 1, 5, 1};
       for (uint32_t offset = 0; offset < rows; offset += kGlobalBatchRows) {
@@ -373,40 +411,41 @@ int32_t mg_group_by(void* handle, void* dictPin, void* valuePin, void* filterPin
   }
 }
 
-// Exact DISTINCTCOUNT over dictionary ids in [0, cardinality).
-int32_t mg_distinct_count(void* handle, void* dictPin, void* filterPin, int32_t numRows, int32_t cardinality,
-    int64_t* outCount, double* gpuMs, char* err, int32_t errLen) {
+// Exact DISTINCTCOUNT pairs: outWords receives the (group * cardinality + id) bitmap, ceil(groups * cardinality / 32)
+// words. keyPin may be null (single group).
+int32_t mg_distinct_pairs(void* handle, void* keyPin, void* idPin, void* filterPin, int32_t numRows, int32_t numGroups,
+    int32_t cardinality, void* outPin, double* gpuMs, char* err, int32_t errLen) {
   @autoreleasepool {
     Context* ctx = static_cast<Context*>(handle);
-    if (numRows < 0 || cardinality <= 0) {
-      setError(err, errLen, @"numRows must be >= 0 and cardinality > 0");
+    uint64_t numBits = (uint64_t) numGroups * (uint64_t) cardinality;
+    if (numRows < 0 || numGroups <= 0 || cardinality <= 0 || numBits > kMaxDistinctBits) {
+      setError(err, errLen, @"invalid distinct dimensions");
       return -1;
     }
-    uint32_t words = ((uint32_t) cardinality + 31) / 32;
-    id<MTLBuffer> bits = [ctx->device newBufferWithLength:words * sizeof(uint32_t)
-                                                  options:MTLResourceStorageModeShared];
-    memset(bits.contents, 0, bits.length);
+    NSUInteger words = (NSUInteger) ((numBits + 31) / 32);
+    id<MTLBuffer> bits = (__bridge id<MTLBuffer>) outPin;
+    if (bits == nil || bits.length < words * sizeof(uint32_t)) {
+      setError(err, errLen, @"distinct output buffer too small");
+      return -1;
+    }
+    memset(bits.contents, 0, words * sizeof(uint32_t));
     if (gpuMs != nullptr) *gpuMs = 0;
     if (numRows > 0) {
-      id<MTLBuffer> dictBuf = (__bridge id<MTLBuffer>) dictPin;
-      id<MTLBuffer> filterBuf = filterPin != nullptr ? (__bridge id<MTLBuffer>) filterPin : ctx->empty;
-      Params p = {(uint32_t) numRows, (uint32_t) cardinality, filterPin != nullptr ? 1u : 0u, 0, 0, 0};
+      DistinctParams p = {(uint32_t) numRows, (uint32_t) numGroups, (uint32_t) cardinality,
+                          filterPin != nullptr ? 1u : 0u, keyPin != nullptr ? 1u : 0u};
       id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
       id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
-      [enc setComputePipelineState:ctx->distinctMark];
-      [enc setBuffer:dictBuf offset:0 atIndex:0];
-      [enc setBuffer:filterBuf offset:0 atIndex:1];
-      [enc setBuffer:bits offset:0 atIndex:2];
-      [enc setBytes:&p length:sizeof(p) atIndex:3];
+      [enc setComputePipelineState:ctx->distinctPairs];
+      [enc setBuffer:(keyPin != nullptr ? (__bridge id<MTLBuffer>) keyPin : ctx->empty) offset:0 atIndex:0];
+      [enc setBuffer:(__bridge id<MTLBuffer>) idPin offset:0 atIndex:1];
+      [enc setBuffer:(filterPin != nullptr ? (__bridge id<MTLBuffer>) filterPin : ctx->empty) offset:0 atIndex:2];
+      [enc setBuffer:bits offset:0 atIndex:3];
+      [enc setBytes:&p length:sizeof(p) atIndex:4];
       [enc dispatchThreads:MTLSizeMake((NSUInteger) numRows, 1, 1)
           threadsPerThreadgroup:MTLSizeMake(kThreadsPerGroup, 1, 1)];
       [enc endEncoding];
       if (!runAndWait(cb, gpuMs, err, errLen)) return -1;
     }
-    const uint32_t* w = static_cast<const uint32_t*>(bits.contents);
-    int64_t count = 0;
-    for (uint32_t i = 0; i < words; i++) count += __builtin_popcount(w[i]);
-    *outCount = count;
     return 0;
   }
 }

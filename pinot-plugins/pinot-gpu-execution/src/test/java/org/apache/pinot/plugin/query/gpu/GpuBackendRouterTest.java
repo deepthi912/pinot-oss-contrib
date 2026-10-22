@@ -124,9 +124,19 @@ public class GpuBackendRouterTest {
     assertTrue(config.isEnabled());
     assertEquals(config.getBackends(), List.of(GpuBackendType.METAL, GpuBackendType.CUDA, GpuBackendType.CPU));
     assertEquals(config.getMinRows(), 5000);
+    assertEquals(GpuExecutionConfig.fromQueryExecutorConfig(new PinotConfiguration(
+        Map.of(GpuExecutionConfig.CACHE_MAX_BYTES, "4096"))).getCacheMaxBytes(), 4096);
+    assertThrows(IllegalArgumentException.class, () -> GpuExecutionConfig.fromQueryExecutorConfig(
+        new PinotConfiguration(Map.of(GpuExecutionConfig.MIN_ROWS, "-1"))));
+    assertThrows(IllegalArgumentException.class, () -> GpuExecutionConfig.fromQueryExecutorConfig(
+        new PinotConfiguration(Map.of(GpuExecutionConfig.CACHE_MAX_BYTES, "-1"))));
+    assertThrows(IllegalArgumentException.class, () -> GpuExecutionConfig.fromQueryExecutorConfig(
+        new PinotConfiguration(Map.of(GpuExecutionConfig.BACKENDS, "rocm"))));
     GpuExecutionConfig defaults = GpuExecutionConfig.fromQueryExecutorConfig(new PinotConfiguration(Map.of()));
     assertFalse(defaults.isEnabled());
     assertEquals(defaults.getBackends(), GpuExecutionConfig.DEFAULT_BACKENDS);
+    assertEquals(defaults.getMinRows(), GpuExecutionConfig.DEFAULT_MIN_ROWS);
+    assertEquals(defaults.getCacheMaxBytes(), GpuExecutionConfig.DEFAULT_CACHE_MAX_BYTES);
 
     GpuQueryOptions options = GpuQueryOptions.fromQueryOptions(Map.of("USEGPU", "true", "gpuBackend", "Metal"));
     assertEquals(options.getUseGpu(), Boolean.TRUE);

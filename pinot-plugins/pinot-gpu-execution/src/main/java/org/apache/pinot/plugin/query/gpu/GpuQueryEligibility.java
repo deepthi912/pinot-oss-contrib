@@ -29,12 +29,14 @@ import org.apache.pinot.segment.spi.AggregationFunctionType;
 import org.apache.pinot.segment.spi.ImmutableSegment;
 import org.apache.pinot.segment.spi.IndexSegment;
 import org.apache.pinot.segment.spi.datasource.DataSource;
-import org.apache.pinot.segment.spi.datasource.DataSourceMetadata;
 import org.apache.pinot.segment.spi.index.reader.ForwardIndexReader;
+import org.apache.pinot.spi.data.FieldSpec;
 
 
-/// Decides whether a query, on a given segment, can run on the GPU path. Every check returns `null` when the GPU path
-/// applies and a short reason otherwise; anything not explicitly supported stays on the regular CPU plan. Stateless.
+/// Decides whether a query, on a given segment, can run on the GPU path: COUNT(*), SUM/AVG on INT columns and
+/// DISTINCTCOUNT on dictionary columns, optionally grouped by one dictionary column. Every check returns `null` when
+/// the GPU path applies and a short reason otherwise; anything not explicitly supported stays on the regular CPU plan.
+/// Stateless.
 public final class GpuQueryEligibility {
   private GpuQueryEligibility() {
   }
@@ -45,17 +47,27 @@ public final class GpuQueryEligibility {
       return "not an aggregation query";
     }
     List<ExpressionContext> groupByExpressions = queryContext.getGroupByExpressions();
-    if (groupByExpressions == null) {
-      return "aggregation without GROUP BY";
-    }
-    if (groupByExpressions.size() != 1 || groupByExpressions.get(0).getType() != ExpressionContext.Type.IDENTIFIER) {
+    if (groupByExpressions != null && (groupByExpressions.size() != 1
+        || groupByExpressions.get(0).getType() != ExpressionContext.Type.IDENTIFIER)) {
       return "GROUP BY must be a single column";
     }
-    AggregationFunction[] aggregationFunctions = queryContext.getAggregationFunctions();
-    for (AggregationFunction function : aggregationFunctions) {
-      if (!isCountStar(function)) {
+    boolean hasNonCount = false;
+    for (AggregationFunction<?, ?> function : queryContext.getAggregationFunctions()) {
+      AggregationFunctionType type = function.getType();
+      List<ExpressionContext> inputs = function.getInputExpressions();
+      if (type == AggregationFunctionType.COUNT && inputs.isEmpty()) {
+        continue;
+      }
+      boolean supported = type == AggregationFunctionType.SUM || type == AggregationFunctionType.AVG
+          || type == AggregationFunctionType.DISTINCTCOUNT;
+      if (!supported || inputs.size() != 1 || inputs.get(0).getType() != ExpressionContext.Type.IDENTIFIER) {
         return "unsupported aggregation: " + function.getResultColumnName();
       }
+      hasNonCount = true;
+    }
+    if (groupByExpressions == null && !hasNonCount) {
+      // COUNT(*) without GROUP BY is answered from metadata or index bitmaps.
+      return "COUNT(*) without GROUP BY";
     }
     if (queryContext.hasFilteredAggregations()) {
       return "filtered aggregations";
@@ -86,29 +98,65 @@ public final class GpuQueryEligibility {
     if (!(segment instanceof ImmutableSegment)) {
       return "mutable (consuming) segment";
     }
-    String column = queryContext.getGroupByExpressions().get(0).getIdentifier();
+    long numGroups = 1;
+    if (queryContext.getGroupByExpressions() != null) {
+      String column = queryContext.getGroupByExpressions().get(0).getIdentifier();
+      String reason = checkDictionaryColumn(segment, column);
+      if (reason != null) {
+        return reason;
+      }
+      DataSource dataSource = segment.getDataSource(column);
+      if (!dataSource.getDictionary().isSorted()) {
+        return "column " + column + " has an unsorted dictionary";
+      }
+      numGroups = dataSource.getDataSourceMetadata().getCardinality();
+      if (numGroups >= queryContext.getNumGroupsLimit()) {
+        // Keeps results identical to the CPU path, which stops adding groups at the limit.
+        return "cardinality reaches numGroupsLimit";
+      }
+    }
+    for (AggregationFunction<?, ?> function : queryContext.getAggregationFunctions()) {
+      AggregationFunctionType type = function.getType();
+      if (type == AggregationFunctionType.COUNT) {
+        continue;
+      }
+      String column = function.getInputExpressions().get(0).getIdentifier();
+      if (type == AggregationFunctionType.DISTINCTCOUNT) {
+        String reason = checkDictionaryColumn(segment, column);
+        if (reason != null) {
+          return reason;
+        }
+        if (numGroups * segment.getDataSource(column).getDictionary().length()
+            > GpuSegmentAggregator.MAX_DISTINCT_BITS) {
+          return "DISTINCTCOUNT too large for the GPU";
+        }
+      } else {
+        DataSource dataSource = segment.getDataSourceNullable(column);
+        if (dataSource == null || !dataSource.getDataSourceMetadata().isSingleValue()
+            || dataSource.getForwardIndex() == null) {
+          return "column " + column + " is not a single-value column with a forward index";
+        }
+        if (dataSource.getDataSourceMetadata().getDataType().getStoredType() != FieldSpec.DataType.INT) {
+          return "SUM/AVG only on INT columns";
+        }
+      }
+    }
+    return null;
+  }
+
+  @Nullable
+  private static String checkDictionaryColumn(IndexSegment segment, String column) {
     DataSource dataSource = segment.getDataSourceNullable(column);
     if (dataSource == null) {
       return "column " + column + " missing in segment";
     }
-    DataSourceMetadata metadata = dataSource.getDataSourceMetadata();
-    if (!metadata.isSingleValue()) {
+    if (!dataSource.getDataSourceMetadata().isSingleValue()) {
       return "multi-value column " + column;
     }
     ForwardIndexReader<?> forwardIndex = dataSource.getForwardIndex();
     if (dataSource.getDictionary() == null || forwardIndex == null || !forwardIndex.isDictionaryEncoded()) {
       return "column " + column + " has no dictionary";
     }
-    if (!dataSource.getDictionary().isSorted()) {
-      return "column " + column + " has an unsorted dictionary";
-    }
-    if (metadata.getCardinality() >= queryContext.getNumGroupsLimit()) {
-      return "cardinality reaches numGroupsLimit";
-    }
     return null;
-  }
-
-  private static boolean isCountStar(AggregationFunction function) {
-    return function.getType() == AggregationFunctionType.COUNT && function.getInputExpressions().isEmpty();
   }
 }

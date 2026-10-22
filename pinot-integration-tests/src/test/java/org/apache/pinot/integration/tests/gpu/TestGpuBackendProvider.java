@@ -18,24 +18,21 @@
  */
 package org.apache.pinot.integration.tests.gpu;
 
-import java.util.Arrays;
-import java.util.concurrent.atomic.AtomicInteger;
-import javax.annotation.Nullable;
 import org.apache.pinot.plugin.query.gpu.GpuBackend;
 import org.apache.pinot.plugin.query.gpu.GpuBackendProvider;
 import org.apache.pinot.plugin.query.gpu.GpuBackendType;
-import org.apache.pinot.plugin.query.gpu.GpuColumn;
-import org.apache.pinot.plugin.query.gpu.GpuGroupByCountResult;
+import org.apache.pinot.plugin.query.gpu.JavaGpuBackendProvider;
 
 
-/// Plain-Java stand-in GPU backend discovered through ServiceLoader; available only while system property
-/// [#ENABLED_PROPERTY] is true, so it does not affect other tests. Thread-safe.
+/// ServiceLoader entry for the plugin's plain-Java test backend; available only while system property
+/// [#ENABLED_PROPERTY] is true, so other tests are unaffected. Thread-safe.
 public class TestGpuBackendProvider implements GpuBackendProvider {
   public static final String ENABLED_PROPERTY = "pinot.gpu.test.backend.enabled";
-  private static final AtomicInteger NUM_GROUP_BY_CALLS = new AtomicInteger();
+  private static final JavaGpuBackendProvider DELEGATE =
+      new JavaGpuBackendProvider(GpuBackendType.CUDA, true, JavaGpuBackendProvider.Behavior.CORRECT);
 
   public static int getNumGroupByCalls() {
-    return NUM_GROUP_BY_CALLS.get();
+    return DELEGATE.getNumGroupByCalls();
   }
 
   @Override
@@ -45,67 +42,12 @@ public class TestGpuBackendProvider implements GpuBackendProvider {
 
   @Override
   public Availability probe() {
-    return Boolean.getBoolean(ENABLED_PROPERTY) ? Availability.available("integration test backend")
+    return Boolean.getBoolean(ENABLED_PROPERTY) ? DELEGATE.probe()
         : Availability.unavailable("integration test backend disabled");
   }
 
   @Override
   public GpuBackend create() {
-    return new GpuBackend() {
-      @Override
-      public GpuBackendType getType() {
-        return GpuBackendType.CUDA;
-      }
-
-      @Override
-      public String getName() {
-        return "test-gpu";
-      }
-
-      @Override
-      public GpuColumn uploadIntColumn(int[] values, int length) {
-        return new TestColumn(Arrays.copyOf(values, length));
-      }
-
-      @Override
-      public GpuGroupByCountResult groupByCount(GpuColumn groupKeys, int cardinality,
-          @Nullable int[] matchingDocsWords) {
-        NUM_GROUP_BY_CALLS.incrementAndGet();
-        int[] keys = ((TestColumn) groupKeys)._values;
-        long[] counts = new long[cardinality];
-        for (int docId = 0; docId < keys.length; docId++) {
-          if (matchingDocsWords == null || (matchingDocsWords[docId >>> 5] >>> (docId & 31) & 1) != 0) {
-            counts[keys[docId]]++;
-          }
-        }
-        return new GpuGroupByCountResult(counts, -1);
-      }
-
-      @Override
-      public void close() {
-      }
-    };
-  }
-
-  private static final class TestColumn implements GpuColumn {
-    final int[] _values;
-
-    TestColumn(int[] values) {
-      _values = values;
-    }
-
-    @Override
-    public int getNumValues() {
-      return _values.length;
-    }
-
-    @Override
-    public long getSizeInBytes() {
-      return (long) _values.length * Integer.BYTES;
-    }
-
-    @Override
-    public void close() {
-    }
+    return DELEGATE.create();
   }
 }

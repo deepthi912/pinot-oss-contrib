@@ -120,7 +120,7 @@ public class GpuPlanMaker extends InstancePlanMakerImplV2 {
         reason = GpuQueryEligibility.checkSegment(segmentContext.getIndexSegment(), queryContext);
       }
       if (reason == null) {
-        return new GpuGroupByPlanNode(segmentContext, queryContext, activeQuery._backend, _columnCache,
+        return new GpuSegmentPlanNode(segmentContext, queryContext, activeQuery._backend, _columnCache,
             activeQuery._stats);
       }
       activeQuery._stats.recordIneligible();

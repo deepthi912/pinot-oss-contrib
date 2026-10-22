@@ -78,7 +78,12 @@ public class GpuExecutionIntegrationTest extends BaseClusterIntegrationTest {
         {"SELECT Carrier, COUNT(*) FROM mytable GROUP BY Carrier ORDER BY Carrier LIMIT 100"},
         {"SELECT DayOfWeek, COUNT(*) FROM mytable GROUP BY DayOfWeek ORDER BY COUNT(*) DESC, DayOfWeek LIMIT 10"},
         {"SELECT OriginState, COUNT(*) FROM mytable WHERE DayOfWeek > 2 GROUP BY OriginState "
-            + "ORDER BY OriginState LIMIT 100"}
+            + "ORDER BY OriginState LIMIT 100"},
+        {"SELECT Carrier, SUM(Distance), AVG(ActualElapsedTime), DISTINCTCOUNT(Origin) FROM mytable "
+            + "GROUP BY Carrier ORDER BY Carrier LIMIT 100"},
+        {"SELECT DayOfWeek, DISTINCTCOUNT(Dest) FROM mytable GROUP BY DayOfWeek "
+            + "ORDER BY DISTINCTCOUNT(Dest) DESC, DayOfWeek LIMIT 3"},
+        {"SELECT SUM(Distance), AVG(CRSDepTime), DISTINCTCOUNT(FlightNum) FROM mytable WHERE DayOfWeek > 2"}
     };
   }
 
@@ -98,13 +103,14 @@ public class GpuExecutionIntegrationTest extends BaseClusterIntegrationTest {
   public void testExplainShowsGpuOperator(String query)
       throws Exception {
     JsonNode plan = postQuery("SET useMultistageEngine = false; SET useGpu = true; EXPLAIN PLAN FOR " + query);
-    assertTrue(plan.toString().contains("GPU_GROUP_BY"), plan.toString());
+    String operator = query.contains("GROUP BY") ? "GPU_GROUP_BY" : "GPU_AGGREGATE";
+    assertTrue(plan.toString().contains(operator), plan.toString());
   }
 
   @Test(dataProvider = "queries")
   public void testMultiStageEngineStaysOnCpu(String query)
       throws Exception {
-    JsonNode cpu = postQuery("SET useMultistageEngine = false; SET useGpu = false; " + query);
+    JsonNode cpu = postQuery("SET useMultistageEngine = true; SET useGpu = false; " + query);
     int callsBefore = TestGpuBackendProvider.getNumGroupByCalls();
     JsonNode mse = postQuery("SET useMultistageEngine = true; SET useGpu = true; " + query);
     assertTrue(mse.get("exceptions").isEmpty(), mse.toString());

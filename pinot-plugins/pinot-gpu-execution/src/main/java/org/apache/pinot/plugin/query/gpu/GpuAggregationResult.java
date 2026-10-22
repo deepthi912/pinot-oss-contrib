@@ -18,18 +18,31 @@
  */
 package org.apache.pinot.plugin.query.gpu;
 
-/// Result of [GpuBackend#groupByCount]: the per-group counts plus the device's own execution time. Immutable.
-public final class GpuGroupByCountResult {
+import javax.annotation.Nullable;
+
+
+/// Per-group row counts and exact 64-bit sums from [GpuBackend#aggregate], plus the device-measured execution time
+/// (`-1` when not measured). Immutable.
+public final class GpuAggregationResult {
   private final long[] _counts;
+  @Nullable
+  private final long[] _sums;
   private final long _deviceTimeNs;
 
-  public GpuGroupByCountResult(long[] counts, long deviceTimeNs) {
+  public GpuAggregationResult(long[] counts, @Nullable long[] sums, long deviceTimeNs) {
     _counts = counts;
+    _sums = sums;
     _deviceTimeNs = deviceTimeNs;
   }
 
   public long[] getCounts() {
     return _counts;
+  }
+
+  /// `null` when no value column was aggregated.
+  @Nullable
+  public long[] getSums() {
+    return _sums;
   }
 
   public long getDeviceTimeNs() {

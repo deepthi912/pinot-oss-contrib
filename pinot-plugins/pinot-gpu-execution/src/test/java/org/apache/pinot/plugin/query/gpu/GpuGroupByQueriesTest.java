@@ -69,6 +69,10 @@ public class GpuGroupByQueriesTest extends BaseQueriesTest {
   private static final int NUM_ROWS_PER_SEGMENT = 20_003;
   private static final String QUERY =
       "SELECT dimStr, COUNT(*) FROM testTable GROUP BY dimStr ORDER BY dimStr LIMIT 1000";
+  private static final String GROUP_BY_VALUES_QUERY = "SELECT dimStr, SUM(metric), AVG(rawMetric), "
+      + "DISTINCTCOUNT(dimInt) FROM testTable GROUP BY dimStr ORDER BY dimStr LIMIT 1000";
+  private static final String AGGREGATION_QUERY =
+      "SELECT SUM(metric), AVG(rawMetric), DISTINCTCOUNT(dimStr), COUNT(*) FROM testTable WHERE metric > 100";
 
   private static final Schema SCHEMA = new Schema.SchemaBuilder().setSchemaName(TABLE)
       .addSingleValueDimension("dimStr", DataType.STRING)
@@ -83,20 +87,24 @@ public class GpuGroupByQueriesTest extends BaseQueriesTest {
       .addSingleValueDimension("rawStr", DataType.STRING)
       .addMultiValueDimension("mvInt", DataType.INT)
       .addMetric("metric", DataType.INT)
+      .addMetric("rawMetric", DataType.INT)
       .build();
   private static final TableConfig TABLE_CONFIG = new TableConfigBuilder(TableType.OFFLINE).setTableName(TABLE)
-      .setNoDictionaryColumns(List.of("rawStr")).build();
+      .setNoDictionaryColumns(List.of("rawStr", "rawMetric")).build();
 
   private final JavaGpuBackendProvider _gpuProvider =
       new JavaGpuBackendProvider(GpuBackendType.CUDA, true, Behavior.CORRECT);
   private final JavaGpuBackendProvider _failingProvider =
       new JavaGpuBackendProvider(GpuBackendType.CUDA, true, Behavior.FAIL);
+  private final JavaGpuBackendProvider _corruptValuesProvider =
+      new JavaGpuBackendProvider(GpuBackendType.CUDA, true, Behavior.CORRUPT_VALUES);
   private final JavaGpuBackendProvider _corruptProvider =
       new JavaGpuBackendProvider(GpuBackendType.CUDA, true, Behavior.CORRUPT);
   private final PlanMaker _cpuPlanMaker = new InstancePlanMakerImplV2();
   private GpuPlanMaker _gpuPlanMaker;
   private GpuPlanMaker _failingPlanMaker;
   private GpuPlanMaker _corruptPlanMaker;
+  private GpuPlanMaker _corruptValuesPlanMaker;
   private List<IndexSegment> _indexSegments;
 
   @Override
@@ -122,6 +130,7 @@ public class GpuGroupByQueriesTest extends BaseQueriesTest {
     _gpuPlanMaker = gpuPlanMaker(List.of(_gpuProvider));
     _failingPlanMaker = gpuPlanMaker(List.of(_failingProvider));
     _corruptPlanMaker = gpuPlanMaker(List.of(_corruptProvider));
+    _corruptValuesPlanMaker = gpuPlanMaker(List.of(_corruptValuesProvider));
   }
 
   private static GpuPlanMaker gpuPlanMaker(List<GpuBackendProvider> providers) {
@@ -149,6 +158,7 @@ public class GpuGroupByQueriesTest extends BaseQueriesTest {
       row.putValue("rawStr", "r" + random.nextInt(50));
       row.putValue("mvInt", new Object[]{random.nextInt(10), random.nextInt(10)});
       row.putValue("metric", random.nextInt(2001) - 1000);
+      row.putValue("rawMetric", random.nextInt() / 4);
       rows.add(row);
     }
     SegmentGeneratorConfig config = new SegmentGeneratorConfig(TABLE_CONFIG, SCHEMA);
@@ -187,7 +197,26 @@ public class GpuGroupByQueriesTest extends BaseQueriesTest {
         // Set by the broker whenever one server serves the query; final results are produced after the combine.
         {"SET serverReturnFinalResult = true; " + QUERY},
         {"SET serverReturnFinalResult = true; "
-            + "SELECT dimStr, COUNT(*) FROM testTable GROUP BY dimStr ORDER BY COUNT(*) DESC, dimStr LIMIT 5"}
+            + "SELECT dimStr, COUNT(*) FROM testTable GROUP BY dimStr ORDER BY COUNT(*) DESC, dimStr LIMIT 5"},
+        // Segment trim below the number of groups through the sorted combine, both directions.
+        {"SET minSegmentGroupTrimSize = 10; "
+            + "SELECT dimInt, COUNT(*) FROM testTable GROUP BY dimInt ORDER BY dimInt LIMIT 3"},
+        {"SET minSegmentGroupTrimSize = 10; "
+            + "SELECT dimInt, SUM(metric) FROM testTable GROUP BY dimInt ORDER BY dimInt DESC LIMIT 3"},
+        // SUM / AVG on dictionary and raw INT columns, DISTINCTCOUNT over several types, all mixed.
+        {"SELECT dimStr, SUM(metric), AVG(metric) FROM testTable GROUP BY dimStr ORDER BY dimStr LIMIT 1000"},
+        {"SELECT dimStr, SUM(rawMetric), AVG(rawMetric) FROM testTable GROUP BY dimStr ORDER BY dimStr LIMIT 1000"},
+        {"SELECT dimStr, DISTINCTCOUNT(dimInt) FROM testTable GROUP BY dimStr ORDER BY dimStr LIMIT 1000"},
+        {"SELECT dimStr, DISTINCTCOUNT(dimLong), DISTINCTCOUNT(dimDouble), DISTINCTCOUNT(dimBytes) FROM testTable "
+            + "GROUP BY dimStr ORDER BY dimStr LIMIT 1000"},
+        {"SELECT dimInt, COUNT(*), SUM(metric), AVG(rawMetric), DISTINCTCOUNT(dimStr) FROM testTable "
+            + "GROUP BY dimInt ORDER BY dimInt LIMIT 2000"},
+        {"SELECT dimStr, SUM(metric) FROM testTable WHERE metric > 0 GROUP BY dimStr "
+            + "ORDER BY SUM(metric) DESC, dimStr LIMIT 5"},
+        // Aggregation without GROUP BY.
+        {"SELECT SUM(metric), AVG(metric) FROM testTable"},
+        {"SELECT SUM(rawMetric), AVG(rawMetric), DISTINCTCOUNT(dimStr), COUNT(*) FROM testTable WHERE metric > 100"},
+        {"SELECT DISTINCTCOUNT(dimHigh) FROM testTable WHERE dimBool = true"}
     };
   }
 
@@ -195,7 +224,12 @@ public class GpuGroupByQueriesTest extends BaseQueriesTest {
   public Object[][] cpuQueries() {
     return new Object[][]{
         {"SELECT COUNT(*) FROM testTable"},
-        {"SELECT dimStr, SUM(metric) FROM testTable GROUP BY dimStr ORDER BY dimStr LIMIT 1000"},
+        {"SELECT dimStr, SUM(dimLong) FROM testTable GROUP BY dimStr ORDER BY dimStr LIMIT 1000"},
+        {"SELECT dimStr, MIN(metric) FROM testTable GROUP BY dimStr ORDER BY dimStr LIMIT 1000"},
+        {"SELECT dimStr, DISTINCTCOUNT(rawStr) FROM testTable GROUP BY dimStr ORDER BY dimStr LIMIT 1000"},
+        // Without a filter, Pinot answers these from the dictionary or metadata without scanning.
+        {"SELECT DISTINCTCOUNT(dimStr) FROM testTable"},
+        {"SELECT COUNT(*), SUM(metric) FROM testTable"},
         {"SELECT dimStr, dimInt, COUNT(*) FROM testTable GROUP BY dimStr, dimInt ORDER BY dimStr, dimInt LIMIT 100"},
         {"SELECT rawStr, COUNT(*) FROM testTable GROUP BY rawStr ORDER BY rawStr LIMIT 1000"},
         {"SELECT mvInt, COUNT(*) FROM testTable GROUP BY mvInt ORDER BY mvInt LIMIT 1000"},
@@ -217,8 +251,18 @@ public class GpuGroupByQueriesTest extends BaseQueriesTest {
   }
 
   @Test(dataProvider = "gpuQueries")
-  public void testEligibleQueriesRunOnGpu(String query) {
+  public void testEligibleQueriesRunOnGpu(String query)
+      throws Exception {
     assertSameResults(query, _gpuPlanMaker, _gpuProvider, true);
+    // Matching results alone would also pass on a CPU fallback.
+    GpuQueryStats stats = executeAndGetStats(_gpuPlanMaker, query);
+    assertEquals(stats.getSegmentsFallback(), 0, stats.toString());
+    assertTrue(stats.getSegmentsOnGpu() > 0, stats.toString());
+  }
+
+  @DataProvider
+  public Object[][] fallbackQueries() {
+    return new Object[][]{{QUERY}, {GROUP_BY_VALUES_QUERY}, {AGGREGATION_QUERY}};
   }
 
   @Test(dataProvider = "cpuQueries")
@@ -228,25 +272,38 @@ public class GpuGroupByQueriesTest extends BaseQueriesTest {
 
   @Test
   public void testNoMatchingDocuments() {
-    String query =
-        "SELECT dimStr, COUNT(*) FROM testTable WHERE metric > 5000 GROUP BY dimStr ORDER BY dimStr LIMIT 10";
-    assertSameResponse(getBrokerResponse(query, _gpuPlanMaker), getBrokerResponse(query, _cpuPlanMaker), query);
+    for (String query : List.of(
+        "SELECT dimStr, COUNT(*) FROM testTable WHERE metric > 5000 GROUP BY dimStr ORDER BY dimStr LIMIT 10",
+        "SELECT SUM(metric), AVG(rawMetric), DISTINCTCOUNT(dimStr), COUNT(*) FROM testTable WHERE metric > 5000")) {
+      assertSameResponse(getBrokerResponse(query, _gpuPlanMaker), getBrokerResponse(query, _cpuPlanMaker), query);
+    }
   }
 
-  @Test
-  public void testDeviceFailureFallsBackToCpu()
+  @Test(dataProvider = "fallbackQueries")
+  public void testDeviceFailureFallsBackToCpu(String query)
       throws Exception {
-    assertSameResults(QUERY, _failingPlanMaker, _failingProvider, true);
-    GpuQueryStats stats = executeAndGetStats(_failingPlanMaker, QUERY);
-    assertEquals(stats.getSegmentsOnGpu(), 0, stats.toString());
-    assertEquals(stats.getSegmentsFallback(), _indexSegments.size(), stats.toString());
+    assertAllSegmentsFallBack(query, _failingPlanMaker, _failingProvider);
   }
 
-  @Test
-  public void testCorruptDeviceResultsFallBackToCpu()
+  @Test(dataProvider = "fallbackQueries")
+  public void testCorruptDeviceResultsFallBackToCpu(String query)
       throws Exception {
-    assertSameResults(QUERY, _corruptPlanMaker, _corruptProvider, true);
-    GpuQueryStats stats = executeAndGetStats(_corruptPlanMaker, QUERY);
+    assertAllSegmentsFallBack(query, _corruptPlanMaker, _corruptProvider);
+  }
+
+  @Test(dataProvider = "fallbackQueries")
+  public void testInconsistentSumsOrDistinctValuesFallBackToCpu(String query)
+      throws Exception {
+    if (query.equals(QUERY)) {
+      return;
+    }
+    assertAllSegmentsFallBack(query, _corruptValuesPlanMaker, _corruptValuesProvider);
+  }
+
+  private void assertAllSegmentsFallBack(String query, GpuPlanMaker planMaker, JavaGpuBackendProvider provider)
+      throws Exception {
+    assertSameResults(query, planMaker, provider, true);
+    GpuQueryStats stats = executeAndGetStats(planMaker, query);
     assertEquals(stats.getSegmentsOnGpu(), 0, stats.toString());
     assertEquals(stats.getSegmentsFallback(), _indexSegments.size(), stats.toString());
   }
@@ -258,10 +315,17 @@ public class GpuGroupByQueriesTest extends BaseQueriesTest {
     assertEquals(stats.getSegmentsOnGpu(), _indexSegments.size(), stats.toString());
     assertEquals(stats.getSegmentsFallback(), 0, stats.toString());
 
-    GpuQueryStats selective = executeAndGetStats(_gpuPlanMaker,
-        "SELECT dimStr, COUNT(*) FROM testTable WHERE dimInt < 20 GROUP BY dimStr ORDER BY dimStr LIMIT 1000");
-    assertEquals(selective.getSegmentsOnGpu(), 0, selective.toString());
-    assertEquals(selective.getSegmentsSelectiveOnCpu(), _indexSegments.size(), selective.toString());
+    for (String query : List.of(
+        "SELECT dimStr, COUNT(*) FROM testTable WHERE dimInt < 20 GROUP BY dimStr ORDER BY dimStr LIMIT 1000",
+        "SELECT SUM(metric), AVG(rawMetric), DISTINCTCOUNT(dimStr) FROM testTable WHERE dimInt < 20",
+        // 1000 x 5000 (group, value) bits per segment: more bitmap words than matching documents.
+        "SELECT dimInt, DISTINCTCOUNT(dimHigh) FROM testTable WHERE metric > 100 GROUP BY dimInt "
+            + "ORDER BY dimInt LIMIT 2000")) {
+      assertSameResponse(getBrokerResponse(query, _gpuPlanMaker), getBrokerResponse(query, _cpuPlanMaker), query);
+      GpuQueryStats selective = executeAndGetStats(_gpuPlanMaker, query);
+      assertEquals(selective.getSegmentsOnGpu(), 0, selective.toString());
+      assertEquals(selective.getSegmentsSelectiveOnCpu(), _indexSegments.size(), selective.toString());
+    }
   }
 
   @Test
@@ -271,6 +335,51 @@ public class GpuGroupByQueriesTest extends BaseQueriesTest {
     int uploads = _gpuProvider.getNumUploads();
     assertSameResults(query, _gpuPlanMaker, _gpuProvider, true);
     assertEquals(_gpuProvider.getNumUploads(), uploads, "second query must reuse the resident columns");
+  }
+
+  @Test
+  public void testReloadedSegmentDoesNotReuseStaleColumns()
+      throws Exception {
+    String query = "SELECT dimStr, SUM(metric), DISTINCTCOUNT(dimInt) FROM testTable WHERE metric >= 0 "
+        + "GROUP BY dimStr ORDER BY dimStr LIMIT 1000";
+    List<IndexSegment> original = _indexSegments;
+    ImmutableSegment before = buildSegment("reloaded", 100);
+    ImmutableSegment after = null;
+    try {
+      _indexSegments = List.of(before);
+      assertSameResults(query, _gpuPlanMaker, _gpuProvider, true);
+      before.destroy();
+      // Same name and row count, different data: the cache must not serve the old instance's columns.
+      after = buildSegment("reloaded", 101);
+      _indexSegments = List.of(after);
+      int uploads = _gpuProvider.getNumUploads();
+      assertSameResults(query, _gpuPlanMaker, _gpuProvider, true);
+      assertTrue(_gpuProvider.getNumUploads() > uploads, "reloaded segment must upload its own columns");
+    } finally {
+      _indexSegments = original;
+      if (after != null) {
+        after.destroy();
+      }
+    }
+  }
+
+  @Test
+  public void testColumnsThatDoNotFitStayOnCpu()
+      throws Exception {
+    GpuPlanMaker planMaker = new GpuPlanMaker(List.of(_gpuProvider));
+    planMaker.init(new PinotConfiguration(Map.of(GpuExecutionConfig.ENABLED, "true", GpuExecutionConfig.MIN_ROWS,
+        "0", GpuExecutionConfig.CACHE_MAX_BYTES, "1")));
+    try {
+      for (String query : List.of(QUERY, AGGREGATION_QUERY)) {
+        assertSameResults(query, planMaker, _gpuProvider, false);
+        GpuQueryStats stats = executeAndGetStats(planMaker, query);
+        assertEquals(stats.getSegmentsNotResident(), _indexSegments.size(), stats.toString());
+        assertEquals(stats.getSegmentsOnGpu(), 0, stats.toString());
+      }
+    } finally {
+      planMaker.getColumnCache().close();
+      planMaker.getRouter().close();
+    }
   }
 
   @Test
@@ -299,6 +408,10 @@ public class GpuGroupByQueriesTest extends BaseQueriesTest {
     for (Object[] query : gpuQueries()) {
       String sql = (String) query[0];
       assertSameResponse(getBrokerResponse(sql, metalPlanMaker), getBrokerResponse(sql, _cpuPlanMaker), sql);
+      // A CPU fallback would still produce matching results, so require that Metal actually computed them.
+      GpuQueryStats stats = executeAndGetStats(metalPlanMaker, sql);
+      assertEquals(stats.getSegmentsFallback(), 0, sql + " " + stats);
+      assertTrue(stats.getSegmentsOnGpu() > 0, sql + " " + stats);
     }
 
     for (String sql : List.of("SELECT dimInt, COUNT(*) FROM testTable GROUP BY dimInt ORDER BY dimInt LIMIT 2000",
@@ -314,11 +427,60 @@ public class GpuGroupByQueriesTest extends BaseQueriesTest {
     for (int i = 0; i < keys.length; i++) {
       keys[i] = i % 7;
     }
-    try (GpuColumn column = metal.uploadIntColumn(keys, keys.length)) {
-      GpuGroupByCountResult result = metal.groupByCount(column, 7, null);
+    int[] values = new int[keys.length];
+    for (int i = 0; i < values.length; i++) {
+      values[i] = i % 2 == 0 ? Integer.MAX_VALUE : Integer.MIN_VALUE;
+    }
+    try (GpuColumn column = metal.uploadIntColumn(keys, keys.length);
+        GpuColumn valueColumn = metal.uploadIntColumn(values, values.length)) {
+      GpuAggregationResult result = metal.aggregate(column, 7, valueColumn, keys.length, null);
       assertTrue(result.getDeviceTimeNs() > 0, "Metal reported no device time");
-      assertEquals(result.getCounts()[0], 142858L);
-      assertEquals(result.getCounts()[6], 142857L);
+      long[] expectedSums = new long[7];
+      long[] expectedCounts = new long[7];
+      for (int i = 0; i < keys.length; i++) {
+        expectedSums[keys[i]] += values[i];
+        expectedCounts[keys[i]]++;
+      }
+      assertEquals(result.getCounts(), expectedCounts);
+      assertEquals(result.getSums(), expectedSums);
+      assertEquals(metal.distinct(null, 1, column, 7, keys.length, null).getIds(0, 7).getCardinality(), 7);
+    }
+
+    // Filtered kernels without group keys, and grouped distinct pairs: every 3rd document matches.
+    int numDocs = 300_001;
+    int[] filterWords = new int[(numDocs + 31) >>> 5];
+    long expectedCount = 0;
+    long expectedSum = 0;
+    int[] groups = new int[numDocs];
+    int[] ids = new int[numDocs];
+    boolean[][] expectedPairs = new boolean[5][11];
+    for (int docId = 0; docId < numDocs; docId++) {
+      groups[docId] = docId % 5;
+      ids[docId] = (docId / 5) % 11;
+      if (docId % 3 == 0) {
+        filterWords[docId >>> 5] |= 1 << docId;
+        expectedCount++;
+        expectedSum += docId - 150_000;
+        expectedPairs[groups[docId]][ids[docId]] = true;
+      }
+    }
+    int[] signedValues = new int[numDocs];
+    for (int docId = 0; docId < numDocs; docId++) {
+      signedValues[docId] = docId - 150_000;
+    }
+    try (GpuColumn filter = metal.uploadFilter(filterWords);
+        GpuColumn valueColumn = metal.uploadIntColumn(signedValues, numDocs);
+        GpuColumn groupColumn = metal.uploadIntColumn(groups, numDocs);
+        GpuColumn idColumn = metal.uploadIntColumn(ids, numDocs)) {
+      GpuAggregationResult total = metal.aggregate(null, 1, valueColumn, numDocs, filter);
+      assertEquals(total.getCounts(), new long[]{expectedCount});
+      assertEquals(total.getSums(), new long[]{expectedSum});
+      GpuDistinctResult pairs = metal.distinct(groupColumn, 5, idColumn, 11, numDocs, filter);
+      for (int g = 0; g < 5; g++) {
+        for (int id = 0; id < 11; id++) {
+          assertEquals(pairs.getIds(g, 11).contains(id), expectedPairs[g][id], "group " + g + " id " + id);
+        }
+      }
     }
     metalPlanMaker.getColumnCache().close();
     metalPlanMaker.getRouter().close();
@@ -375,7 +537,8 @@ public class GpuGroupByQueriesTest extends BaseQueriesTest {
 
   @AfterClass
   public void tearDown() {
-    for (GpuPlanMaker planMaker : List.of(_gpuPlanMaker, _failingPlanMaker, _corruptPlanMaker)) {
+    for (GpuPlanMaker planMaker : List.of(_gpuPlanMaker, _failingPlanMaker, _corruptPlanMaker,
+        _corruptValuesPlanMaker)) {
       planMaker.getColumnCache().close();
       planMaker.getRouter().close();
     }

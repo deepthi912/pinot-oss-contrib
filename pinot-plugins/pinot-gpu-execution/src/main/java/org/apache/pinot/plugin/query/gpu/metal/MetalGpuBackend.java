@@ -28,10 +28,11 @@ import java.lang.foreign.ValueLayout;
 import java.lang.invoke.MethodHandle;
 import java.nio.file.Path;
 import javax.annotation.Nullable;
+import org.apache.pinot.plugin.query.gpu.GpuAggregationResult;
 import org.apache.pinot.plugin.query.gpu.GpuBackend;
 import org.apache.pinot.plugin.query.gpu.GpuBackendType;
 import org.apache.pinot.plugin.query.gpu.GpuColumn;
-import org.apache.pinot.plugin.query.gpu.GpuGroupByCountResult;
+import org.apache.pinot.plugin.query.gpu.GpuDistinctResult;
 
 
 /// Experimental Apple GPU backend on Metal, called through the FFM API (native code: `src/main/native/metal_ops.mm`).
@@ -39,6 +40,7 @@ import org.apache.pinot.plugin.query.gpu.GpuGroupByCountResult;
 public class MetalGpuBackend implements GpuBackend {
   private static final long PAGE_SIZE = 16 * 1024;
   private static final int ERROR_LENGTH = 1024;
+  private static final int UPLOAD_CHUNK_SIZE = 64 * 1024;
   private static final AddressLayout ADDRESS = ValueLayout.ADDRESS;
   private static final ValueLayout.OfInt INT = ValueLayout.JAVA_INT;
   private static final ValueLayout.OfLong LONG = ValueLayout.JAVA_LONG;
@@ -48,6 +50,7 @@ public class MetalGpuBackend implements GpuBackend {
   private final MethodHandle _pin;
   private final MethodHandle _unpin;
   private final MethodHandle _groupBy;
+  private final MethodHandle _distinct;
   private final MemorySegment _context;
   private final String _deviceName;
 
@@ -65,6 +68,8 @@ public class MetalGpuBackend implements GpuBackend {
     _groupBy = linker.downcallHandle(lookup.find("mg_group_by").orElseThrow(),
         FunctionDescriptor.of(INT, ADDRESS, ADDRESS, ADDRESS, ADDRESS, INT, INT, ADDRESS, ADDRESS, ADDRESS, ADDRESS,
             INT));
+    _distinct = linker.downcallHandle(lookup.find("mg_distinct_pairs").orElseThrow(),
+        FunctionDescriptor.of(INT, ADDRESS, ADDRESS, ADDRESS, ADDRESS, INT, INT, INT, ADDRESS, ADDRESS, ADDRESS, INT));
     try (Arena arena = Arena.ofConfined()) {
       MemorySegment error = arena.allocate(ERROR_LENGTH);
       _context = (MemorySegment) create.invokeExact(error, ERROR_LENGTH);
@@ -92,11 +97,17 @@ public class MetalGpuBackend implements GpuBackend {
   }
 
   @Override
-  public GpuColumn uploadIntColumn(int[] values, int length) {
+  public GpuColumn uploadIntColumn(int numValues, IntChunkReader reader) {
     Arena arena = Arena.ofShared();
     try {
-      MemorySegment segment = copyAligned(arena, values, length);
-      return new MetalColumn(arena, pin(segment), length, segment.byteSize());
+      MemorySegment segment = allocateAligned(arena, numValues);
+      int[] buffer = new int[Math.min(UPLOAD_CHUNK_SIZE, Math.max(numValues, 1))];
+      for (int start = 0; start < numValues; start += buffer.length) {
+        int length = Math.min(buffer.length, numValues - start);
+        reader.read(start, length, buffer);
+        MemorySegment.copy(buffer, 0, segment, ValueLayout.JAVA_INT, (long) start * Integer.BYTES, length);
+      }
+      return new MetalColumn(arena, pin(segment), numValues, segment.byteSize());
     } catch (RuntimeException e) {
       arena.close();
       throw e;
@@ -104,42 +115,76 @@ public class MetalGpuBackend implements GpuBackend {
   }
 
   @Override
-  public GpuGroupByCountResult groupByCount(GpuColumn groupKeys, int cardinality,
-      @Nullable int[] matchingDocsWords) {
-    MetalColumn keys = (MetalColumn) groupKeys;
+  public GpuAggregationResult aggregate(@Nullable GpuColumn groupKeys, int numGroups, @Nullable GpuColumn values,
+      int numDocs, @Nullable GpuColumn matchingDocs) {
     try (Arena arena = Arena.ofConfined()) {
-      MemorySegment filterPin = MemorySegment.NULL;
-      if (matchingDocsWords != null) {
-        filterPin = pin(copyAligned(arena, matchingDocsWords, matchingDocsWords.length));
+      MemorySegment counts = arena.allocate(ValueLayout.JAVA_LONG, numGroups);
+      MemorySegment sumsU = values != null ? arena.allocate(ValueLayout.JAVA_LONG, numGroups) : MemorySegment.NULL;
+      MemorySegment gpuMillis = arena.allocate(ValueLayout.JAVA_DOUBLE);
+      MemorySegment error = arena.allocate(ERROR_LENGTH);
+      int status = (int) _groupBy.invokeExact(_context, pinOf(groupKeys), pinOf(values), pinOf(matchingDocs),
+          numDocs, numGroups, sumsU, counts, gpuMillis, error, ERROR_LENGTH);
+      if (status != 0) {
+        throw new IllegalStateException("Metal aggregation failed: " + error.getString(0));
       }
+      long[] countArray = counts.toArray(ValueLayout.JAVA_LONG);
+      long[] sums = null;
+      if (values != null) {
+        // The kernel sums (value + 2^31) to stay unsigned; subtract the bias per row.
+        sums = sumsU.toArray(ValueLayout.JAVA_LONG);
+        for (int g = 0; g < numGroups; g++) {
+          sums[g] -= countArray[g] << 31;
+        }
+      }
+      return new GpuAggregationResult(countArray, sums, deviceTimeNs(gpuMillis));
+    } catch (RuntimeException | Error e) {
+      throw e;
+    } catch (Throwable t) {
+      throw new IllegalStateException("Metal aggregation failed", t);
+    }
+  }
+
+  @Override
+  public GpuDistinctResult distinct(@Nullable GpuColumn groupKeys, int numGroups, GpuColumn ids, int cardinality,
+      int numDocs, @Nullable GpuColumn matchingDocs) {
+    try (Arena arena = Arena.ofConfined()) {
+      int numWords = (int) (((long) numGroups * cardinality + 31) >>> 5);
+      // The kernel writes the bitmap straight into this page-aligned memory: no device-side copy.
+      MemorySegment words = allocateAligned(arena, numWords);
+      MemorySegment wordsPin = pin(words);
       try {
-        MemorySegment counts = arena.allocate(ValueLayout.JAVA_LONG, cardinality);
         MemorySegment gpuMillis = arena.allocate(ValueLayout.JAVA_DOUBLE);
         MemorySegment error = arena.allocate(ERROR_LENGTH);
-        int status = (int) _groupBy.invokeExact(_context, keys._pin, MemorySegment.NULL, filterPin,
-            keys._numValues, cardinality, MemorySegment.NULL, counts, gpuMillis, error, ERROR_LENGTH);
+        int status = (int) _distinct.invokeExact(_context, pinOf(groupKeys), pinOf(ids), pinOf(matchingDocs),
+            numDocs, numGroups, cardinality, wordsPin, gpuMillis, error, ERROR_LENGTH);
         if (status != 0) {
-          throw new IllegalStateException("Metal group-by failed: " + error.getString(0));
+          throw new IllegalStateException("Metal distinct failed: " + error.getString(0));
         }
-        long deviceTimeNs = Math.round(gpuMillis.get(ValueLayout.JAVA_DOUBLE, 0) * 1_000_000);
-        return new GpuGroupByCountResult(counts.toArray(ValueLayout.JAVA_LONG), deviceTimeNs);
+        return new GpuDistinctResult(words.asSlice(0, (long) numWords * Integer.BYTES).toArray(ValueLayout.JAVA_INT),
+            deviceTimeNs(gpuMillis));
       } finally {
-        unpin(filterPin);
+        unpin(wordsPin);
       }
     } catch (RuntimeException | Error e) {
       throw e;
     } catch (Throwable t) {
-      throw new IllegalStateException("Metal group-by failed", t);
+      throw new IllegalStateException("Metal distinct failed", t);
     }
   }
 
-  private static MemorySegment copyAligned(Arena arena, int[] values, int length) {
-    long bytes = (long) length * Integer.BYTES;
-    long padded = Math.max(PAGE_SIZE, (bytes + PAGE_SIZE - 1) / PAGE_SIZE * PAGE_SIZE);
-    MemorySegment segment = arena.allocate(padded, PAGE_SIZE);
-    MemorySegment.copy(values, 0, segment, ValueLayout.JAVA_INT, 0, length);
-    return segment;
+  private static MemorySegment pinOf(@Nullable GpuColumn column) {
+    return column != null ? ((MetalColumn) column)._pin : MemorySegment.NULL;
   }
+
+  private static long deviceTimeNs(MemorySegment gpuMillis) {
+    return Math.round(gpuMillis.get(ValueLayout.JAVA_DOUBLE, 0) * 1_000_000);
+  }
+
+  private static MemorySegment allocateAligned(Arena arena, int numInts) {
+    long bytes = (long) numInts * Integer.BYTES;
+    return arena.allocate(Math.max(PAGE_SIZE, (bytes + PAGE_SIZE - 1) / PAGE_SIZE * PAGE_SIZE), PAGE_SIZE);
+  }
+
 
   private MemorySegment pin(MemorySegment segment) {
     try {
