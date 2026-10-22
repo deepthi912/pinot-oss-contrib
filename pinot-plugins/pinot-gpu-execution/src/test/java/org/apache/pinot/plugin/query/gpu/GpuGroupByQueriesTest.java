@@ -213,8 +213,11 @@ public class GpuGroupByQueriesTest extends BaseQueriesTest {
             + "GROUP BY dimInt ORDER BY dimInt LIMIT 2000"},
         {"SELECT dimStr, SUM(metric) FROM testTable WHERE metric > 0 GROUP BY dimStr "
             + "ORDER BY SUM(metric) DESC, dimStr LIMIT 5"},
-        // Aggregation without GROUP BY.
+        // More than 1024 groups: the global-memory SUM kernel.
+        {"SELECT dimHigh, SUM(rawMetric), AVG(metric) FROM testTable GROUP BY dimHigh ORDER BY dimHigh LIMIT 10000"},
+        // Aggregation without GROUP BY; with SUM present core would scan, so COUNT(*) comes from the GPU too.
         {"SELECT SUM(metric), AVG(metric) FROM testTable"},
+        {"SELECT COUNT(*), SUM(metric), AVG(rawMetric) FROM testTable"},
         {"SELECT SUM(rawMetric), AVG(rawMetric), DISTINCTCOUNT(dimStr), COUNT(*) FROM testTable WHERE metric > 100"},
         {"SELECT DISTINCTCOUNT(dimHigh) FROM testTable WHERE dimBool = true"}
     };
@@ -229,7 +232,7 @@ public class GpuGroupByQueriesTest extends BaseQueriesTest {
         {"SELECT dimStr, DISTINCTCOUNT(rawStr) FROM testTable GROUP BY dimStr ORDER BY dimStr LIMIT 1000"},
         // Without a filter, Pinot answers these from the dictionary or metadata without scanning.
         {"SELECT DISTINCTCOUNT(dimStr) FROM testTable"},
-        {"SELECT COUNT(*), SUM(metric) FROM testTable"},
+        {"SELECT COUNT(*), DISTINCTCOUNT(dimStr) FROM testTable"},
         {"SELECT dimStr, dimInt, COUNT(*) FROM testTable GROUP BY dimStr, dimInt ORDER BY dimStr, dimInt LIMIT 100"},
         {"SELECT rawStr, COUNT(*) FROM testTable GROUP BY rawStr ORDER BY rawStr LIMIT 1000"},
         {"SELECT mvInt, COUNT(*) FROM testTable GROUP BY mvInt ORDER BY mvInt LIMIT 1000"},
@@ -444,6 +447,28 @@ public class GpuGroupByQueriesTest extends BaseQueriesTest {
       assertEquals(result.getCounts(), expectedCounts);
       assertEquals(result.getSums(), expectedSums);
       assertEquals(metal.distinct(null, 1, column, 7, keys.length, null).getIds(0, 7).getCardinality(), 7);
+    }
+
+    // Global-memory SUM kernel: more than 1024 groups, asymmetric full-range values, per-group sums beyond int32 and
+    // more than 2^24 rows (several fold batches).
+    int numRows = (1 << 24) + 12_345;
+    int numGroups = 3001;
+    int[] groupKeys = new int[numRows];
+    int[] bigValues = new int[numRows];
+    long[] expectedGroupSums = new long[numGroups];
+    long[] expectedGroupCounts = new long[numGroups];
+    Random random = new Random(7);
+    for (int i = 0; i < numRows; i++) {
+      groupKeys[i] = random.nextInt(numGroups);
+      bigValues[i] = random.nextInt() / (groupKeys[i] % 3 == 0 ? 1 : 7) + (groupKeys[i] % 2 == 0 ? 1_000_000 : 0);
+      expectedGroupSums[groupKeys[i]] += bigValues[i];
+      expectedGroupCounts[groupKeys[i]]++;
+    }
+    try (GpuColumn keyColumn = metal.uploadIntColumn(groupKeys, numRows);
+        GpuColumn valueColumn = metal.uploadIntColumn(bigValues, numRows)) {
+      GpuAggregationResult result = metal.aggregate(keyColumn, numGroups, valueColumn, numRows, null);
+      assertEquals(result.getCounts(), expectedGroupCounts);
+      assertEquals(result.getSums(), expectedGroupSums);
     }
 
     // Filtered kernels without group keys, and grouped distinct pairs: every 3rd document matches.

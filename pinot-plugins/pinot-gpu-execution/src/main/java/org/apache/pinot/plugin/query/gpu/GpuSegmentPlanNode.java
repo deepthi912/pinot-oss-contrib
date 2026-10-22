@@ -55,7 +55,7 @@ public class GpuSegmentPlanNode implements PlanNode {
     boolean groupBy = _queryContext.getGroupByExpressions() != null;
     FilterPlanNode filterPlanNode = new FilterPlanNode(_segmentContext, _queryContext);
     BaseFilterOperator filterOperator = filterPlanNode.run();
-    if (!groupBy && filterOperator.isResultMatchingAll() && hasMetadataAnswerableFunction()) {
+    if (!groupBy && filterOperator.isResultMatchingAll() && answerableWithoutScan()) {
       _stats.recordIneligible();
       return new AggregationPlanNode(_segmentContext, _queryContext).run();
     }
@@ -71,13 +71,15 @@ public class GpuSegmentPlanNode implements PlanNode {
         : new GpuAggregationOperator(_segmentContext, _queryContext, filterOperator, _backend, _columnCache, _stats);
   }
 
-  private boolean hasMetadataAnswerableFunction() {
+  /// Mirrors core's non-scan plan for the GPU functions: it skips the scan only when every function is COUNT or a
+  /// DISTINCTCOUNT on a dictionary column; with SUM/AVG present core would scan on the CPU, so the GPU does it all.
+  private boolean answerableWithoutScan() {
     for (AggregationFunction<?, ?> function : _queryContext.getAggregationFunctions()) {
       AggregationFunctionType type = function.getType();
-      if (type == AggregationFunctionType.COUNT || type == AggregationFunctionType.DISTINCTCOUNT) {
-        return true;
+      if (type != AggregationFunctionType.COUNT && type != AggregationFunctionType.DISTINCTCOUNT) {
+        return false;
       }
     }
-    return false;
+    return true;
   }
 }

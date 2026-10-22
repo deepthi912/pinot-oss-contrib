@@ -115,6 +115,20 @@ public class MetalGpuBackend implements GpuBackend {
   }
 
   @Override
+  public GpuColumn uploadFilter(int[] words) {
+    // Per-segment and closed by the uploading thread: a confined arena avoids the global handshake of shared ones.
+    Arena arena = Arena.ofConfined();
+    try {
+      MemorySegment segment = allocateAligned(arena, words.length);
+      MemorySegment.copy(words, 0, segment, ValueLayout.JAVA_INT, 0, words.length);
+      return new MetalColumn(arena, pin(segment), words.length, segment.byteSize());
+    } catch (RuntimeException | Error e) {
+      arena.close();
+      throw e;
+    }
+  }
+
+  @Override
   public GpuAggregationResult aggregate(@Nullable GpuColumn groupKeys, int numGroups, @Nullable GpuColumn values,
       int numDocs, @Nullable GpuColumn matchingDocs) {
     try (Arena arena = Arena.ofConfined()) {

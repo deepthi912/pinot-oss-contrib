@@ -143,18 +143,19 @@ public class GpuColumnCacheTest {
   }
 
   @Test
-  public void testPartialEvictionThenDenialFreesEvicted() {
+  public void testDenialWithoutRoomEvictsNothing() {
     GpuColumnCache cache = cache(100);
     JavaColumn a = column(10);
     JavaColumn b = column(10);
     cache.acquire("a", _instanceId, 40, WAIT_NANOS, () -> a).close();
     idle();
     cache.acquire("b", _instanceId, 40, WAIT_NANOS, () -> b).close();
-    // Needs 80 bytes: evicting idle "a" frees 40, then recently used "b" is protected, so the load is denied.
+    // Needs 80 bytes: idle "a" frees only 40 and recently used "b" is protected, so the load is denied up front,
+    // without evicting "a" for nothing.
     assertNull(cache.acquire("c", _instanceId, 80, WAIT_NANOS, () -> {
       throw new AssertionError("must not load");
     }));
-    assertTrue(a.isClosed());
+    assertFalse(a.isClosed());
     assertFalse(b.isClosed());
   }
 

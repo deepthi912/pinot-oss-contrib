@@ -170,7 +170,7 @@ public class GpuColumnCache implements AutoCloseable {
               _loading.put(key, pending);
               ownLoad = true;
             }
-          } else if (pending == null && estimatedBytes > _maxBytes) {
+          } else if (pending == null && !canMakeRoom(estimatedBytes)) {
             return null;
           }
         }
@@ -241,6 +241,28 @@ public class GpuColumnCache implements AutoCloseable {
     }
     ownLoad.complete(entry);
     return new Lease(entry);
+  }
+
+  /// Whether [#makeRoom] could succeed, without evicting anything; checked before waiting for a load slot.
+  private boolean canMakeRoom(long neededBytes) {
+    if (neededBytes > _maxBytes) {
+      return false;
+    }
+    long excess = _residentBytes + _loadingBytes + _pendingFreeBytes + neededBytes - _maxBytes;
+    if (excess <= 0 || _segmentInstanceIds.size() < _expectedLiveInstances) {
+      return true;
+    }
+    long protectedSince = _clockNs.getAsLong() - _minResidencyNs;
+    for (Entry entry : _entries.values()) {
+      if (entry._lastAccessNs > protectedSince) {
+        return false;
+      }
+      excess -= entry._sizeInBytes;
+      if (excess <= 0) {
+        return true;
+      }
+    }
+    return false;
   }
 
   /// Evicts least recently used columns idle for longer than the residency window until `neededBytes` fit.
