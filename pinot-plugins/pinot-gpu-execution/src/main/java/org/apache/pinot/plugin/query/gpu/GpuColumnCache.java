@@ -114,6 +114,7 @@ public class GpuColumnCache implements AutoCloseable {
   private long _nextSegmentInstanceId;
   // Instances believed live; when the weak map holds fewer, some segment was collected and its columns are dead.
   private int _expectedLiveInstances;
+  private boolean _closed;
   private long _residentBytes;
   private long _loadingBytes;
   private long _pendingFreeBytes;
@@ -156,6 +157,9 @@ public class GpuColumnCache implements AutoCloseable {
         boolean ownLoad = false;
         List<GpuColumn> toFree = new ArrayList<>();
         synchronized (this) {
+          if (_closed) {
+            return null;
+          }
           Entry entry = _entries.get(key);
           if (entry != null) {
             entry._refCount++;
@@ -234,10 +238,16 @@ public class GpuColumnCache implements AutoCloseable {
     synchronized (this) {
       _loading.remove(key);
       _loadingBytes -= estimatedBytes;
-      _entries.put(key, entry);
-      _residentBytes += entry._sizeInBytes;
       entry._refCount++;
       entry._lastAccessNs = _clockNs.getAsLong();
+      if (_closed || !_segmentInstanceIds.containsValue(segmentInstanceId)) {
+        // Released or closed while loading: serve this caller only, and free the column when its lease closes.
+        entry._evicted = true;
+        _pendingFreeBytes += entry._sizeInBytes;
+      } else {
+        _entries.put(key, entry);
+        _residentBytes += entry._sizeInBytes;
+      }
     }
     ownLoad.complete(entry);
     return new Lease(entry);
@@ -348,6 +358,7 @@ public class GpuColumnCache implements AutoCloseable {
   public void close() {
     List<GpuColumn> toFree = new ArrayList<>();
     synchronized (this) {
+      _closed = true;
       for (Entry entry : _entries.values()) {
         entry._evicted = true;
         if (entry.markClosedIfUnused()) {

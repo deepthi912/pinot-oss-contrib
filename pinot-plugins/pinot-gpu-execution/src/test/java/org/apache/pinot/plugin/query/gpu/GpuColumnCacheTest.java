@@ -326,6 +326,40 @@ public class GpuColumnCacheTest {
   }
 
   @Test
+  public void testLoadFinishingAfterReleaseIsNotCached()
+      throws Exception {
+    for (boolean closeCache : new boolean[]{false, true}) {
+      GpuColumnCache cache = cache(1000);
+      CountDownLatch loading = new CountDownLatch(1);
+      CountDownLatch release = new CountDownLatch(1);
+      JavaColumn column = column(10);
+      CompletableFuture<GpuColumnCache.Lease> load =
+          CompletableFuture.supplyAsync(() -> cache.acquire("k", _instanceId, 40, WAIT_NANOS, () -> {
+            loading.countDown();
+            awaitQuietly(release);
+            return column;
+          }));
+      assertTrue(loading.await(10, TimeUnit.SECONDS));
+      if (closeCache) {
+        cache.close();
+      } else {
+        cache.releaseSegment(_segment);
+      }
+      release.countDown();
+      GpuColumnCache.Lease lease = load.get(10, TimeUnit.SECONDS);
+      assertSame(lease.getColumn(), column);
+      assertEquals(cache.getNumResidentColumns(), 0);
+      lease.close();
+      assertTrue(column.isClosed(), "the column of a released segment must be freed with its last lease");
+      if (closeCache) {
+        assertNull(cache.acquire("k2", _instanceId, 40, WAIT_NANOS, () -> {
+          throw new AssertionError("a closed cache must not load");
+        }));
+      }
+    }
+  }
+
+  @Test
   public void testFailedLoadPropagatesAndNextAcquireRetries() {
     GpuColumnCache cache = cache(100);
     assertThrows(IllegalStateException.class, () -> cache.acquire("a", _instanceId, 40, WAIT_NANOS, () -> {
