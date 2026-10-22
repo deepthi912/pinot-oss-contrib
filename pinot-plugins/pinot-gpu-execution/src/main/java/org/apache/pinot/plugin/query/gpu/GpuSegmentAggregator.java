@@ -56,8 +56,8 @@ final class GpuSegmentAggregator {
   // Bounds the (group, value) bitmap DISTINCTCOUNT builds per segment to 4 MB.
   static final long MAX_DISTINCT_BITS = 1L << 25;
   private static final int READ_CHUNK_SIZE = 10_000;
-  // A cache miss waits at most this long (and at most a quarter of the remaining query time) for a load slot or a
-  // concurrent load of the same column, then runs on the CPU so the CPU path keeps most of the query's time.
+  // A segment waits at most this long in total (and at most a quarter of the remaining query time) for column loads,
+  // then runs on the CPU so the CPU path keeps most of the query's time. After one timeout the query stops waiting.
   static final long MAX_LOAD_WAIT_MS = 200;
 
   /// Per-group results. Values are materialized on demand, so trimmed-away groups cost nothing.
@@ -109,6 +109,7 @@ final class GpuSegmentAggregator {
   private final String _groupByColumn;
 
   private int _numDocsScanned;
+  private long _loadWaitDeadlineNanos;
   private long _numEntriesScannedInFilter;
   @Nullable
   private ImmutableRoaringBitmap _matchingDocs;
@@ -197,6 +198,9 @@ final class GpuSegmentAggregator {
 
   @Nullable
   private Result computeOnDevice(int numDocs, List<GpuColumnCache.Lease> leases) {
+    long remainingMs = _queryContext.getEndTimeMs() - System.currentTimeMillis();
+    _loadWaitDeadlineNanos = System.nanoTime() + (_stats.isLoadWaitExpired() ? 0
+        : TimeUnit.MILLISECONDS.toNanos(Math.max(0, Math.min(MAX_LOAD_WAIT_MS, remainingMs / 4))));
     GpuColumn keys = null;
     int numGroups = 1;
     if (_groupByColumn != null) {
@@ -327,14 +331,14 @@ final class GpuSegmentAggregator {
   @Nullable
   private GpuColumn resident(String column, boolean intValues, int numDocs, List<GpuColumnCache.Lease> leases) {
     long instanceId = _cache.getOrAssignInstanceId(_segment);
-    long remainingMs = _queryContext.getEndTimeMs() - System.currentTimeMillis();
-    long maxWaitNanos = TimeUnit.MILLISECONDS.toNanos(Math.max(0, Math.min(MAX_LOAD_WAIT_MS, remainingMs / 4)));
+    long maxWaitNanos = Math.max(0, _loadWaitDeadlineNanos - System.nanoTime());
     String key = GpuColumnCache.cacheKey(_backend.getType(), _queryContext.getTableName(), _segment.getSegmentName(),
         instanceId, column + (intValues ? "#values" : "#dictIds"));
     DataSource dataSource = _segment.getDataSource(column);
     GpuColumnCache.Lease lease = _cache.acquire(key, instanceId, (long) numDocs * Integer.BYTES, maxWaitNanos,
         () -> uploadColumn(dataSource, intValues, numDocs));
     if (lease == null) {
+      _stats.markLoadWaitExpired();
       return null;
     }
     leases.add(lease);

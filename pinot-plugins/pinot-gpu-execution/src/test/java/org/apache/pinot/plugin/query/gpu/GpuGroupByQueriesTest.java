@@ -218,6 +218,11 @@ public class GpuGroupByQueriesTest extends BaseQueriesTest {
         // Aggregation without GROUP BY; with SUM present core would scan, so COUNT(*) comes from the GPU too.
         {"SELECT SUM(metric), AVG(metric) FROM testTable"},
         {"SELECT COUNT(*), SUM(metric), AVG(rawMetric) FROM testTable"},
+        // One column as both SUM/AVG values and DISTINCTCOUNT dictionary ids, in both upload orders.
+        {"SELECT dimStr, SUM(dimInt), AVG(dimInt), DISTINCTCOUNT(dimInt) FROM testTable GROUP BY dimStr "
+            + "ORDER BY dimStr LIMIT 1000"},
+        {"SELECT dimStr, DISTINCTCOUNT(dimInt), SUM(dimInt) FROM testTable GROUP BY dimStr ORDER BY dimStr LIMIT 1000"},
+        {"SELECT SUM(metric), DISTINCTCOUNT(metric), COUNT(*) FROM testTable WHERE metric > 100"},
         {"SELECT SUM(rawMetric), AVG(rawMetric), DISTINCTCOUNT(dimStr), COUNT(*) FROM testTable WHERE metric > 100"},
         {"SELECT DISTINCTCOUNT(dimHigh) FROM testTable WHERE dimBool = true"}
     };
@@ -265,7 +270,12 @@ public class GpuGroupByQueriesTest extends BaseQueriesTest {
 
   @DataProvider
   public Object[][] fallbackQueries() {
-    return new Object[][]{{QUERY}, {GROUP_BY_VALUES_QUERY}, {AGGREGATION_QUERY}};
+    return new Object[][]{
+        {QUERY}, {GROUP_BY_VALUES_QUERY}, {AGGREGATION_QUERY},
+        // DISTINCTCOUNT without SUM/AVG, so the distinct-result validation is what triggers the fallback.
+        {"SELECT dimStr, DISTINCTCOUNT(dimInt) FROM testTable GROUP BY dimStr ORDER BY dimStr LIMIT 1000"},
+        {"SELECT DISTINCTCOUNT(dimStr), COUNT(*) FROM testTable WHERE metric > 100"}
+    };
   }
 
   @Test(dataProvider = "cpuQueries")

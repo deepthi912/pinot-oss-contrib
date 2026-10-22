@@ -80,9 +80,20 @@ kernel void gb_local(device const int* dictIds [[buffer(0)]],
 
   uint start = tgid * p.rowsPerSlice;
   uint end = min(start + p.rowsPerSlice, p.numRows);
+  // Without group keys every row hits one address: sum in registers, then one atomic per SIMD group.
+  uint lo = 0, hi = 0, count = 0;
   for (uint r = start + tid; r < end; r += tgsize) {
     if (!passes(filter, p.hasFilter, r)) continue;
-    uint g = p.hasKeys ? (uint) dictIds[r] : 0u;
+    if (!p.hasKeys) {
+      if (p.hasValues) {
+        uint u = as_type<uint>(values[r]) ^ 0x80000000u;
+        lo += u & 0xFFFFu;
+        hi += u >> 16;
+      }
+      count++;
+      continue;
+    }
+    uint g = (uint) dictIds[r];
     if (g >= G) continue;
     if (p.hasValues) {
       uint u = as_type<uint>(values[r]) ^ 0x80000000u;
@@ -90,6 +101,16 @@ kernel void gb_local(device const int* dictIds [[buffer(0)]],
       atomic_fetch_add_explicit(&acc[G + g], u >> 16, memory_order_relaxed);
     }
     atomic_fetch_add_explicit(&acc[2 * G + g], 1u, memory_order_relaxed);
+  }
+  if (!p.hasKeys) {
+    lo = simd_sum(lo);
+    hi = simd_sum(hi);
+    count = simd_sum(count);
+    if (simd_is_first()) {
+      atomic_fetch_add_explicit(&acc[0], lo, memory_order_relaxed);
+      atomic_fetch_add_explicit(&acc[G], hi, memory_order_relaxed);
+      atomic_fetch_add_explicit(&acc[2 * G], count, memory_order_relaxed);
+    }
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -331,15 +352,15 @@ int32_t mg_group_by(void* handle, void* dictPin, void* valuePin, void* filterPin
                                                     options:MTLResourceStorageModeShared];
     id<MTLBuffer> accCount = [ctx->device newBufferWithLength:groups * sizeof(uint64_t)
                                                       options:MTLResourceStorageModeShared];
+    if (accSum == nil || accCount == nil) {
+      setError(err, errLen, @"GPU buffer allocation failed");
+      return -1;
+    }
     memset(accSum.contents, 0, accSum.length);
     memset(accCount.contents, 0, accCount.length);
 
     id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
     id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];  // serial dispatch: each dispatch sees the last
-    if (accSum == nil || accCount == nil) {
-      setError(err, errLen, @"GPU buffer allocation failed");
-      return -1;
-    }
     Params p = {rows, groups, filterPin != nullptr ? 1u : 0u, 0, 0, valuePin != nullptr ? 1u : 0u,
                 dictPin != nullptr ? 1u : 0u};
     id<MTLBuffer> partials;

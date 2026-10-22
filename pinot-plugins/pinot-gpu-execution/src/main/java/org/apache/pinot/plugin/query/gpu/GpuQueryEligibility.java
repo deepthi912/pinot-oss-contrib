@@ -93,6 +93,8 @@ public final class GpuQueryEligibility {
     return null;
   }
 
+  static final long MAX_EXACT_DOUBLE_SUM = 1L << 53;
+
   @Nullable
   public static String checkSegment(IndexSegment segment, QueryContext queryContext) {
     if (!(segment instanceof ImmutableSegment)) {
@@ -138,6 +140,16 @@ public final class GpuQueryEligibility {
         }
         if (dataSource.getDataSourceMetadata().getDataType().getStoredType() != FieldSpec.DataType.INT) {
           return "SUM/AVG only on INT columns";
+        }
+        // The GPU sums exactly; the CPU adds doubles, which round past 2^53. Below that bound both are exact.
+        Comparable<?> min = dataSource.getDataSourceMetadata().getMinValue();
+        Comparable<?> max = dataSource.getDataSourceMetadata().getMaxValue();
+        if (!(min instanceof Number) || !(max instanceof Number)) {
+          return "column " + column + " has no min/max metadata";
+        }
+        long maxAbs = Math.max(Math.abs(((Number) min).longValue()), Math.abs(((Number) max).longValue()));
+        if (maxAbs * segment.getSegmentMetadata().getTotalDocs() >= MAX_EXACT_DOUBLE_SUM) {
+          return "SUM of " + column + " may exceed 2^53";
         }
       }
     }
