@@ -40,8 +40,12 @@ import org.apache.pinot.segment.spi.index.reader.ForwardIndexReader;
 import org.apache.pinot.segment.spi.index.reader.ForwardIndexReaderContext;
 import org.apache.pinot.spi.exception.QueryException;
 import org.apache.pinot.spi.query.QueryThreadContext;
-import org.roaringbitmap.BatchIterator;
+import org.roaringbitmap.PeekableCharIterator;
 import org.roaringbitmap.buffer.ImmutableRoaringBitmap;
+import org.roaringbitmap.buffer.MappeableBitmapContainer;
+import org.roaringbitmap.buffer.MappeableContainer;
+import org.roaringbitmap.buffer.MappeableContainerPointer;
+import org.roaringbitmap.buffer.MappeableRunContainer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -388,17 +392,61 @@ final class GpuSegmentAggregator {
     }
   }
 
-  private static int[] toWords(ImmutableRoaringBitmap docIds, int numDocs) {
+  /// Converts the filter result to the bitmap layout of [GpuBackend#uploadFilter], one Roaring container at a time.
+  static int[] toWords(ImmutableRoaringBitmap docIds, int numDocs) {
     int[] words = new int[(numDocs + 31) >>> 5];
-    BatchIterator iterator = docIds.getBatchIterator();
-    int[] batch = new int[4096];
-    int n;
-    while ((n = iterator.nextBatch(batch)) > 0) {
-      for (int i = 0; i < n; i++) {
-        int docId = batch[i];
-        words[docId >>> 5] |= 1 << docId;
+    long[] bitmapContainerWords = null;
+    MappeableContainerPointer pointer = docIds.getContainerPointer();
+    for (; pointer.hasContainer(); pointer.advance()) {
+      int base = pointer.key() << 16;
+      MappeableContainer container = pointer.getContainer();
+      if (container instanceof MappeableBitmapContainer) {
+        if (bitmapContainerWords == null) {
+          bitmapContainerWords = new long[1 << 10];
+        } else {
+          Arrays.fill(bitmapContainerWords, 0L);
+        }
+        ((MappeableBitmapContainer) container).orInto(bitmapContainerWords);
+        int firstWord = base >>> 5;
+        for (int i = 0; i < bitmapContainerWords.length; i++) {
+          // Only non-zero halves are written: the last container may extend past the segment's last word.
+          long bits = bitmapContainerWords[i];
+          if ((int) bits != 0) {
+            words[firstWord + 2 * i] = (int) bits;
+          }
+          if ((int) (bits >>> 32) != 0) {
+            words[firstWord + 2 * i + 1] = (int) (bits >>> 32);
+          }
+        }
+      } else if (container instanceof MappeableRunContainer) {
+        MappeableRunContainer runs = (MappeableRunContainer) container;
+        for (int r = 0; r < runs.numberOfRuns(); r++) {
+          int start = base + runs.getValue(r);
+          setRange(words, start, start + runs.getLength(r) + 1);
+        }
+      } else {
+        PeekableCharIterator iterator = container.getCharIterator();
+        while (iterator.hasNext()) {
+          int docId = base + iterator.next();
+          words[docId >>> 5] |= 1 << docId;
+        }
       }
     }
     return words;
+  }
+
+  /// Sets bits `[from, to)`.
+  private static void setRange(int[] words, int from, int to) {
+    int firstWord = from >>> 5;
+    int lastWord = (to - 1) >>> 5;
+    int firstMask = -1 << from;
+    int lastMask = -1 >>> -to;
+    if (firstWord == lastWord) {
+      words[firstWord] |= firstMask & lastMask;
+    } else {
+      words[firstWord] |= firstMask;
+      Arrays.fill(words, firstWord + 1, lastWord, -1);
+      words[lastWord] |= lastMask;
+    }
   }
 }
