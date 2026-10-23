@@ -39,12 +39,14 @@ import javax.annotation.Nullable;
 import org.apache.pinot.segment.spi.IndexSegment;
 
 
-/// Keeps segment columns resident in GPU memory across queries within a byte budget. Columns used within the
+/// Keeps segment columns resident in GPU memory across queries within a byte budget. The budget counts off-heap native
+/// memory (device memory, or host memory registered with a unified-memory GPU), not Java heap. Columns used within the
 /// residency window are never evicted to make room, so a working set larger than the budget stays partly resident
 /// (the rest runs on the CPU) instead of thrashing. Thread-safe; the monitor only guards bookkeeping.
 ///
-/// Columns of segments that were unloaded (garbage collected) or reloaded are reclaimed first when space is needed.
-/// [#releaseSegment] frees them eagerly; the plugin has no segment-unload hook yet, so servers rely on the former.
+/// Columns of segment instances that were released ([#releaseSegment]) or garbage collected (unloaded or reloaded
+/// segments) are freed regardless of residency: eagerly on release, and on the next [#acquire] after a collection.
+/// The plugin has no segment-unload hook yet, so servers rely on garbage collection.
 public class GpuColumnCache implements AutoCloseable {
   public static final long DEFAULT_MIN_RESIDENCY_MS = 60_000;
   public static final int MAX_CONCURRENT_LOADS = 2;
@@ -108,12 +110,12 @@ public class GpuColumnCache implements AutoCloseable {
   private final Map<String, Entry> _entries = new LinkedHashMap<>(16, 0.75f, true);
   private final Map<String, CompletableFuture<Entry>> _loading = new HashMap<>();
   private final Map<IndexSegment, Long> _segmentInstanceIds = new WeakHashMap<>();
+  // Ids of the instances in _segmentInstanceIds; when the weak map holds fewer, some segment was collected.
+  private final Set<Long> _liveInstanceIds = new HashSet<>();
   private final long _maxBytes;
   private final long _minResidencyNs;
   private final LongSupplier _clockNs;
   private long _nextSegmentInstanceId;
-  // Instances believed live; when the weak map holds fewer, some segment was collected and its columns are dead.
-  private int _expectedLiveInstances;
   private boolean _closed;
   private long _residentBytes;
   private long _loadingBytes;
@@ -135,17 +137,19 @@ public class GpuColumnCache implements AutoCloseable {
     return backend.getId() + '|' + tableName + '|' + segmentName + '|' + segmentInstanceId + '|' + column;
   }
 
-  // Per loaded instance: a reload can rebuild a column without changing segment name or CRC.
+  /// Per loaded instance: a reload can rebuild a column without changing segment name or CRC.
   public synchronized long getOrAssignInstanceId(IndexSegment segment) {
     return _segmentInstanceIds.computeIfAbsent(segment, k -> {
-      _expectedLiveInstances++;
-      return _nextSegmentInstanceId++;
+      long id = _nextSegmentInstanceId++;
+      _liveInstanceIds.add(id);
+      return id;
     });
   }
 
   /// Returns a lease on the resident column, loading it on a miss, or `null` when it cannot be made resident without
   /// evicting recently used columns, or not within `maxWaitNanos` (the caller then runs on the CPU). At most
   /// [#MAX_CONCURRENT_LOADS] loads run at once; further misses wait for a slot, bounded by `maxWaitNanos`.
+  /// `estimatedBytes` should match the loaded column's [GpuColumn#getSizeInBytes()].
   @Nullable
   public Lease acquire(String key, long segmentInstanceId, long estimatedBytes, long maxWaitNanos,
       Supplier<GpuColumn> loader) {
@@ -155,30 +159,41 @@ public class GpuColumnCache implements AutoCloseable {
       while (true) {
         CompletableFuture<Entry> pending;
         boolean ownLoad = false;
+        boolean refused = false;
+        Lease hit = null;
         List<GpuColumn> toFree = new ArrayList<>();
         synchronized (this) {
           if (_closed) {
             return null;
           }
+          sweepCollectedSegments(toFree);
           Entry entry = _entries.get(key);
+          pending = null;
           if (entry != null) {
             entry._refCount++;
             entry._lastAccessNs = _clockNs.getAsLong();
-            return new Lease(entry);
-          }
-          pending = _loading.get(key);
-          if (pending == null && holdsPermit) {
-            if (makeRoom(estimatedBytes, toFree)) {
-              _loadingBytes += estimatedBytes;
-              pending = new CompletableFuture<>();
-              _loading.put(key, pending);
-              ownLoad = true;
+            hit = new Lease(entry);
+          } else {
+            pending = _loading.get(key);
+            if (pending == null && holdsPermit) {
+              if (makeRoom(estimatedBytes, toFree)) {
+                _loadingBytes += estimatedBytes;
+                pending = new CompletableFuture<>();
+                _loading.put(key, pending);
+                ownLoad = true;
+              }
+            } else if (pending == null && !canMakeRoom(estimatedBytes)) {
+              refused = true;
             }
-          } else if (pending == null && !canMakeRoom(estimatedBytes)) {
-            return null;
           }
         }
         freeAll(toFree);
+        if (hit != null) {
+          return hit;
+        }
+        if (refused) {
+          return null;
+        }
         if (ownLoad) {
           return load(key, segmentInstanceId, estimatedBytes, loader, pending);
         }
@@ -240,8 +255,9 @@ public class GpuColumnCache implements AutoCloseable {
       _loadingBytes -= estimatedBytes;
       entry._refCount++;
       entry._lastAccessNs = _clockNs.getAsLong();
-      if (_closed || !_segmentInstanceIds.containsValue(segmentInstanceId)) {
-        // Released or closed while loading: serve this caller only, and free the column when its lease closes.
+      if (_closed || !_liveInstanceIds.contains(segmentInstanceId)) {
+        // Released or closed while loading: not cached. This caller (and callers already waiting for this load)
+        // get leases; the column is freed when the last one closes.
         entry._evicted = true;
         _pendingFreeBytes += entry._sizeInBytes;
       } else {
@@ -253,13 +269,22 @@ public class GpuColumnCache implements AutoCloseable {
     return new Lease(entry);
   }
 
+  /// Frees the columns of segment instances that were garbage collected. `size()` drops collected keys, so the sweep
+  /// over the entries only runs after an instance actually went away.
+  private void sweepCollectedSegments(List<GpuColumn> toFree) {
+    if (_segmentInstanceIds.size() < _liveInstanceIds.size()) {
+      _liveInstanceIds.retainAll(new HashSet<>(_segmentInstanceIds.values()));
+      evict(entry -> !_liveInstanceIds.contains(entry._segmentInstanceId), toFree);
+    }
+  }
+
   /// Whether [#makeRoom] could succeed, without evicting anything; checked before waiting for a load slot.
   private boolean canMakeRoom(long neededBytes) {
     if (neededBytes > _maxBytes) {
       return false;
     }
     long excess = _residentBytes + _loadingBytes + _pendingFreeBytes + neededBytes - _maxBytes;
-    if (excess <= 0 || _segmentInstanceIds.size() < _expectedLiveInstances) {
+    if (excess <= 0) {
       return true;
     }
     long protectedSince = _clockNs.getAsLong() - _minResidencyNs;
@@ -279,16 +304,6 @@ public class GpuColumnCache implements AutoCloseable {
   private boolean makeRoom(long neededBytes, List<GpuColumn> toFree) {
     if (neededBytes > _maxBytes) {
       return false;
-    }
-    if (_residentBytes + _loadingBytes + _pendingFreeBytes + neededBytes > _maxBytes) {
-      // Columns of unloaded or reloaded segments go first, regardless of residency. size() drops collected keys,
-      // so the full sweep only runs after a segment instance actually went away.
-      int liveInstances = _segmentInstanceIds.size();
-      if (liveInstances < _expectedLiveInstances) {
-        Set<Long> live = new HashSet<>(_segmentInstanceIds.values());
-        evict(entry -> !live.contains(entry._segmentInstanceId), toFree);
-        _expectedLiveInstances = liveInstances;
-      }
     }
     long protectedSince = _clockNs.getAsLong() - _minResidencyNs;
     Iterator<Entry> iterator = _entries.values().iterator();
@@ -333,7 +348,7 @@ public class GpuColumnCache implements AutoCloseable {
     synchronized (this) {
       Long instanceId = _segmentInstanceIds.remove(segment);
       if (instanceId != null) {
-        _expectedLiveInstances--;
+        _liveInstanceIds.remove(instanceId);
         evict(entry -> entry._segmentInstanceId == instanceId, toFree);
       }
     }
@@ -354,21 +369,16 @@ public class GpuColumnCache implements AutoCloseable {
     }
   }
 
+  /// Frees idle columns now and leased ones when their leases close; later acquires return `null`. Idempotent.
   @Override
   public void close() {
     List<GpuColumn> toFree = new ArrayList<>();
     synchronized (this) {
-      _closed = true;
-      for (Entry entry : _entries.values()) {
-        entry._evicted = true;
-        if (entry.markClosedIfUnused()) {
-          toFree.add(entry._column);
-        } else {
-          _pendingFreeBytes += entry._sizeInBytes;
-        }
+      if (_closed) {
+        return;
       }
-      _entries.clear();
-      _residentBytes = 0;
+      _closed = true;
+      evict(entry -> true, toFree);
     }
     freeAll(toFree);
   }

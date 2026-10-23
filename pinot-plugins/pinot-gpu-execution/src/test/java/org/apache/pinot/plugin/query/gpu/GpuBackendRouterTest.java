@@ -130,6 +130,19 @@ public class GpuBackendRouterTest {
   }
 
   @Test
+  public void testDecideAfterCloseRunsOnCpu() {
+    JavaGpuBackendProvider provider = new JavaGpuBackendProvider(GpuBackendType.METAL, true, Behavior.CORRECT);
+    GpuBackendRouter router = new GpuBackendRouter(enabled(0), List.of(provider));
+    assertTrue(router.decide(FORCE, 1).runsOnGpu());
+    router.close();
+    router.close();
+    assertEquals(provider.getNumBackendCloses(), 1);
+    Decision decision = router.decide(FORCE, 1);
+    assertFalse(decision.runsOnGpu());
+    assertEquals(decision.getReason(), Reason.CLOSED);
+  }
+
+  @Test
   public void testParsesConfigAndQueryOptions() {
     GpuExecutionConfig config = GpuExecutionConfig.fromQueryExecutorConfig(new PinotConfiguration(Map.of(
         GpuExecutionConfig.ENABLED, "true", GpuExecutionConfig.BACKENDS, "metal, cpu, cuda",

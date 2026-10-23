@@ -57,11 +57,32 @@ public class GpuPlanMaker extends InstancePlanMakerImplV2 {
   }
 
   @Override
-  public void init(PinotConfiguration queryExecutorConfig) {
+  public synchronized void init(PinotConfiguration queryExecutorConfig) {
     super.init(queryExecutorConfig);
     GpuExecutionConfig config = GpuExecutionConfig.fromQueryExecutorConfig(queryExecutorConfig);
+    closeGpuResources();
     _router = new GpuBackendRouter(config, _providers != null ? _providers : discoverProviders());
     _columnCache = new GpuColumnCache(config.getCacheMaxBytes());
+  }
+
+  /// Stops routing new queries to the GPU, then closes the column cache (leased columns are freed when their leases
+  /// close) and the backends. Queries still running fall back to the CPU for the segments they have not computed.
+  @Override
+  public synchronized void close() {
+    closeGpuResources();
+  }
+
+  private void closeGpuResources() {
+    GpuBackendRouter router = _router;
+    GpuColumnCache columnCache = _columnCache;
+    _router = null;
+    _columnCache = null;
+    if (columnCache != null) {
+      columnCache.close();
+    }
+    if (router != null) {
+      router.close();
+    }
   }
 
   private static List<GpuBackendProvider> discoverProviders() {
@@ -88,7 +109,8 @@ public class GpuPlanMaker extends InstancePlanMakerImplV2 {
   public Plan makeInstancePlan(List<SegmentContext> segmentContexts, QueryContext queryContext,
       ExecutorService executorService) {
     GpuBackendRouter router = _router;
-    if (router == null || !router.getConfig().isEnabled()) {
+    GpuColumnCache columnCache = _columnCache;
+    if (router == null || columnCache == null || !router.getConfig().isEnabled()) {
       return super.makeInstancePlan(segmentContexts, queryContext, executorService);
     }
     long numRows = 0;
@@ -103,7 +125,7 @@ public class GpuPlanMaker extends InstancePlanMakerImplV2 {
       return super.makeInstancePlan(segmentContexts, queryContext, executorService);
     }
     GpuQueryStats stats = new GpuQueryStats(decision.getBackend().getName(), segmentContexts.size());
-    _activeQuery.set(new ActiveQuery(decision.getBackend(), stats));
+    _activeQuery.set(new ActiveQuery(decision.getBackend(), columnCache, stats));
     try {
       return new GpuInstancePlan(super.makeInstancePlan(segmentContexts, queryContext, executorService), stats);
     } finally {
@@ -120,7 +142,7 @@ public class GpuPlanMaker extends InstancePlanMakerImplV2 {
         reason = GpuQueryEligibility.checkSegment(segmentContext.getIndexSegment(), queryContext);
       }
       if (reason == null) {
-        return new GpuSegmentPlanNode(segmentContext, queryContext, activeQuery._backend, _columnCache,
+        return new GpuSegmentPlanNode(segmentContext, queryContext, activeQuery._backend, activeQuery._columnCache,
             activeQuery._stats);
       }
       activeQuery._stats.recordIneligible();
@@ -131,10 +153,12 @@ public class GpuPlanMaker extends InstancePlanMakerImplV2 {
 
   private static final class ActiveQuery {
     final GpuBackend _backend;
+    final GpuColumnCache _columnCache;
     final GpuQueryStats _stats;
 
-    ActiveQuery(GpuBackend backend, GpuQueryStats stats) {
+    ActiveQuery(GpuBackend backend, GpuColumnCache columnCache, GpuQueryStats stats) {
       _backend = backend;
+      _columnCache = columnCache;
       _stats = stats;
     }
   }

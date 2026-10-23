@@ -167,8 +167,7 @@ public class GpuMixedSegmentsQueriesTest extends BaseQueriesTest {
 
   @AfterClass
   public void tearDown() {
-    _gpuPlanMaker.getColumnCache().close();
-    _gpuPlanMaker.getRouter().close();
+    _gpuPlanMaker.close();
     for (IndexSegment segment : _indexSegments) {
       segment.destroy();
     }

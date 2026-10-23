@@ -30,9 +30,9 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 
-/// Chooses the backend for each query, in the configured order (CUDA, then Metal, then CPU by default), within what the
-/// server config allows and as steered by query options. Thread-safe: decisions read a volatile config snapshot, and
-/// backends are created at most once.
+/// Chooses the backend for each query, in the configured order of pluggable backends (no CUDA backend ships yet), within
+/// what the server config allows and as steered by query options. Thread-safe: the config is immutable, each backend is
+/// created at most once, and after [#close()] no backend is created and every decision is CPU.
 public class GpuBackendRouter implements AutoCloseable {
   private static final Logger LOGGER = LoggerFactory.getLogger(GpuBackendRouter.class);
 
@@ -43,7 +43,8 @@ public class GpuBackendRouter implements AutoCloseable {
     GPU_SELECTED,
     GPU_FORCED,
     CPU_REQUESTED,
-    NO_GPU_AVAILABLE
+    NO_GPU_AVAILABLE,
+    CLOSED
   }
 
   public static final class Decision {
@@ -85,7 +86,9 @@ public class GpuBackendRouter implements AutoCloseable {
   private final Map<GpuBackendType, GpuBackendProvider> _providers = new EnumMap<>(GpuBackendType.class);
   private final Map<GpuBackendType, GpuBackendProvider.Availability> _availability = new ConcurrentHashMap<>();
   private final Map<GpuBackendType, GpuBackend> _backends = new ConcurrentHashMap<>();
-  private volatile GpuExecutionConfig _config;
+  private final GpuExecutionConfig _config;
+  // Written under the _backends monitor.
+  private volatile boolean _closed;
 
   public GpuBackendRouter(GpuExecutionConfig config, List<GpuBackendProvider> providers) {
     _config = config;
@@ -120,17 +123,15 @@ public class GpuBackendRouter implements AutoCloseable {
     return _config;
   }
 
-  public void setConfig(GpuExecutionConfig config) {
-    LOGGER.info("Updating GPU execution config to: {}", config);
-    _config = config;
-  }
-
   public Map<GpuBackendType, GpuBackendProvider.Availability> getAvailability() {
     return Map.copyOf(_availability);
   }
 
   public Decision decide(GpuQueryOptions options, long numRows) {
     GpuExecutionConfig config = _config;
+    if (_closed) {
+      return new Decision(null, Reason.CLOSED, List.of());
+    }
     if (!config.isEnabled()) {
       return new Decision(null, Reason.DISABLED_BY_CONFIG, List.of());
     }
@@ -145,7 +146,6 @@ public class GpuBackendRouter implements AutoCloseable {
     Set<GpuBackendType> order = new LinkedHashSet<>();
     GpuBackendType preferred = options.getPreferredBackend();
     if (preferred != null) {
-      // A query may only pick among the backends the server allows.
       if (config.getBackends().contains(preferred)) {
         order.add(preferred);
       } else {
@@ -176,10 +176,14 @@ public class GpuBackendRouter implements AutoCloseable {
   @Nullable
   private GpuBackend getOrCreateBackend(GpuBackendType type, List<String> skipped) {
     GpuBackend backend = _backends.get(type);
-    if (backend != null) {
+    if (backend != null && !_closed) {
       return backend;
     }
     synchronized (_backends) {
+      if (_closed) {
+        skipped.add(type.getId() + ": router closed");
+        return null;
+      }
       backend = _backends.get(type);
       if (backend != null) {
         return backend;
@@ -201,13 +205,19 @@ public class GpuBackendRouter implements AutoCloseable {
 
   @Override
   public void close() {
-    for (GpuBackend backend : _backends.values()) {
-      try {
-        backend.close();
-      } catch (RuntimeException e) {
-        LOGGER.warn("Failed to close GPU backend: {}", backend.getName(), e);
+    synchronized (_backends) {
+      if (_closed) {
+        return;
       }
+      _closed = true;
+      for (GpuBackend backend : _backends.values()) {
+        try {
+          backend.close();
+        } catch (RuntimeException e) {
+          LOGGER.warn("Failed to close GPU backend: {}", backend.getName(), e);
+        }
+      }
+      _backends.clear();
     }
-    _backends.clear();
   }
 }

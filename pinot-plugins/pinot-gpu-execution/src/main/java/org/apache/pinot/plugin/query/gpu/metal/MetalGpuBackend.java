@@ -27,6 +27,8 @@ import java.lang.foreign.SymbolLookup;
 import java.lang.foreign.ValueLayout;
 import java.lang.invoke.MethodHandle;
 import java.nio.file.Path;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 import javax.annotation.Nullable;
 import org.apache.pinot.plugin.query.gpu.GpuAggregationResult;
 import org.apache.pinot.plugin.query.gpu.GpuBackend;
@@ -36,7 +38,10 @@ import org.apache.pinot.plugin.query.gpu.GpuDistinctResult;
 
 
 /// Experimental Apple GPU backend on Metal, called through the FFM API (native code: `src/main/native/metal_ops.mm`).
-/// Thread-safe: Metal command queues accept concurrent submissions, and each call uses its own native buffers.
+/// Thread-safe: Metal command queues accept concurrent submissions, kernels only read the shared resident columns and
+/// each call allocates its own output buffers. Native calls hold the read lock and [#close()] the write lock, so the
+/// library is never unloaded under a running call; after close every call throws [IllegalStateException] (callers
+/// recompute on the CPU).
 public class MetalGpuBackend implements GpuBackend {
   private static final long PAGE_SIZE = 16 * 1024;
   private static final int ERROR_LENGTH = 1024;
@@ -53,6 +58,9 @@ public class MetalGpuBackend implements GpuBackend {
   private final MethodHandle _distinct;
   private final MemorySegment _context;
   private final String _deviceName;
+  private final ReentrantReadWriteLock _lock = new ReentrantReadWriteLock();
+  // Guarded by _lock.
+  private boolean _closed;
 
   public MetalGpuBackend(Path library) {
     Linker linker = Linker.nativeLinker();
@@ -107,8 +115,8 @@ public class MetalGpuBackend implements GpuBackend {
         reader.read(start, length, buffer);
         MemorySegment.copy(buffer, 0, segment, ValueLayout.JAVA_INT, (long) start * Integer.BYTES, length);
       }
-      return new MetalColumn(arena, pin(segment), numValues, segment.byteSize());
-    } catch (RuntimeException e) {
+      return newColumn(arena, segment, numValues);
+    } catch (RuntimeException | Error e) {
       arena.close();
       throw e;
     }
@@ -121,7 +129,7 @@ public class MetalGpuBackend implements GpuBackend {
     try {
       MemorySegment segment = allocateAligned(arena, words.length);
       MemorySegment.copy(words, 0, segment, ValueLayout.JAVA_INT, 0, words.length);
-      return new MetalColumn(arena, pin(segment), words.length, segment.byteSize());
+      return newColumn(arena, segment, words.length);
     } catch (RuntimeException | Error e) {
       arena.close();
       throw e;
@@ -131,6 +139,7 @@ public class MetalGpuBackend implements GpuBackend {
   @Override
   public GpuAggregationResult aggregate(@Nullable GpuColumn groupKeys, int numGroups, @Nullable GpuColumn values,
       int numDocs, @Nullable GpuColumn matchingDocs) {
+    Lock lock = lockOpen();
     try (Arena arena = Arena.ofConfined()) {
       MemorySegment counts = arena.allocate(ValueLayout.JAVA_LONG, numGroups);
       MemorySegment sumsU = values != null ? arena.allocate(ValueLayout.JAVA_LONG, numGroups) : MemorySegment.NULL;
@@ -155,12 +164,15 @@ public class MetalGpuBackend implements GpuBackend {
       throw e;
     } catch (Throwable t) {
       throw new IllegalStateException("Metal aggregation failed", t);
+    } finally {
+      lock.unlock();
     }
   }
 
   @Override
   public GpuDistinctResult distinct(@Nullable GpuColumn groupKeys, int numGroups, GpuColumn ids, int cardinality,
       int numDocs, @Nullable GpuColumn matchingDocs) {
+    Lock lock = lockOpen();
     try (Arena arena = Arena.ofConfined()) {
       int numWords = (int) (((long) numGroups * cardinality + 31) >>> 5);
       // The kernel writes the bitmap straight into this page-aligned memory: no device-side copy.
@@ -183,6 +195,28 @@ public class MetalGpuBackend implements GpuBackend {
       throw e;
     } catch (Throwable t) {
       throw new IllegalStateException("Metal distinct failed", t);
+    } finally {
+      lock.unlock();
+    }
+  }
+
+  /// Takes the read lock, or throws when the backend is closed.
+  private Lock lockOpen() {
+    Lock lock = _lock.readLock();
+    lock.lock();
+    if (_closed) {
+      lock.unlock();
+      throw new IllegalStateException("Metal backend is closed");
+    }
+    return lock;
+  }
+
+  private MetalColumn newColumn(Arena arena, MemorySegment segment, int numValues) {
+    Lock lock = lockOpen();
+    try {
+      return new MetalColumn(arena, pin(segment), numValues, segment.byteSize());
+    } finally {
+      lock.unlock();
     }
   }
 
@@ -227,12 +261,21 @@ public class MetalGpuBackend implements GpuBackend {
 
   @Override
   public void close() {
+    _lock.writeLock().lock();
     try {
-      _destroy.invokeExact(_context);
-    } catch (Throwable t) {
-      throw new IllegalStateException("Failed to close Metal", t);
+      if (_closed) {
+        return;
+      }
+      _closed = true;
+      try {
+        _destroy.invokeExact(_context);
+      } catch (Throwable t) {
+        throw new IllegalStateException("Failed to close Metal", t);
+      } finally {
+        _libraryArena.close();
+      }
     } finally {
-      _libraryArena.close();
+      _lock.writeLock().unlock();
     }
   }
 
@@ -266,9 +309,15 @@ public class MetalGpuBackend implements GpuBackend {
         return;
       }
       _closed = true;
+      Lock lock = _lock.readLock();
+      lock.lock();
       try {
-        unpin(_pin);
+        // Once the backend is closed the library is unloaded, so the native buffer handle is leaked, not released.
+        if (!MetalGpuBackend.this._closed) {
+          unpin(_pin);
+        }
       } finally {
+        lock.unlock();
         _arena.close();
       }
     }

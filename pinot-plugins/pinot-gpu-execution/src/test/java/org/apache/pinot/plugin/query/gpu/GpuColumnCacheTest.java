@@ -419,7 +419,25 @@ public class GpuColumnCacheTest {
     cache.close();
     assertTrue(idle.isClosed());
     assertFalse(leased.isClosed());
+    // A second close must not free the leased column early (JavaColumn rejects a double free).
+    cache.close();
+    assertFalse(leased.isClosed());
     lease.close();
     assertTrue(leased.isClosed());
+    lease.close();
+  }
+
+  @Test
+  public void testCollectedSegmentsAreSweptWithoutPressure() {
+    GpuColumnCache cache = cache(1_000_000);
+    JavaColumn stale = loadForUnreachableSegment(cache);
+    long deadlineMs = System.currentTimeMillis() + 30_000;
+    while (!stale.isClosed()) {
+      assertTrue(System.currentTimeMillis() < deadlineMs, "column of the collected segment was never reclaimed");
+      System.gc();
+      cache.acquire("live", _instanceId, 40, WAIT_NANOS, () -> column(10)).close();
+    }
+    assertEquals(cache.getNumResidentColumns(), 1);
+    assertEquals(cache.getResidentBytes(), 40);
   }
 }

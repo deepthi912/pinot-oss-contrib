@@ -390,9 +390,18 @@ public class GpuGroupByQueriesTest extends BaseQueriesTest {
         assertEquals(stats.getSegmentsOnGpu(), 0, stats.toString());
       }
     } finally {
-      planMaker.getColumnCache().close();
-      planMaker.getRouter().close();
+      planMaker.close();
     }
+  }
+
+  @Test
+  public void testClosedPlanMakerRunsOnCpu() {
+    JavaGpuBackendProvider provider = new JavaGpuBackendProvider(GpuBackendType.CUDA, true, Behavior.CORRECT);
+    GpuPlanMaker planMaker = gpuPlanMaker(List.of(provider));
+    assertSameResults(GROUP_BY_VALUES_QUERY, planMaker, provider, true);
+    planMaker.close();
+    assertEquals(provider.getNumBackendCloses(), 1);
+    assertSameResults(GROUP_BY_VALUES_QUERY, planMaker, provider, false);
   }
 
   @Test
@@ -574,8 +583,7 @@ public class GpuGroupByQueriesTest extends BaseQueriesTest {
   public void tearDown() {
     for (GpuPlanMaker planMaker : List.of(_gpuPlanMaker, _failingPlanMaker, _corruptPlanMaker,
         _corruptValuesPlanMaker)) {
-      planMaker.getColumnCache().close();
-      planMaker.getRouter().close();
+      planMaker.close();
     }
     for (IndexSegment segment : _indexSegments) {
       segment.destroy();

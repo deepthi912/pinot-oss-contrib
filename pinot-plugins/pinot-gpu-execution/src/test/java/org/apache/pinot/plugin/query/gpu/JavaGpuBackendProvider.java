@@ -43,6 +43,7 @@ public class JavaGpuBackendProvider implements GpuBackendProvider {
   private final Behavior _behavior;
   private final AtomicInteger _numGroupByCalls = new AtomicInteger();
   private final AtomicInteger _numUploads = new AtomicInteger();
+  private final AtomicInteger _numBackendCloses = new AtomicInteger();
 
   public JavaGpuBackendProvider(GpuBackendType type, boolean available, Behavior behavior) {
     _type = type;
@@ -56,6 +57,10 @@ public class JavaGpuBackendProvider implements GpuBackendProvider {
 
   public int getNumUploads() {
     return _numUploads.get();
+  }
+
+  public int getNumBackendCloses() {
+    return _numBackendCloses.get();
   }
 
   @Override
@@ -149,6 +154,7 @@ public class JavaGpuBackendProvider implements GpuBackendProvider {
 
       @Override
       public void close() {
+        _numBackendCloses.incrementAndGet();
       }
     };
   }
