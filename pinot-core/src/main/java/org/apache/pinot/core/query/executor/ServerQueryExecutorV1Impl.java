@@ -150,6 +150,13 @@ public class ServerQueryExecutorV1Impl implements QueryExecutor {
 
   @Override
   public synchronized void shutDown() {
+    if (_planMaker != null) {
+      try {
+        _planMaker.close();
+      } catch (Exception e) {
+        LOGGER.warn("Caught exception while closing PlanMaker", e);
+      }
+    }
     LOGGER.info("Query executor shut down");
   }
 
