@@ -141,13 +141,19 @@ public class GpuBackendRouter implements AutoCloseable {
     if (!forced && numRows < config.getMinRows()) {
       return new Decision(null, Reason.BELOW_MIN_ROWS, List.of());
     }
+    List<String> skipped = new ArrayList<>();
     Set<GpuBackendType> order = new LinkedHashSet<>();
-    if (options.getPreferredBackend() != null) {
-      order.add(options.getPreferredBackend());
+    GpuBackendType preferred = options.getPreferredBackend();
+    if (preferred != null) {
+      // A query may only pick among the backends the server allows.
+      if (config.getBackends().contains(preferred)) {
+        order.add(preferred);
+      } else {
+        skipped.add(preferred.getId() + ": not in " + GpuExecutionConfig.BACKENDS);
+      }
     }
     order.addAll(config.getBackends());
 
-    List<String> skipped = new ArrayList<>();
     for (GpuBackendType type : order) {
       if (type == GpuBackendType.CPU) {
         Reason reason = options.getPreferredBackend() == GpuBackendType.CPU ? Reason.CPU_REQUESTED

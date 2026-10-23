@@ -117,6 +117,19 @@ public class GpuBackendRouterTest {
   }
 
   @Test
+  public void testQueryCannotPickBackendExcludedByServer() {
+    GpuExecutionConfig metalOnly =
+        new GpuExecutionConfig(true, List.of(GpuBackendType.METAL), 0, GpuExecutionConfig.DEFAULT_CACHE_MAX_BYTES);
+    try (GpuBackendRouter router = new GpuBackendRouter(metalOnly,
+        List.of(provider(GpuBackendType.CUDA, true), provider(GpuBackendType.METAL, true)))) {
+      GpuBackendRouter.Decision decision =
+          router.decide(GpuQueryOptions.fromQueryOptions(Map.of("gpuBackend", "cuda")), 1);
+      assertEquals(decision.getBackend().getType(), GpuBackendType.METAL);
+      assertTrue(decision.getSkipped().get(0).startsWith("cuda: not in"), decision.getSkipped().toString());
+    }
+  }
+
+  @Test
   public void testParsesConfigAndQueryOptions() {
     GpuExecutionConfig config = GpuExecutionConfig.fromQueryExecutorConfig(new PinotConfiguration(Map.of(
         GpuExecutionConfig.ENABLED, "true", GpuExecutionConfig.BACKENDS, "metal, cpu, cuda",
