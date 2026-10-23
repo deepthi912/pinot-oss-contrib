@@ -24,6 +24,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.Random;
 import org.apache.commons.io.FileUtils;
+import org.apache.pinot.common.datatable.DataTableFactory;
+import org.apache.pinot.common.request.BrokerRequest;
+import org.apache.pinot.common.request.PinotQuery;
 import org.apache.pinot.common.response.broker.BrokerResponseNative;
 import org.apache.pinot.core.plan.Plan;
 import org.apache.pinot.core.plan.maker.InstancePlanMakerImplV2;
@@ -31,13 +34,17 @@ import org.apache.pinot.core.plan.maker.PlanMaker;
 import org.apache.pinot.core.query.request.context.QueryContext;
 import org.apache.pinot.core.query.request.context.utils.QueryContextConverterUtils;
 import org.apache.pinot.plugin.query.gpu.JavaGpuBackendProvider.Behavior;
+import org.apache.pinot.plugin.query.gpu.metal.MetalGpuBackend;
 import org.apache.pinot.plugin.query.gpu.metal.MetalGpuBackendProvider;
+import org.apache.pinot.plugin.query.gpu.metal.MetalNativeLibrary;
+import org.apache.pinot.core.transport.ServerRoutingInstance;
 import org.apache.pinot.queries.BaseQueriesTest;
 import org.apache.pinot.segment.local.indexsegment.immutable.ImmutableSegmentLoader;
 import org.apache.pinot.segment.local.segment.creator.impl.SegmentIndexCreationDriverImpl;
 import org.apache.pinot.segment.local.segment.readers.GenericRowRecordReader;
 import org.apache.pinot.segment.spi.ImmutableSegment;
 import org.apache.pinot.segment.spi.IndexSegment;
+import org.apache.pinot.segment.spi.MutableSegment;
 import org.apache.pinot.segment.spi.SegmentContext;
 import org.apache.pinot.segment.spi.creator.SegmentGeneratorConfig;
 import org.apache.pinot.spi.config.table.TableConfig;
@@ -49,24 +56,36 @@ import org.apache.pinot.spi.env.PinotConfiguration;
 import org.apache.pinot.spi.query.QueryThreadContext;
 import org.apache.pinot.spi.utils.ReadMode;
 import org.apache.pinot.spi.utils.builder.TableConfigBuilder;
+import org.apache.pinot.sql.parsers.CalciteSqlCompiler;
+import org.apache.pinot.sql.parsers.CalciteSqlParser;
+import org.roaringbitmap.buffer.MutableRoaringBitmap;
 import org.testng.SkipException;
 import org.testng.annotations.AfterClass;
 import org.testng.annotations.BeforeClass;
 import org.testng.annotations.DataProvider;
 import org.testng.annotations.Test;
 
+import static org.mockito.AdditionalAnswers.delegatesTo;
+import static org.mockito.Mockito.mock;
 import static org.testng.Assert.assertEquals;
 import static org.testng.Assert.assertFalse;
+import static org.testng.Assert.assertThrows;
 import static org.testng.Assert.assertTrue;
+import static org.testng.Assert.fail;
 
 
 /// Runs every query through the regular CPU plan maker and through [GpuPlanMaker], end to end (segment plan, combine,
 /// data table serialization, broker reduce), and requires identical rows and scan statistics. Also asserts whether the
 /// GPU backend was called, so eligible queries are proven to take the GPU path and others the CPU path.
+///
+/// Metal kernels (macOS on Apple Silicon): `./mvnw -pl pinot-plugins/pinot-gpu-execution -am test -Ppinot-fastdev
+/// -Dpinot.gpu.metal=true -Dtest=GpuGroupByQueriesTest -Dsurefire.failIfNoSpecifiedTests=false`; with that property
+/// [#testMetalBackendEndToEnd] fails instead of skipping when Metal is unavailable.
 public class GpuGroupByQueriesTest extends BaseQueriesTest {
   private static final File INDEX_DIR = new File(FileUtils.getTempDirectory(), "GpuGroupByQueriesTest");
   private static final String TABLE = "testTable";
   private static final int NUM_ROWS_PER_SEGMENT = 20_003;
+  private static final String METAL_PROPERTY = "pinot.gpu.metal";
   private static final String QUERY =
       "SELECT dimStr, COUNT(*) FROM testTable GROUP BY dimStr ORDER BY dimStr LIMIT 1000";
   private static final String GROUP_BY_VALUES_QUERY = "SELECT dimStr, SUM(metric), AVG(rawMetric), "
@@ -209,11 +228,15 @@ public class GpuGroupByQueriesTest extends BaseQueriesTest {
         {"SELECT dimStr, DISTINCTCOUNT(dimInt) FROM testTable GROUP BY dimStr ORDER BY dimStr LIMIT 1000"},
         {"SELECT dimStr, DISTINCTCOUNT(dimLong), DISTINCTCOUNT(dimDouble), DISTINCTCOUNT(dimBytes) FROM testTable "
             + "GROUP BY dimStr ORDER BY dimStr LIMIT 1000"},
+        {"SELECT dimStr, DISTINCTCOUNT(dimFloat), DISTINCTCOUNT(dimTs) FROM testTable GROUP BY dimStr "
+            + "ORDER BY dimStr LIMIT 1000"},
+        {"SELECT DISTINCTCOUNT(dimFloat), DISTINCTCOUNT(dimTs) FROM testTable WHERE metric > 0"},
+        {"SELECT dimStr, SUM(dimBool), AVG(dimBool) FROM testTable GROUP BY dimStr ORDER BY dimStr LIMIT 1000"},
         {"SELECT dimInt, COUNT(*), SUM(metric), AVG(rawMetric), DISTINCTCOUNT(dimStr) FROM testTable "
             + "GROUP BY dimInt ORDER BY dimInt LIMIT 2000"},
         {"SELECT dimStr, SUM(metric) FROM testTable WHERE metric > 0 GROUP BY dimStr "
             + "ORDER BY SUM(metric) DESC, dimStr LIMIT 5"},
-        // More than 1024 groups: the global-memory SUM kernel.
+        // More than 1024 groups: Metal's global-memory SUM kernel.
         {"SELECT dimHigh, SUM(rawMetric), AVG(metric) FROM testTable GROUP BY dimHigh ORDER BY dimHigh LIMIT 10000"},
         // Aggregation without GROUP BY; with SUM present core would scan, so COUNT(*) comes from the GPU too.
         {"SELECT SUM(metric), AVG(metric) FROM testTable"},
@@ -247,7 +270,7 @@ public class GpuGroupByQueriesTest extends BaseQueriesTest {
         {"SET enableNullHandling = true; " + QUERY},
         {"SET useGpu = false; " + QUERY},
         {"SET gpuBackend = 'cpu'; " + QUERY},
-        // dimInt has 1000 values per segment: at or below the groups limit the CPU group-by caps groups.
+        // dimInt has 1000 values per segment: the GPU needs fewer than numGroupsLimit; 500 makes the CPU cap groups.
         {"SET numGroupsLimit = 500; "
             + "SELECT dimInt, COUNT(*) FROM testTable GROUP BY dimInt ORDER BY dimInt LIMIT 2000"},
         {"SET numGroupsLimit = 1000; "
@@ -265,13 +288,23 @@ public class GpuGroupByQueriesTest extends BaseQueriesTest {
     // Matching results alone would also pass on a CPU fallback.
     GpuQueryStats stats = executeAndGetStats(_gpuPlanMaker, query);
     assertEquals(stats.getSegmentsFallback(), 0, stats.toString());
-    assertTrue(stats.getSegmentsOnGpu() > 0, stats.toString());
+    assertEquals(stats.getSegmentsOnGpu(), _indexSegments.size(), stats.toString());
   }
 
   @DataProvider
   public Object[][] fallbackQueries() {
+    Object[][] valueQueries = valueFallbackQueries();
+    Object[][] queries = new Object[valueQueries.length + 1][];
+    queries[0] = new Object[]{QUERY};
+    System.arraycopy(valueQueries, 0, queries, 1, valueQueries.length);
+    return queries;
+  }
+
+  /// Queries with SUM/AVG or DISTINCTCOUNT, whose results are validated beyond the counts.
+  @DataProvider
+  public Object[][] valueFallbackQueries() {
     return new Object[][]{
-        {QUERY}, {GROUP_BY_VALUES_QUERY}, {AGGREGATION_QUERY},
+        {GROUP_BY_VALUES_QUERY}, {AGGREGATION_QUERY},
         // DISTINCTCOUNT without SUM/AVG, so the distinct-result validation is what triggers the fallback.
         {"SELECT dimStr, DISTINCTCOUNT(dimInt) FROM testTable GROUP BY dimStr ORDER BY dimStr LIMIT 1000"},
         {"SELECT DISTINCTCOUNT(dimStr), COUNT(*) FROM testTable WHERE metric > 100"}
@@ -304,12 +337,9 @@ public class GpuGroupByQueriesTest extends BaseQueriesTest {
     assertAllSegmentsFallBack(query, _corruptPlanMaker, _corruptProvider);
   }
 
-  @Test(dataProvider = "fallbackQueries")
+  @Test(dataProvider = "valueFallbackQueries")
   public void testInconsistentSumsOrDistinctValuesFallBackToCpu(String query)
       throws Exception {
-    if (query.equals(QUERY)) {
-      return;
-    }
     assertAllSegmentsFallBack(query, _corruptValuesPlanMaker, _corruptValuesProvider);
   }
 
@@ -394,6 +424,77 @@ public class GpuGroupByQueriesTest extends BaseQueriesTest {
     }
   }
 
+  /// Upsert tables pass each segment's queryable documents as a snapshot bitmap on the segment context.
+  @Test
+  public void testQueryableDocIdsSnapshotMatchesCpu()
+      throws Exception {
+    Random random = new Random(3);
+    List<SegmentContext> segmentContexts = new ArrayList<>();
+    for (IndexSegment segment : _indexSegments) {
+      MutableRoaringBitmap queryableDocIds = new MutableRoaringBitmap();
+      for (int docId = 0; docId < NUM_ROWS_PER_SEGMENT; docId++) {
+        if (random.nextBoolean()) {
+          queryableDocIds.add(docId);
+        }
+      }
+      SegmentContext segmentContext = new SegmentContext(segment);
+      segmentContext.setQueryableDocIdsSnapshot(queryableDocIds);
+      segmentContexts.add(segmentContext);
+    }
+    for (String query : List.of(
+        "SELECT COUNT(*), SUM(metric), AVG(rawMetric), DISTINCTCOUNT(dimInt) FROM testTable",
+        "SELECT DISTINCTCOUNT(dimStr) FROM testTable",
+        "SELECT dimStr, COUNT(*) FROM testTable GROUP BY dimStr ORDER BY dimStr LIMIT 1000",
+        "SELECT dimStr, COUNT(*), SUM(metric), AVG(rawMetric), DISTINCTCOUNT(dimInt) FROM testTable "
+            + "GROUP BY dimStr ORDER BY dimStr LIMIT 1000",
+        "SELECT dimStr, SUM(metric), DISTINCTCOUNT(dimInt) FROM testTable WHERE metric > 0 GROUP BY dimStr "
+            + "ORDER BY dimStr LIMIT 1000")) {
+      BrokerResponseNative expected = getBrokerResponse(query, _cpuPlanMaker, segmentContexts);
+      int callsBefore = _gpuProvider.getNumGroupByCalls();
+      BrokerResponseNative actual = getBrokerResponse(query, _gpuPlanMaker, segmentContexts);
+      assertSameResponse(actual, expected, query);
+      assertTrue(_gpuProvider.getNumGroupByCalls() > callsBefore, query);
+      assertTrue(expected.getNumDocsScanned() < (long) NUM_ROWS_PER_SEGMENT * _indexSegments.size(), query);
+      GpuQueryStats stats = executeAndGetStats(_gpuPlanMaker, query, segmentContexts);
+      assertEquals(stats.getSegmentsOnGpu(), _indexSegments.size(), query + " " + stats);
+    }
+  }
+
+  /// A consuming segment is a mutable [IndexSegment], not an [ImmutableSegment]; this one serves immutable data.
+  @Test
+  public void testConsumingSegmentStaysOnCpu()
+      throws Exception {
+    IndexSegment consuming = mock(MutableSegment.class, delegatesTo(_indexSegments.get(0)));
+    List<SegmentContext> segmentContexts = List.of(new SegmentContext(consuming));
+    for (String query : List.of(GROUP_BY_VALUES_QUERY, AGGREGATION_QUERY)) {
+      BrokerResponseNative expected = getBrokerResponse(query, _cpuPlanMaker, segmentContexts);
+      int callsBefore = _gpuProvider.getNumGroupByCalls();
+      assertSameResponse(getBrokerResponse(query, _gpuPlanMaker, segmentContexts), expected, query);
+      GpuQueryStats stats = executeAndGetStats(_gpuPlanMaker, query, segmentContexts);
+      assertEquals(_gpuProvider.getNumGroupByCalls(), callsBefore, query);
+      assertEquals(stats.getSegmentsIneligible(), 1, query + " " + stats);
+      assertEquals(stats.getSegmentsOnGpu(), 0, query + " " + stats);
+    }
+  }
+
+  /// Server and broker over the given segment contexts, which may carry document snapshots.
+  private BrokerResponseNative getBrokerResponse(String query, PlanMaker planMaker,
+      List<SegmentContext> segmentContexts)
+      throws Exception {
+    PinotQuery pinotQuery = CalciteSqlParser.compileToPinotQuery(query);
+    QueryContext queryContext = QueryContextConverterUtils.getQueryContext(pinotQuery);
+    queryContext.setEndTimeMs(System.currentTimeMillis() + 60_000);
+    byte[] dataTable;
+    try (QueryThreadContext ignore = QueryThreadContext.openForSseTest()) {
+      dataTable = planMaker.makeInstancePlan(segmentContexts, queryContext, EXECUTOR_SERVICE).execute().toDataTable()
+          .toBytes();
+    }
+    BrokerRequest brokerRequest = CalciteSqlCompiler.convertToBrokerRequest(pinotQuery);
+    return reduceOnDataTable(brokerRequest, brokerRequest,
+        Map.of(new ServerRoutingInstance("localhost", 1234, TableType.OFFLINE),
+            DataTableFactory.getDataTable(dataTable)));
+  }
+
   @Test
   public void testClosedPlanMakerRunsOnCpu() {
     JavaGpuBackendProvider provider = new JavaGpuBackendProvider(GpuBackendType.CUDA, true, Behavior.CORRECT);
@@ -407,7 +508,7 @@ public class GpuGroupByQueriesTest extends BaseQueriesTest {
   @Test
   public void testDiscoveryWithoutGpuDegradesToCpu() {
     if (new MetalGpuBackendProvider().probe().isAvailable()) {
-      throw new SkipException("A GPU backend is available here; covered by testMetalBackendEndToEnd");
+      throw new SkipException("Metal is available here, so discovery finds a GPU; see testMetalBackendEndToEnd");
     }
     GpuPlanMaker planMaker = gpuPlanMaker(null);
     assertFalse(planMaker.getRouter().decide(GpuQueryOptions.NONE, 1).runsOnGpu());
@@ -422,29 +523,37 @@ public class GpuGroupByQueriesTest extends BaseQueriesTest {
       throws Exception {
     GpuBackendProvider.Availability availability = new MetalGpuBackendProvider().probe();
     if (!availability.isAvailable()) {
+      if (Boolean.getBoolean(METAL_PROPERTY)) {
+        fail("-D" + METAL_PROPERTY + "=true but the Metal backend is unavailable: " + availability);
+      }
       throw new SkipException("Metal backend not available: " + availability);
     }
     GpuPlanMaker metalPlanMaker = gpuPlanMaker(null);
-    assertEquals(metalPlanMaker.getRouter().decide(GpuQueryOptions.NONE, 1).getBackend().getType(),
-        GpuBackendType.METAL);
-    for (Object[] query : gpuQueries()) {
-      String sql = (String) query[0];
-      assertSameResponse(getBrokerResponse(sql, metalPlanMaker), getBrokerResponse(sql, _cpuPlanMaker), sql);
-      // A CPU fallback would still produce matching results, so require that Metal actually computed them.
-      GpuQueryStats stats = executeAndGetStats(metalPlanMaker, sql);
-      assertEquals(stats.getSegmentsFallback(), 0, sql + " " + stats);
-      assertTrue(stats.getSegmentsOnGpu() > 0, sql + " " + stats);
+    try {
+      assertEquals(metalPlanMaker.getRouter().decide(GpuQueryOptions.NONE, 1).getBackend().getType(),
+          GpuBackendType.METAL);
+      for (Object[] query : gpuQueries()) {
+        String sql = (String) query[0];
+        assertSameResponse(getBrokerResponse(sql, metalPlanMaker), getBrokerResponse(sql, _cpuPlanMaker), sql);
+        GpuQueryStats stats = executeAndGetStats(metalPlanMaker, sql);
+        assertEquals(stats.getSegmentsFallback(), 0, sql + " " + stats);
+        assertEquals(stats.getSegmentsOnGpu(), _indexSegments.size(), sql + " " + stats);
+      }
+      for (String sql : List.of("SELECT dimInt, COUNT(*) FROM testTable GROUP BY dimInt ORDER BY dimInt LIMIT 2000",
+          "SELECT dimHigh, COUNT(*) FROM testTable GROUP BY dimHigh ORDER BY dimHigh LIMIT 10000")) {
+        GpuQueryStats stats = executeAndGetStats(metalPlanMaker, sql);
+        assertEquals(stats.getSegmentsOnGpu(), _indexSegments.size(), stats.toString());
+        assertEquals(stats.getSegmentsFallback(), 0, stats.toString());
+        assertTrue(stats.getDeviceTimeNs() > 0, stats.toString());
+      }
+      checkMetalKernels(metalPlanMaker.getRouter().decide(GpuQueryOptions.NONE, 1).getBackend());
+    } finally {
+      metalPlanMaker.close();
     }
+    checkMetalClose();
+  }
 
-    for (String sql : List.of("SELECT dimInt, COUNT(*) FROM testTable GROUP BY dimInt ORDER BY dimInt LIMIT 2000",
-        "SELECT dimHigh, COUNT(*) FROM testTable GROUP BY dimHigh ORDER BY dimHigh LIMIT 10000")) {
-      GpuQueryStats stats = executeAndGetStats(metalPlanMaker, sql);
-      assertEquals(stats.getSegmentsOnGpu(), _indexSegments.size(), stats.toString());
-      assertEquals(stats.getSegmentsFallback(), 0, stats.toString());
-      assertTrue(stats.getDeviceTimeNs() > 0, stats.toString());
-    }
-
-    GpuBackend metal = metalPlanMaker.getRouter().decide(GpuQueryOptions.NONE, 1).getBackend();
+  private static void checkMetalKernels(GpuBackend metal) {
     int[] keys = new int[1_000_000];
     for (int i = 0; i < keys.length; i++) {
       keys[i] = i % 7;
@@ -468,8 +577,8 @@ public class GpuGroupByQueriesTest extends BaseQueriesTest {
       assertEquals(metal.distinct(null, 1, column, 7, keys.length, null).getIds(0, 7).getCardinality(), 7);
     }
 
-    // Global-memory SUM kernel: more than 1024 groups, asymmetric full-range values, per-group sums beyond int32 and
-    // more than 2^24 rows (several fold batches).
+    // Global-memory SUM kernel: more than kLocalMaxGroups groups, asymmetric full-range values, per-group sums beyond
+    // int32 and more than kGlobalBatchRows rows (several fold batches); constants of metal_ops.mm.
     int numRows = (1 << 24) + 12_345;
     int numGroups = 3001;
     int[] groupKeys = new int[numRows];
@@ -526,18 +635,39 @@ public class GpuGroupByQueriesTest extends BaseQueriesTest {
         }
       }
     }
-    metalPlanMaker.getColumnCache().close();
-    metalPlanMaker.getRouter().close();
+  }
+
+  /// After close, calls are rejected (the plan falls back to the CPU) and a column still leased by a query can be
+  /// closed without calling into the unloaded library.
+  private static void checkMetalClose() {
+    MetalGpuBackend metal = new MetalGpuBackend(MetalNativeLibrary.resolve());
+    GpuColumn column = metal.uploadIntColumn(new int[]{1, 2, 3}, 3);
+    try {
+      assertEquals(metal.aggregate(null, 1, column, 3, null).getSums(), new long[]{6});
+    } finally {
+      metal.close();
+    }
+    metal.close();
+    assertThrows(IllegalStateException.class, () -> metal.aggregate(null, 1, column, 3, null));
+    assertThrows(IllegalStateException.class, () -> metal.uploadIntColumn(new int[]{1}, 1));
+    column.close();
+    column.close();
   }
 
   private GpuQueryStats executeAndGetStats(GpuPlanMaker planMaker, String query)
       throws Exception {
-    QueryContext queryContext = QueryContextConverterUtils.getQueryContext(query);
-    queryContext.setEndTimeMs(System.currentTimeMillis() + 60_000);
     List<SegmentContext> segmentContexts = new ArrayList<>();
     for (IndexSegment segment : _indexSegments) {
       segmentContexts.add(new SegmentContext(segment));
     }
+    return executeAndGetStats(planMaker, query, segmentContexts);
+  }
+
+  private static GpuQueryStats executeAndGetStats(GpuPlanMaker planMaker, String query,
+      List<SegmentContext> segmentContexts)
+      throws Exception {
+    QueryContext queryContext = QueryContextConverterUtils.getQueryContext(query);
+    queryContext.setEndTimeMs(System.currentTimeMillis() + 60_000);
     try (QueryThreadContext ignore = QueryThreadContext.openForSseTest()) {
       Plan plan = planMaker.makeInstancePlan(segmentContexts, queryContext, EXECUTOR_SERVICE);
       assertTrue(plan instanceof GpuInstancePlan, "query was not routed to a GPU backend");

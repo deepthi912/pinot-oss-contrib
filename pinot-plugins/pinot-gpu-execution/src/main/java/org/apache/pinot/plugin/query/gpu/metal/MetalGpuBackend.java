@@ -153,11 +153,8 @@ public class MetalGpuBackend implements GpuBackend {
       long[] countArray = counts.toArray(ValueLayout.JAVA_LONG);
       long[] sums = null;
       if (values != null) {
-        // The kernel sums (value + 2^31) to stay unsigned; subtract the bias per row.
         sums = sumsU.toArray(ValueLayout.JAVA_LONG);
-        for (int g = 0; g < numGroups; g++) {
-          sums[g] -= countArray[g] << 31;
-        }
+        removeSumBias(sums, countArray);
       }
       return new GpuAggregationResult(countArray, sums, deviceTimeNs(gpuMillis));
     } catch (RuntimeException | Error e) {
@@ -197,6 +194,14 @@ public class MetalGpuBackend implements GpuBackend {
       throw new IllegalStateException("Metal distinct failed", t);
     } finally {
       lock.unlock();
+    }
+  }
+
+  /// The kernel sums `value + 2^31` per row to stay unsigned; removes that bias in place. Exact modulo 2^64, so the result
+  /// is right whenever the true sum fits in a long, even when the biased sum overflowed.
+  static void removeSumBias(long[] biasedSums, long[] counts) {
+    for (int g = 0; g < biasedSums.length; g++) {
+      biasedSums[g] -= counts[g] << 31;
     }
   }
 
