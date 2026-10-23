@@ -213,7 +213,7 @@ struct DistinctParams {
   uint32_t hasKeys;
 };
 
-// Hard limit; GpuSegmentAggregator.MAX_DISTINCT_BITS (Java) routes larger bitmaps to the CPU well below it.
+// Hard limit; GpuBackend.MAX_DISTINCT_BITS (Java) routes larger bitmaps to the CPU well below it.
 constexpr uint64_t kMaxDistinctBits = 1ull << 28;
 
 struct FoldParams {

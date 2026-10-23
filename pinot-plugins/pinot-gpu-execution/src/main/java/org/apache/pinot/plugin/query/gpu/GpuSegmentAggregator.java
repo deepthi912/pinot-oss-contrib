@@ -58,9 +58,6 @@ import org.slf4j.LoggerFactory;
 final class GpuSegmentAggregator {
   private static final Logger LOGGER = LoggerFactory.getLogger(GpuSegmentAggregator.class);
   static final int SELECTIVE_FILTER_RATIO = 16;
-  // Bounds the (group, value) bitmap DISTINCTCOUNT builds per segment to 4 MB; the native Metal code
-  // (kMaxDistinctBits in metal_ops.mm) enforces a higher hard limit.
-  static final long MAX_DISTINCT_BITS = 1L << 25;
   private static final int READ_CHUNK_SIZE = 10_000;
   // Bounds how long a segment waits for load slots and for other threads' loads of its columns (also at most a quarter
   // of the remaining query time); a load the segment runs itself is not time-bounded. Once any lease is refused, the
@@ -298,14 +295,14 @@ final class GpuSegmentAggregator {
   }
 
   /// DISTINCTCOUNT's bitmap has `numGroups * cardinality` bits whatever the filter; when it has more 32-bit words than
-  /// matching documents, or more bits than [#MAX_DISTINCT_BITS], the CPU's value sets are cheaper.
+  /// matching documents, or more bits than [GpuBackend#MAX_DISTINCT_BITS], the CPU's value sets are cheaper.
   private boolean distinctBitmapTooSparse() {
     long numGroups = _groupByColumn != null ? _segment.getDataSource(_groupByColumn).getDictionary().length() : 1;
     for (AggregationFunction<?, ?> function : _queryContext.getAggregationFunctions()) {
       if (function.getType() == AggregationFunctionType.DISTINCTCOUNT) {
         String column = function.getInputExpressions().get(0).getIdentifier();
         long numBits = numGroups * _segment.getDataSource(column).getDictionary().length();
-        if (numBits > MAX_DISTINCT_BITS || numBits / Integer.SIZE > _numDocsScanned) {
+        if (numBits > GpuBackend.MAX_DISTINCT_BITS || numBits / Integer.SIZE > _numDocsScanned) {
           return true;
         }
       }

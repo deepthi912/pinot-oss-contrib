@@ -24,6 +24,8 @@ import javax.annotation.Nullable;
 /// A GPU execution backend (e.g. Metal) for the per-row part of server-side aggregation queries. Thread-safe: one
 /// instance serves all concurrent queries of a server.
 public interface GpuBackend extends AutoCloseable {
+  /// Most (group, id) bits a [#distinct] call is asked for (a 4 MB bitmap); callers route larger ones to the CPU.
+  long MAX_DISTINCT_BITS = 1L << 25;
 
   GpuBackendType getType();
 

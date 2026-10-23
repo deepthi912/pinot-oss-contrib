@@ -129,7 +129,7 @@ public final class GpuQueryEligibility {
           return reason;
         }
         if (numGroups * segment.getDataSource(column).getDictionary().length()
-            > GpuSegmentAggregator.MAX_DISTINCT_BITS) {
+            > GpuBackend.MAX_DISTINCT_BITS) {
           return "DISTINCTCOUNT too large for the GPU";
         }
       } else {
