@@ -51,17 +51,20 @@ import org.slf4j.LoggerFactory;
 
 
 /// Computes one segment's COUNT / SUM / AVG / DISTINCTCOUNT on the GPU, optionally grouped by one dictionary column,
-/// producing the same intermediate results as the CPU aggregation functions. Returns `null` when the segment should
-/// run on the CPU instead (selective filter, non-resident column, device failure or inconsistent device results).
-/// Not thread-safe; used by one segment operator.
+/// producing the same intermediate results as the CPU aggregation functions. [#compute()] returns `null` when the
+/// segment runs on the CPU instead: no matching documents, a selective filter, a DISTINCTCOUNT bitmap too sparse or too
+/// large, a column the cache could not make resident (budget or wait), a device or backend failure (including a closed
+/// backend), or inconsistent device results. Not thread-safe; used by one segment operator.
 final class GpuSegmentAggregator {
   private static final Logger LOGGER = LoggerFactory.getLogger(GpuSegmentAggregator.class);
   static final int SELECTIVE_FILTER_RATIO = 16;
-  // Bounds the (group, value) bitmap DISTINCTCOUNT builds per segment to 4 MB.
+  // Bounds the (group, value) bitmap DISTINCTCOUNT builds per segment to 4 MB; the native Metal code
+  // (kMaxDistinctBits in metal_ops.mm) enforces a higher hard limit.
   static final long MAX_DISTINCT_BITS = 1L << 25;
   private static final int READ_CHUNK_SIZE = 10_000;
-  // A segment waits at most this long in total (and at most a quarter of the remaining query time) for column loads,
-  // then runs on the CPU so the CPU path keeps most of the query's time. After one timeout the query stops waiting.
+  // Bounds how long a segment waits for load slots and for other threads' loads of its columns (also at most a quarter
+  // of the remaining query time); a load the segment runs itself is not time-bounded. Once any lease is refused, the
+  // query's remaining segments do not wait at all.
   static final long MAX_LOAD_WAIT_MS = 200;
 
   /// Per-group results. Values are materialized on demand, so trimmed-away groups cost nothing.
@@ -188,6 +191,11 @@ final class GpuSegmentAggregator {
       return result;
     } catch (QueryException e) {
       throw e;
+    } catch (InconsistentResultException e) {
+      LOGGER.error("GPU backend: {} returned inconsistent results on segment: {}, recomputing on CPU",
+          _backend.getName(), _segment.getSegmentName(), e);
+      _stats.recordFallback();
+      return null;
     } catch (RuntimeException e) {
       LOGGER.warn("GPU backend: {} failed on segment: {}, recomputing on CPU", _backend.getName(),
           _segment.getSegmentName(), e);
@@ -230,7 +238,6 @@ final class GpuSegmentAggregator {
       }
     }
 
-    // Uploaded once and shared by every kernel on this segment.
     GpuColumn filter = _matchingDocs != null ? _backend.uploadFilter(toWords(_matchingDocs, numDocs)) : null;
     try {
       long[] counts = null;
@@ -251,11 +258,11 @@ final class GpuSegmentAggregator {
             if (counts == null) {
               counts = validateCounts(result, numGroups);
             } else if (!Arrays.equals(result.getCounts(), counts)) {
-              throw new IllegalStateException("Inconsistent GPU counts for column: " + columns[i]);
+              throw new InconsistentResultException("Inconsistent GPU counts for column: " + columns[i]);
             }
             columnSums = result.getSums();
             if (columnSums == null || columnSums.length != numGroups) {
-              throw new IllegalStateException("Missing GPU sums for column: " + columns[i]);
+              throw new InconsistentResultException("Missing GPU sums for column: " + columns[i]);
             }
             sumsByColumn.put(columns[i], columnSums);
           }
@@ -290,8 +297,8 @@ final class GpuSegmentAggregator {
     }
   }
 
-  /// DISTINCTCOUNT's bitmap has `numGroups * cardinality` bits whatever the filter; when it is larger than the matching
-  /// documents, or above [#MAX_DISTINCT_BITS], the CPU's value sets are cheaper.
+  /// DISTINCTCOUNT's bitmap has `numGroups * cardinality` bits whatever the filter; when it has more 32-bit words than
+  /// matching documents, or more bits than [#MAX_DISTINCT_BITS], the CPU's value sets are cheaper.
   private boolean distinctBitmapTooSparse() {
     long numGroups = _groupByColumn != null ? _segment.getDataSource(_groupByColumn).getDictionary().length() : 1;
     for (AggregationFunction<?, ?> function : _queryContext.getAggregationFunctions()) {
@@ -311,7 +318,8 @@ final class GpuSegmentAggregator {
     boolean[] seen = distinct.nonEmptyGroups(counts.length, cardinality);
     for (int g = 0; g < counts.length; g++) {
       if (seen[g] != (counts[g] > 0)) {
-        throw new IllegalStateException("Inconsistent GPU distinct values for column: " + column + ", group: " + g);
+        throw new InconsistentResultException(
+            "Inconsistent GPU distinct values for column: " + column + ", group: " + g);
       }
     }
   }
@@ -319,7 +327,7 @@ final class GpuSegmentAggregator {
   private long[] validateCounts(GpuAggregationResult result, int numGroups) {
     long[] counts = result.getCounts();
     if (counts.length != numGroups) {
-      throw new IllegalStateException("GPU returned " + counts.length + " groups, expected " + numGroups);
+      throw new InconsistentResultException("GPU returned " + counts.length + " groups, expected " + numGroups);
     }
     long total = 0;
     for (long count : counts) {
@@ -327,7 +335,7 @@ final class GpuSegmentAggregator {
     }
     // Stale or corrupt device data must never reach the result: recompute on CPU.
     if (total != _numDocsScanned) {
-      throw new IllegalStateException("GPU counted " + total + " documents, filter matched " + _numDocsScanned);
+      throw new InconsistentResultException("GPU counted " + total + " documents, filter matched " + _numDocsScanned);
     }
     return counts;
   }
@@ -339,7 +347,7 @@ final class GpuSegmentAggregator {
     String key = GpuColumnCache.cacheKey(_backend.getType(), _queryContext.getTableName(), _segment.getSegmentName(),
         instanceId, column + (intValues ? "#values" : "#dictIds"));
     DataSource dataSource = _segment.getDataSource(column);
-    GpuColumnCache.Lease lease = _cache.acquire(key, instanceId, (long) numDocs * Integer.BYTES, maxWaitNanos,
+    GpuColumnCache.Lease lease = _cache.acquire(key, instanceId, _backend.residentBytes(numDocs), maxWaitNanos,
         () -> uploadColumn(dataSource, intValues, numDocs));
     if (lease == null) {
       _stats.markLoadWaitExpired();
@@ -347,7 +355,7 @@ final class GpuSegmentAggregator {
     }
     leases.add(lease);
     if (lease.getColumn().getNumValues() != numDocs) {
-      throw new IllegalStateException("Resident column " + column + " has " + lease.getColumn().getNumValues()
+      throw new InconsistentResultException("Resident column " + column + " has " + lease.getColumn().getNumValues()
           + " values, segment has " + numDocs + " documents");
     }
     return lease.getColumn();
@@ -433,6 +441,13 @@ final class GpuSegmentAggregator {
       }
     }
     return words;
+  }
+
+  /// Device results that fail validation: never merged, always recomputed on the CPU.
+  private static final class InconsistentResultException extends RuntimeException {
+    InconsistentResultException(String message) {
+      super(message);
+    }
   }
 
   /// Sets bits `[from, to)`.

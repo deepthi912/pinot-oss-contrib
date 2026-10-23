@@ -91,12 +91,12 @@ public class GpuExecutionIntegrationTest extends BaseClusterIntegrationTest {
   public void testGpuResultsMatchCpu(String query)
       throws Exception {
     JsonNode cpu = postQuery("SET useMultistageEngine = false; SET useGpu = false; " + query);
-    int callsBefore = TestGpuBackendProvider.getNumGroupByCalls();
+    int callsBefore = TestGpuBackendProvider.getNumBackendCalls();
     JsonNode gpu = postQuery("SET useMultistageEngine = false; SET useGpu = true; " + query);
     assertTrue(gpu.get("exceptions").isEmpty(), gpu.toString());
     assertEquals(gpu.get("resultTable").get("rows"), cpu.get("resultTable").get("rows"), query);
     assertEquals(gpu.get("numDocsScanned"), cpu.get("numDocsScanned"), query);
-    assertTrue(TestGpuBackendProvider.getNumGroupByCalls() > callsBefore, "GPU backend was not called: " + query);
+    assertTrue(TestGpuBackendProvider.getNumBackendCalls() > callsBefore, "GPU backend was not called: " + query);
   }
 
   @Test(dataProvider = "queries")
@@ -111,11 +111,11 @@ public class GpuExecutionIntegrationTest extends BaseClusterIntegrationTest {
   public void testMultiStageEngineStaysOnCpu(String query)
       throws Exception {
     JsonNode cpu = postQuery("SET useMultistageEngine = true; SET useGpu = false; " + query);
-    int callsBefore = TestGpuBackendProvider.getNumGroupByCalls();
+    int callsBefore = TestGpuBackendProvider.getNumBackendCalls();
     JsonNode mse = postQuery("SET useMultistageEngine = true; SET useGpu = true; " + query);
     assertTrue(mse.get("exceptions").isEmpty(), mse.toString());
     assertEquals(mse.get("resultTable").get("rows"), cpu.get("resultTable").get("rows"), query);
-    assertEquals(TestGpuBackendProvider.getNumGroupByCalls(), callsBefore, "MSE reached the GPU: " + query);
+    assertEquals(TestGpuBackendProvider.getNumBackendCalls(), callsBefore, "MSE reached the GPU: " + query);
   }
 
   @AfterClass

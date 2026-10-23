@@ -20,12 +20,18 @@ package org.apache.pinot.plugin.query.gpu;
 
 import java.util.Locale;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicBoolean;
 import javax.annotation.Nullable;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 
-/// Per-query options: `useGpu` (true forces the GPU above no size gate, false forces the CPU) and `gpuBackend`
-/// (backend to try first). Both only apply when the server enables GPU execution. Immutable.
+/// Per-query options: `useGpu` (true skips the `gpu.min.rows` gate, false forces the CPU) and `gpuBackend` (backend to
+/// try first). Both only apply when the server enables GPU execution. An invalid value is ignored, with a warning
+/// logged once, so it never fails a query. Immutable.
 public final class GpuQueryOptions {
+  private static final Logger LOGGER = LoggerFactory.getLogger(GpuQueryOptions.class);
+  private static final AtomicBoolean INVALID_VALUE_LOGGED = new AtomicBoolean();
   public static final String USE_GPU = "useGpu";
   public static final String GPU_BACKEND = "gpuBackend";
 
@@ -57,7 +63,7 @@ public final class GpuQueryOptions {
     if (useGpu == null && backend == null) {
       return NONE;
     }
-    return new GpuQueryOptions(parseUseGpu(useGpu), backend != null ? GpuBackendType.fromId(backend) : null);
+    return new GpuQueryOptions(parseUseGpu(useGpu), parseBackend(backend));
   }
 
   @Nullable
@@ -71,8 +77,30 @@ public final class GpuQueryOptions {
       case "false":
         return Boolean.FALSE;
       default:
-        throw new IllegalArgumentException("Invalid value for query option " + USE_GPU + ": '" + value
-            + "', expected true or false");
+        logInvalid(USE_GPU, value, "expected true or false");
+        return null;
+    }
+  }
+
+  @Nullable
+  private static GpuBackendType parseBackend(@Nullable String value) {
+    if (value == null) {
+      return null;
+    }
+    try {
+      return GpuBackendType.fromId(value);
+    } catch (IllegalArgumentException e) {
+      logInvalid(GPU_BACKEND, value, e.getMessage());
+      return null;
+    }
+  }
+
+  private static void logInvalid(String option, String value, String detail) {
+    if (INVALID_VALUE_LOGGED.compareAndSet(false, true)) {
+      LOGGER.warn("Ignoring invalid value for query option {}: '{}' ({}); further invalid values are logged at DEBUG",
+          option, value, detail);
+    } else {
+      LOGGER.debug("Ignoring invalid value for query option {}: '{}' ({})", option, value, detail);
     }
   }
 

@@ -93,7 +93,10 @@ public class GpuGroupByOperator extends BaseOperator<GroupByResultsBlock> {
       return computeOnCpu(_aggregator.getMatchingDocs());
     }
 
-    // Sorted dictionaries give ORDER BY order on the group key; mirror GroupByOperator's sort-aggregate trim.
+    // Sorted dictionaries give ORDER BY order on the group key. Under sort-aggregate (safe trim, LIMIT below the
+    // threshold) this keeps the first trim-size groups like GroupByOperator. Otherwise all groups are emitted, where
+    // GroupByOperator under safe trim keeps only LIMIT of them when there are more: a superset the combine trims
+    // to the same result.
     Dictionary dictionary = _indexSegment.getDataSource(_groupByColumn).getDictionary();
     boolean sorted = _queryContext.shouldSortAggregateUnderSafeTrim();
     boolean ascending = !sorted || _queryContext.getOrderByExpressions().get(0).isAsc();

@@ -21,7 +21,7 @@ package org.apache.pinot.plugin.query.gpu;
 import org.roaringbitmap.RoaringBitmap;
 
 /// Distinct (group, value id) pairs from [GpuBackend#distinct] as a bitmap: bit `group * cardinality + id` is set when
-/// the pair occurs among matching documents. Immutable.
+/// the pair occurs among matching documents. The array is not defensively copied.
 public final class GpuDistinctResult {
   private final int[] _words;
   private final long _deviceTimeNs;

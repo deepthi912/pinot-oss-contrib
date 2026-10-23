@@ -249,9 +249,9 @@ public class GpuColumnCacheTest {
             extraLoaded.set(true);
             return column(10);
           }));
-      // The third load waits for a slot instead of skipping the GPU.
+      // A load beyond MAX_CONCURRENT_LOADS waits for a slot instead of skipping the GPU.
       Thread.sleep(200);
-      assertFalse(extraLoaded.get(), "a third load started while all load slots were busy");
+      assertFalse(extraLoaded.get(), "an extra load started while all load slots were busy");
       release.countDown();
       GpuColumnCache.Lease lease = extra.get(10, TimeUnit.SECONDS);
       assertNotNull(lease);

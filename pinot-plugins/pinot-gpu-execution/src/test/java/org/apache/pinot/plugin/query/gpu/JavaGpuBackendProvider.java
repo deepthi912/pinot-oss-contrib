@@ -22,11 +22,8 @@ import java.util.concurrent.atomic.AtomicInteger;
 import javax.annotation.Nullable;
 
 
-/// Test stand-in for a GPU backend: implements the backend contract in plain Java and registers under any
-/// [GpuBackendType] (it is not a CUDA implementation). It lets tests drive the whole GPU code path (plan maker,
-/// operator, column cache, result conversion) on machines without a GPU, counts calls so tests can assert which path a
-/// query took, can fail or return corrupt counts on demand, and rejects use of a column after it was freed.
-/// Thread-safe.
+/// Plain-Java test backend, registered under any [GpuBackendType], that counts calls, can fail or corrupt results on
+/// demand and rejects use of a freed column. Thread-safe.
 public class JavaGpuBackendProvider implements GpuBackendProvider {
 
   public enum Behavior {
@@ -41,7 +38,7 @@ public class JavaGpuBackendProvider implements GpuBackendProvider {
   private final GpuBackendType _type;
   private final boolean _available;
   private final Behavior _behavior;
-  private final AtomicInteger _numGroupByCalls = new AtomicInteger();
+  private final AtomicInteger _numBackendCalls = new AtomicInteger();
   private final AtomicInteger _numUploads = new AtomicInteger();
   private final AtomicInteger _numBackendCloses = new AtomicInteger();
 
@@ -51,8 +48,8 @@ public class JavaGpuBackendProvider implements GpuBackendProvider {
     _behavior = behavior;
   }
 
-  public int getNumGroupByCalls() {
-    return _numGroupByCalls.get();
+  public int getNumBackendCalls() {
+    return _numBackendCalls.get();
   }
 
   public int getNumUploads() {
@@ -108,7 +105,7 @@ public class JavaGpuBackendProvider implements GpuBackendProvider {
       @Override
       public GpuAggregationResult aggregate(@Nullable GpuColumn groupKeys, int numGroups, @Nullable GpuColumn values,
           int numDocs, @Nullable GpuColumn matchingDocs) {
-        _numGroupByCalls.incrementAndGet();
+        _numBackendCalls.incrementAndGet();
         if (_behavior == Behavior.FAIL) {
           throw new IllegalStateException("simulated device failure");
         }
@@ -135,7 +132,7 @@ public class JavaGpuBackendProvider implements GpuBackendProvider {
       @Override
       public GpuDistinctResult distinct(@Nullable GpuColumn groupKeys, int numGroups, GpuColumn ids,
           int cardinality, int numDocs, @Nullable GpuColumn matchingDocs) {
-        _numGroupByCalls.incrementAndGet();
+        _numBackendCalls.incrementAndGet();
         if (_behavior == Behavior.FAIL) {
           throw new IllegalStateException("simulated device failure");
         }

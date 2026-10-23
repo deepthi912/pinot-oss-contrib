@@ -30,9 +30,9 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 
-/// Chooses the backend for each query, in the configured order of pluggable backends (no CUDA backend ships yet), within
-/// what the server config allows and as steered by query options. Thread-safe: the config is immutable, each backend is
-/// created at most once, and after [#close()] no backend is created and every decision is CPU.
+/// Chooses the backend for each query, in the configured order of pluggable backends (no CUDA backend ships yet),
+/// within what the server config allows and as steered by query options. Thread-safe: the config is immutable, each
+/// backend is created at most once, and after [#close()] no backend is created and every decision is CPU.
 public class GpuBackendRouter implements AutoCloseable {
   private static final Logger LOGGER = LoggerFactory.getLogger(GpuBackendRouter.class);
 

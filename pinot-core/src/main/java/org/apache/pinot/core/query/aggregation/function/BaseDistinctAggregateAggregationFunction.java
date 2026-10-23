@@ -935,8 +935,8 @@ public abstract class BaseDistinctAggregateAggregationFunction<T extends Compara
   }
 
   /// Converts dictionary ids to the typed value set used as the intermediate result of distinct aggregations, so
-  /// segment results computed elsewhere (e.g. by an execution plugin) merge with the regular ones.
-  public static Set convertToValueSet(Dictionary dictionary, RoaringBitmap dictIdBitmap) {
+  /// segment results computed elsewhere merge with the regular ones.
+  public static Set<?> convertToValueSet(Dictionary dictionary, RoaringBitmap dictIdBitmap) {
     int numValues = dictIdBitmap.getCardinality();
     PeekableIntIterator iterator = dictIdBitmap.getIntIterator();
     DataType storedType = dictionary.getValueType();

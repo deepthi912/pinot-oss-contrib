@@ -104,6 +104,13 @@ public class MetalGpuBackend implements GpuBackend {
     return "metal(" + _deviceName + ")";
   }
 
+  /// Columns are page-aligned and page-sized, so Metal can wrap them without copying.
+  @Override
+  public long residentBytes(int numValues) {
+    long bytes = (long) numValues * Integer.BYTES;
+    return Math.max(PAGE_SIZE, (bytes + PAGE_SIZE - 1) / PAGE_SIZE * PAGE_SIZE);
+  }
+
   @Override
   public GpuColumn uploadIntColumn(int numValues, IntChunkReader reader) {
     Arena arena = Arena.ofShared();
@@ -172,7 +179,7 @@ public class MetalGpuBackend implements GpuBackend {
     Lock lock = lockOpen();
     try (Arena arena = Arena.ofConfined()) {
       int numWords = (int) (((long) numGroups * cardinality + 31) >>> 5);
-      // The kernel writes the bitmap straight into this page-aligned memory: no device-side copy.
+      // Page-aligned and page-sized, so mg_pin wraps it without copying and the kernel's writes land here directly.
       MemorySegment words = allocateAligned(arena, numWords);
       MemorySegment wordsPin = pin(words);
       try {
@@ -197,8 +204,8 @@ public class MetalGpuBackend implements GpuBackend {
     }
   }
 
-  /// The kernel sums `value + 2^31` per row to stay unsigned; removes that bias in place. Exact modulo 2^64, so the result
-  /// is right whenever the true sum fits in a long, even when the biased sum overflowed.
+  /// The kernel sums `value + 2^31` per row to stay unsigned; removes that bias in place. Exact modulo 2^64, so the
+  /// result is right whenever the true sum fits in a long, even when the biased sum overflowed.
   static void removeSumBias(long[] biasedSums, long[] counts) {
     for (int g = 0; g < biasedSums.length; g++) {
       biasedSums[g] -= counts[g] << 31;
@@ -233,9 +240,8 @@ public class MetalGpuBackend implements GpuBackend {
     return Math.round(gpuMillis.get(ValueLayout.JAVA_DOUBLE, 0) * 1_000_000);
   }
 
-  private static MemorySegment allocateAligned(Arena arena, int numInts) {
-    long bytes = (long) numInts * Integer.BYTES;
-    return arena.allocate(Math.max(PAGE_SIZE, (bytes + PAGE_SIZE - 1) / PAGE_SIZE * PAGE_SIZE), PAGE_SIZE);
+  private MemorySegment allocateAligned(Arena arena, int numInts) {
+    return arena.allocate(residentBytes(numInts), PAGE_SIZE);
   }
 
 
@@ -289,7 +295,7 @@ public class MetalGpuBackend implements GpuBackend {
     private final MemorySegment _pin;
     private final int _numValues;
     private final long _sizeInBytes;
-    private boolean _closed;
+    private boolean _freed;
 
     MetalColumn(Arena arena, MemorySegment pin, int numValues, long sizeInBytes) {
       _arena = arena;
@@ -310,15 +316,15 @@ public class MetalGpuBackend implements GpuBackend {
 
     @Override
     public synchronized void close() {
-      if (_closed) {
+      if (_freed) {
         return;
       }
-      _closed = true;
+      _freed = true;
       Lock lock = _lock.readLock();
       lock.lock();
       try {
         // Once the backend is closed the library is unloaded, so the native buffer handle is leaked, not released.
-        if (!MetalGpuBackend.this._closed) {
+        if (!_closed) {
           unpin(_pin);
         }
       } finally {

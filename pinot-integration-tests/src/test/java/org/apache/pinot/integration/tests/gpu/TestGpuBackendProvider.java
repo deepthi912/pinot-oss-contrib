@@ -31,8 +31,8 @@ public class TestGpuBackendProvider implements GpuBackendProvider {
   private static final JavaGpuBackendProvider DELEGATE =
       new JavaGpuBackendProvider(GpuBackendType.CUDA, true, JavaGpuBackendProvider.Behavior.CORRECT);
 
-  public static int getNumGroupByCalls() {
-    return DELEGATE.getNumGroupByCalls();
+  public static int getNumBackendCalls() {
+    return DELEGATE.getNumBackendCalls();
   }
 
   @Override

@@ -20,11 +20,14 @@ package org.apache.pinot.plugin.query.gpu;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
+import javax.annotation.Nullable;
 import org.apache.pinot.spi.env.PinotConfiguration;
 
 
-/// Server-level GPU execution settings under `pinot.server.query.executor.gpu.*`, read at startup (changes need a
-/// restart). `gpu.enabled` is the master switch: when false, no query option enables the GPU. Immutable.
+/// Server-level GPU execution settings under `pinot.server.query.executor.gpu.*`, read once when the plan maker is
+/// initialized (changes need a server restart). `gpu.enabled` is the master switch: when false, no query option
+/// enables the GPU. Immutable.
 public final class GpuExecutionConfig {
   public static final String ENABLED = "gpu.enabled";
   public static final String BACKENDS = "gpu.backends";
@@ -74,9 +77,23 @@ public final class GpuExecutionConfig {
         }
       }
     }
-    return new GpuExecutionConfig(enabled != null && Boolean.parseBoolean(enabled.trim()), order,
+    return new GpuExecutionConfig(parseEnabled(enabled), order,
         minRows != null ? Long.parseLong(minRows.trim()) : DEFAULT_MIN_ROWS,
         cacheMaxBytes != null ? Long.parseLong(cacheMaxBytes.trim()) : DEFAULT_CACHE_MAX_BYTES);
+  }
+
+  private static boolean parseEnabled(@Nullable String enabled) {
+    if (enabled == null) {
+      return false;
+    }
+    switch (enabled.trim().toLowerCase(Locale.ROOT)) {
+      case "true":
+        return true;
+      case "false":
+        return false;
+      default:
+        throw new IllegalArgumentException(ENABLED + " must be true or false, got: " + enabled);
+    }
   }
 
   private static List<GpuBackendType> withCpuLast(List<GpuBackendType> backends) {

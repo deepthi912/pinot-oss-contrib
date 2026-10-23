@@ -158,6 +158,10 @@ public class GpuBackendRouterTest {
         new PinotConfiguration(Map.of(GpuExecutionConfig.CACHE_MAX_BYTES, "-1"))));
     assertThrows(IllegalArgumentException.class, () -> GpuExecutionConfig.fromQueryExecutorConfig(
         new PinotConfiguration(Map.of(GpuExecutionConfig.BACKENDS, "rocm"))));
+    assertThrows(IllegalArgumentException.class, () -> GpuExecutionConfig.fromQueryExecutorConfig(
+        new PinotConfiguration(Map.of(GpuExecutionConfig.ENABLED, "yes"))));
+    assertFalse(GpuExecutionConfig.fromQueryExecutorConfig(
+        new PinotConfiguration(Map.of(GpuExecutionConfig.ENABLED, " False "))).isEnabled());
     GpuExecutionConfig defaults = GpuExecutionConfig.fromQueryExecutorConfig(new PinotConfiguration(Map.of()));
     assertFalse(defaults.isEnabled());
     assertEquals(defaults.getBackends(), GpuExecutionConfig.DEFAULT_BACKENDS);
@@ -167,8 +171,10 @@ public class GpuBackendRouterTest {
     GpuQueryOptions options = GpuQueryOptions.fromQueryOptions(Map.of("USEGPU", "true", "gpuBackend", "Metal"));
     assertEquals(options.getUseGpu(), Boolean.TRUE);
     assertEquals(options.getPreferredBackend(), GpuBackendType.METAL);
-    assertThrows(IllegalArgumentException.class, () -> GpuQueryOptions.fromQueryOptions(Map.of("useGpu", "maybe")));
-    assertThrows(IllegalArgumentException.class,
-        () -> GpuQueryOptions.fromQueryOptions(Map.of("gpuBackend", "rocm")));
+    // Invalid values are ignored, so they never fail a query.
+    GpuQueryOptions invalid = GpuQueryOptions.fromQueryOptions(Map.of("useGpu", "maybe", "gpuBackend", "rocm"));
+    assertNull(invalid.getUseGpu());
+    assertNull(invalid.getPreferredBackend());
+    assertNull(GpuQueryOptions.fromQueryOptions(Map.of("useGpu", "maybe", "gpuBackend", "metal")).getUseGpu());
   }
 }

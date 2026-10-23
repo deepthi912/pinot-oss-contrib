@@ -16,7 +16,8 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-// Experimental Metal (Apple GPU) kernels for Pinot server-side GROUP BY over dictionary-encoded columns.
+// Experimental Metal (Apple GPU) kernels for Pinot server-side COUNT / SUM / AVG / DISTINCTCOUNT, optionally grouped
+// by one dictionary-id column.
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -212,6 +213,7 @@ struct DistinctParams {
   uint32_t hasKeys;
 };
 
+// Hard limit; GpuSegmentAggregator.MAX_DISTINCT_BITS (Java) routes larger bitmaps to the CPU well below it.
 constexpr uint64_t kMaxDistinctBits = 1ull << 28;
 
 struct FoldParams {
@@ -233,7 +235,7 @@ struct Context {
   id<MTLComputePipelineState> gbGlobal;
   id<MTLComputePipelineState> gbFold;
   id<MTLComputePipelineState> distinctPairs;
-  id<MTLBuffer> empty;  // bound when there is no filter bitmap
+  id<MTLBuffer> empty;  // bound in place of any absent buffer (keys, values, filter)
   char deviceName[256];
 };
 
@@ -334,7 +336,8 @@ void mg_unpin(void* buffer) {
   }
 }
 
-// GROUP BY dictId: COUNT(*), plus SUM(value) when valuePin is set; sums are of (value + 2^31) per group.
+// GROUP BY dictId: COUNT(*), plus SUM(value) when valuePin is set; sums are of (value + 2^31) per group. dictPin may
+// be null (single group).
 int32_t mg_group_by(void* handle, void* dictPin, void* valuePin, void* filterPin, int32_t numRows,
     int32_t numGroups, uint64_t* outSumU, uint64_t* outCount, double* gpuMs, char* err, int32_t errLen) {
   @autoreleasepool {

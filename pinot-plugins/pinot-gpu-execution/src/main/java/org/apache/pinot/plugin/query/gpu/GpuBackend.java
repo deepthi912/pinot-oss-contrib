@@ -21,7 +21,7 @@ package org.apache.pinot.plugin.query.gpu;
 import javax.annotation.Nullable;
 
 
-/// A GPU execution backend (CUDA, Metal) for the per-row part of server-side aggregation queries. thread-safe: one
+/// A GPU execution backend (e.g. Metal) for the per-row part of server-side aggregation queries. Thread-safe: one
 /// instance serves all concurrent queries of a server.
 public interface GpuBackend extends AutoCloseable {
 
@@ -37,6 +37,11 @@ public interface GpuBackend extends AutoCloseable {
   /// Loads `numValues` values chunk by chunk into device memory, without materializing the whole column on the heap.
   /// The returned column may only be passed back to this backend.
   GpuColumn uploadIntColumn(int numValues, IntChunkReader reader);
+
+  /// Bytes of off-heap memory a column of `numValues` values occupies: what its [GpuColumn#getSizeInBytes()] reports.
+  default long residentBytes(int numValues) {
+    return (long) numValues * Integer.BYTES;
+  }
 
   default GpuColumn uploadIntColumn(int[] values, int length) {
     return uploadIntColumn(length, (start, chunk, buffer) -> System.arraycopy(values, start, buffer, 0, chunk));

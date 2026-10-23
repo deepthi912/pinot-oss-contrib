@@ -38,7 +38,8 @@ public class MetalGpuBackendProvider implements GpuBackendProvider {
     }
     String source = MetalNativeLibrary.describeSource();
     if (source == null) {
-      return Availability.unavailable("native library not built (build the plugin on macOS)");
+      return Availability.unavailable("native library not found (build the plugin with -Dpinot.gpu.metal=true, or "
+          + "set -D" + MetalNativeLibrary.LIBRARY_PATH_PROPERTY + " to an existing library)");
     }
     return Availability.available(source);
   }

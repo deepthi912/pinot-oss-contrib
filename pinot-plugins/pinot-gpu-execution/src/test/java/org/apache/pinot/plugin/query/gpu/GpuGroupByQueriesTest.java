@@ -33,11 +33,11 @@ import org.apache.pinot.core.plan.maker.InstancePlanMakerImplV2;
 import org.apache.pinot.core.plan.maker.PlanMaker;
 import org.apache.pinot.core.query.request.context.QueryContext;
 import org.apache.pinot.core.query.request.context.utils.QueryContextConverterUtils;
+import org.apache.pinot.core.transport.ServerRoutingInstance;
 import org.apache.pinot.plugin.query.gpu.JavaGpuBackendProvider.Behavior;
 import org.apache.pinot.plugin.query.gpu.metal.MetalGpuBackend;
 import org.apache.pinot.plugin.query.gpu.metal.MetalGpuBackendProvider;
 import org.apache.pinot.plugin.query.gpu.metal.MetalNativeLibrary;
-import org.apache.pinot.core.transport.ServerRoutingInstance;
 import org.apache.pinot.queries.BaseQueriesTest;
 import org.apache.pinot.segment.local.indexsegment.immutable.ImmutableSegmentLoader;
 import org.apache.pinot.segment.local.segment.creator.impl.SegmentIndexCreationDriverImpl;
@@ -287,7 +287,7 @@ public class GpuGroupByQueriesTest extends BaseQueriesTest {
     assertSameResults(query, _gpuPlanMaker, _gpuProvider, true);
     // Matching results alone would also pass on a CPU fallback.
     GpuQueryStats stats = executeAndGetStats(_gpuPlanMaker, query);
-    assertEquals(stats.getSegmentsFallback(), 0, stats.toString());
+    assertEquals(stats.getSegmentsFallbackToCpu(), 0, stats.toString());
     assertEquals(stats.getSegmentsOnGpu(), _indexSegments.size(), stats.toString());
   }
 
@@ -348,7 +348,7 @@ public class GpuGroupByQueriesTest extends BaseQueriesTest {
     assertSameResults(query, planMaker, provider, true);
     GpuQueryStats stats = executeAndGetStats(planMaker, query);
     assertEquals(stats.getSegmentsOnGpu(), 0, stats.toString());
-    assertEquals(stats.getSegmentsFallback(), _indexSegments.size(), stats.toString());
+    assertEquals(stats.getSegmentsFallbackToCpu(), _indexSegments.size(), stats.toString());
   }
 
   @Test
@@ -356,7 +356,7 @@ public class GpuGroupByQueriesTest extends BaseQueriesTest {
       throws Exception {
     GpuQueryStats stats = executeAndGetStats(_gpuPlanMaker, QUERY);
     assertEquals(stats.getSegmentsOnGpu(), _indexSegments.size(), stats.toString());
-    assertEquals(stats.getSegmentsFallback(), 0, stats.toString());
+    assertEquals(stats.getSegmentsFallbackToCpu(), 0, stats.toString());
 
     for (String query : List.of(
         "SELECT dimStr, COUNT(*) FROM testTable WHERE dimInt < 20 GROUP BY dimStr ORDER BY dimStr LIMIT 1000",
@@ -450,10 +450,10 @@ public class GpuGroupByQueriesTest extends BaseQueriesTest {
         "SELECT dimStr, SUM(metric), DISTINCTCOUNT(dimInt) FROM testTable WHERE metric > 0 GROUP BY dimStr "
             + "ORDER BY dimStr LIMIT 1000")) {
       BrokerResponseNative expected = getBrokerResponse(query, _cpuPlanMaker, segmentContexts);
-      int callsBefore = _gpuProvider.getNumGroupByCalls();
+      int callsBefore = _gpuProvider.getNumBackendCalls();
       BrokerResponseNative actual = getBrokerResponse(query, _gpuPlanMaker, segmentContexts);
       assertSameResponse(actual, expected, query);
-      assertTrue(_gpuProvider.getNumGroupByCalls() > callsBefore, query);
+      assertTrue(_gpuProvider.getNumBackendCalls() > callsBefore, query);
       assertTrue(expected.getNumDocsScanned() < (long) NUM_ROWS_PER_SEGMENT * _indexSegments.size(), query);
       GpuQueryStats stats = executeAndGetStats(_gpuPlanMaker, query, segmentContexts);
       assertEquals(stats.getSegmentsOnGpu(), _indexSegments.size(), query + " " + stats);
@@ -468,10 +468,10 @@ public class GpuGroupByQueriesTest extends BaseQueriesTest {
     List<SegmentContext> segmentContexts = List.of(new SegmentContext(consuming));
     for (String query : List.of(GROUP_BY_VALUES_QUERY, AGGREGATION_QUERY)) {
       BrokerResponseNative expected = getBrokerResponse(query, _cpuPlanMaker, segmentContexts);
-      int callsBefore = _gpuProvider.getNumGroupByCalls();
+      int callsBefore = _gpuProvider.getNumBackendCalls();
       assertSameResponse(getBrokerResponse(query, _gpuPlanMaker, segmentContexts), expected, query);
       GpuQueryStats stats = executeAndGetStats(_gpuPlanMaker, query, segmentContexts);
-      assertEquals(_gpuProvider.getNumGroupByCalls(), callsBefore, query);
+      assertEquals(_gpuProvider.getNumBackendCalls(), callsBefore, query);
       assertEquals(stats.getSegmentsIneligible(), 1, query + " " + stats);
       assertEquals(stats.getSegmentsOnGpu(), 0, query + " " + stats);
     }
@@ -536,15 +536,15 @@ public class GpuGroupByQueriesTest extends BaseQueriesTest {
         String sql = (String) query[0];
         assertSameResponse(getBrokerResponse(sql, metalPlanMaker), getBrokerResponse(sql, _cpuPlanMaker), sql);
         GpuQueryStats stats = executeAndGetStats(metalPlanMaker, sql);
-        assertEquals(stats.getSegmentsFallback(), 0, sql + " " + stats);
+        assertEquals(stats.getSegmentsFallbackToCpu(), 0, sql + " " + stats);
         assertEquals(stats.getSegmentsOnGpu(), _indexSegments.size(), sql + " " + stats);
       }
       for (String sql : List.of("SELECT dimInt, COUNT(*) FROM testTable GROUP BY dimInt ORDER BY dimInt LIMIT 2000",
           "SELECT dimHigh, COUNT(*) FROM testTable GROUP BY dimHigh ORDER BY dimHigh LIMIT 10000")) {
         GpuQueryStats stats = executeAndGetStats(metalPlanMaker, sql);
         assertEquals(stats.getSegmentsOnGpu(), _indexSegments.size(), stats.toString());
-        assertEquals(stats.getSegmentsFallback(), 0, stats.toString());
-        assertTrue(stats.getDeviceTimeNs() > 0, stats.toString());
+        assertEquals(stats.getSegmentsFallbackToCpu(), 0, stats.toString());
+        assertTrue(stats.getGpuKernelNs() > 0, stats.toString());
       }
       checkMetalKernels(metalPlanMaker.getRouter().decide(GpuQueryOptions.NONE, 1).getBackend());
     } finally {
@@ -678,11 +678,11 @@ public class GpuGroupByQueriesTest extends BaseQueriesTest {
 
   private void assertSameResults(String query, PlanMaker gpuPlanMaker, JavaGpuBackendProvider provider,
       boolean expectGpu) {
-    int callsBefore = provider.getNumGroupByCalls();
+    int callsBefore = provider.getNumBackendCalls();
     BrokerResponseNative expected = getBrokerResponse(query, _cpuPlanMaker);
     BrokerResponseNative actual = getBrokerResponse(query, gpuPlanMaker);
     assertSameResponse(actual, expected, query);
-    int calls = provider.getNumGroupByCalls() - callsBefore;
+    int calls = provider.getNumBackendCalls() - callsBefore;
     if (expectGpu) {
       assertTrue(calls > 0, "expected the GPU path for: " + query);
     } else {

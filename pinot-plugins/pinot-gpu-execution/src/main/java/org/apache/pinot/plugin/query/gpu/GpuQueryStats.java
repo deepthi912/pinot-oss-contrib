@@ -35,7 +35,7 @@ public final class GpuQueryStats {
   private final AtomicInteger _segmentsFallback = new AtomicInteger();
   private final AtomicLong _docsOnGpu = new AtomicLong();
   private final AtomicLong _deviceTimeNs = new AtomicLong();
-  // Once one column load times out, the query's remaining segments stop waiting for loads.
+  // Set once any column lease is refused (budget or wait); the query's remaining segments then do not wait for loads.
   private volatile boolean _loadWaitExpired;
 
   public GpuQueryStats(String backendName, int numSegments) {
@@ -95,11 +95,11 @@ public final class GpuQueryStats {
     return _segmentsNotResident.get();
   }
 
-  public int getSegmentsFallback() {
+  public int getSegmentsFallbackToCpu() {
     return _segmentsFallback.get();
   }
 
-  public long getDeviceTimeNs() {
+  public long getGpuKernelNs() {
     return _deviceTimeNs.get();
   }
 

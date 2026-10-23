@@ -63,7 +63,6 @@
         ./mvnw -pl pinot-plugins/pinot-gpu-execution package -Dpinot.gpu.metal=true
       Without it, or on any other platform, the Metal backend reports itself unavailable and queries use the regular
       CPU plan. A prebuilt library can also be supplied at runtime with -Dpinot.gpu.metal.library=/path/to.dylib.
-      Linux CI does not compile the native code.
     -->
     <profile>
       <id>gpu-metal-native</id>

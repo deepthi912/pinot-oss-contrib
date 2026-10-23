@@ -33,10 +33,10 @@ import org.apache.pinot.segment.spi.index.reader.ForwardIndexReader;
 import org.apache.pinot.spi.data.FieldSpec;
 
 
-/// Decides whether a query, on a given segment, can run on the GPU path: COUNT(*), SUM/AVG on INT columns and
-/// DISTINCTCOUNT on dictionary columns, optionally grouped by one dictionary column. Every check returns `null` when
-/// the GPU path applies and a short reason otherwise; anything not explicitly supported stays on the regular CPU plan.
-/// Stateless.
+/// Decides whether a query, on a given segment, can run on the GPU path: COUNT(*), SUM/AVG on columns with stored type
+/// INT and DISTINCTCOUNT on dictionary columns, optionally grouped by one dictionary column. Every check returns `null`
+/// when the GPU path applies and a short reason otherwise; anything not explicitly supported stays on the regular CPU
+/// plan. Stateless.
 public final class GpuQueryEligibility {
   private GpuQueryEligibility() {
   }
@@ -66,7 +66,7 @@ public final class GpuQueryEligibility {
       hasNonCount = true;
     }
     if (groupByExpressions == null && !hasNonCount) {
-      // COUNT(*) without GROUP BY is answered from metadata or index bitmaps.
+      // Only COUNT(*) without GROUP BY: core answers it from metadata or the filter's match count, without a scan.
       return "COUNT(*) without GROUP BY";
     }
     if (queryContext.hasFilteredAggregations()) {

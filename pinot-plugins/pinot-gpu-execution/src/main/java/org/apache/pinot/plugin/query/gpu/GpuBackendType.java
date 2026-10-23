@@ -21,7 +21,8 @@ package org.apache.pinot.plugin.query.gpu;
 import java.util.Locale;
 
 
-/// Execution backends for GPU query execution, in the default preference order: CUDA, then Metal, then CPU.
+/// Execution backends in the default preference order, CPU last. Backends are pluggable ([GpuBackendProvider]); no
+/// CUDA backend ships yet.
 public enum GpuBackendType {
   CUDA, METAL, CPU;
 

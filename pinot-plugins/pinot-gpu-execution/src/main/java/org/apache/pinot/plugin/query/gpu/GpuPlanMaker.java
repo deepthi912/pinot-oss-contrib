@@ -34,10 +34,10 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 
-/// Server plan maker that runs supported single-stage aggregation queries on a GPU backend (CUDA, then Metal) and
-/// everything else exactly as [InstancePlanMakerImplV2] does. Thread-safe: the per-query decision travels to
-/// [#makeSegmentPlanNode] through a thread-local that is set and cleared around the synchronous planning in
-/// [#makeInstancePlan].
+/// Server plan maker that runs supported single-stage aggregation queries on a pluggable GPU backend (Metal today; no
+/// CUDA backend ships yet) and everything else exactly as [InstancePlanMakerImplV2] does. Thread-safe: the per-query
+/// decision travels to [#makeSegmentPlanNode] through a thread-local that is set and cleared around the synchronous
+/// planning in [#makeInstancePlan].
 public class GpuPlanMaker extends InstancePlanMakerImplV2 {
   private static final Logger LOGGER = LoggerFactory.getLogger(GpuPlanMaker.class);
 
@@ -104,7 +104,8 @@ public class GpuPlanMaker extends InstancePlanMakerImplV2 {
     return _columnCache;
   }
 
-  // MSE leaf and streaming queries use makeStreamingInstancePlan (inherited), so they never reach the GPU.
+  // MSE leaves and other streaming queries use makeStreamingInstancePlan (inherited) and never reach the GPU.
+  // Time-series leaves do come here; GpuQueryEligibility keeps their aggregations on the CPU.
   @Override
   public Plan makeInstancePlan(List<SegmentContext> segmentContexts, QueryContext queryContext,
       ExecutorService executorService) {

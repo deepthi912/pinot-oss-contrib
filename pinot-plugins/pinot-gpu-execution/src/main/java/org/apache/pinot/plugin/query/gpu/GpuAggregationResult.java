@@ -22,7 +22,7 @@ import javax.annotation.Nullable;
 
 
 /// Per-group row counts and exact 64-bit sums from [GpuBackend#aggregate], plus the device-measured execution time
-/// (`-1` when not measured). Immutable.
+/// (`-1` when not measured). Arrays are not defensively copied.
 public final class GpuAggregationResult {
   private final long[] _counts;
   @Nullable
