@@ -645,30 +645,30 @@ public class ArrayFunctions {
   /// in `float` arithmetic, as the single-stage engine always did.
   private static int generatedArrayLength(float start, float end, float inc) {
     checkFloatingPointArguments(start, end, inc);
-    float steps = (end - start) / inc;
-    double nearestSteps = Math.rint(steps);
-    // The tolerance uses float ulps so that it matches the precision of the arguments.
-    double roundingError =
-        2 * (Math.ulp(start) + Math.ulp(end) + Math.abs(nearestSteps) * Math.ulp(inc)) / Math.abs(inc);
-    return checkGeneratedArrayLength(floatingPointSteps(steps, nearestSteps, roundingError));
+    // The quotient and the ulps are taken in float so that the tolerance matches the precision of the arguments.
+    return checkGeneratedArrayLength(
+        floatingPointSteps((end - start) / inc, inc, Math.ulp(start) + Math.ulp(end), Math.ulp(inc)));
   }
 
   /// Length of the `double` sequence `start, start + inc, ...` bounded by `end`, inclusive.
   private static int generatedArrayLength(double start, double end, double inc) {
     checkFloatingPointArguments(start, end, inc);
-    double steps = (end - start) / inc;
-    double nearestSteps = Math.rint(steps);
-    double roundingError =
-        2 * (Math.ulp(start) + Math.ulp(end) + Math.abs(nearestSteps) * Math.ulp(inc)) / Math.abs(inc);
-    return checkGeneratedArrayLength(floatingPointSteps(steps, nearestSteps, roundingError));
+    return checkGeneratedArrayLength(
+        floatingPointSteps((end - start) / inc, inc, Math.ulp(start) + Math.ulp(end), Math.ulp(inc)));
   }
 
   /// Returns the number of whole increments in a floating point sequence. Decimal steps such as `0.1` are not exact in
-  /// binary, so `(end - start) / inc` often lands just below the integer it should be, e.g. `5.999999999999999` for
-  /// `0.1` to `0.7` by `0.1`. Flooring that would drop the end, so a step count within the rounding error of the
-  /// arguments is snapped to the nearest integer. Otherwise the end falls between two steps and the count is floored.
-  /// A span too wide for a long saturates the cast at `Long.MAX_VALUE`, which the length check then rejects.
-  private static long floatingPointSteps(double steps, double nearestSteps, double roundingError) {
+  /// binary, so `steps = (end - start) / inc` often lands just below the integer it should be, e.g.
+  /// `5.999999999999999` for `0.1` to `0.7` by `0.1`. Flooring that would drop the end, so a step count within the
+  /// rounding error of the arguments is snapped to the nearest integer. Otherwise the end falls between two steps and
+  /// the count is floored. A span too wide for a long saturates the cast at `Long.MAX_VALUE`, which the length check
+  /// then rejects.
+  ///
+  /// @param boundsUlp `ulp(start) + ulp(end)`, in the precision of the arguments
+  /// @param incUlp `ulp(inc)`, in the precision of the arguments
+  private static long floatingPointSteps(double steps, double inc, double boundsUlp, double incUlp) {
+    double nearestSteps = Math.rint(steps);
+    double roundingError = 2 * (boundsUlp + Math.abs(nearestSteps) * incUlp) / Math.abs(inc);
     return (long) (Math.abs(steps - nearestSteps) <= roundingError ? nearestSteps : Math.floor(steps));
   }
 
