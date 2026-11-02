@@ -22,6 +22,7 @@ import java.util.List;
 import javax.annotation.Nullable;
 import org.apache.commons.collections4.MapUtils;
 import org.apache.pinot.common.request.context.ExpressionContext;
+import org.apache.pinot.common.request.context.OrderByExpressionContext;
 import org.apache.pinot.core.query.aggregation.function.AggregationFunction;
 import org.apache.pinot.core.query.request.context.QueryContext;
 import org.apache.pinot.core.query.request.context.utils.QueryContextUtils;
@@ -34,9 +35,14 @@ import org.apache.pinot.spi.data.FieldSpec;
 
 
 /// Decides whether a query, on a given segment, can run on the GPU path: COUNT(*), SUM/AVG on columns with stored type
-/// INT and DISTINCTCOUNT on dictionary columns, optionally grouped by one dictionary column. Every check returns `null`
-/// when the GPU path applies and a short reason otherwise; anything not explicitly supported stays on the regular CPU
-/// plan. Stateless.
+/// INT and DISTINCTCOUNT on dictionary columns, optionally grouped by sorted-dictionary columns whose combined key
+/// ([GpuGroupKeys]) has fewer groups than numGroupsLimit and at most [GpuGroupKeys#MAX_DENSE_GROUPS]. Every check
+/// returns `null` when the GPU path applies and a short reason otherwise; anything not explicitly supported stays on
+/// the regular CPU plan. Stateless.
+///
+/// ORDER BY under sort-aggregate: with sorted dictionaries, ascending dense group ids follow the GROUP BY values in
+/// column order, so the GPU operator emits groups in ORDER BY order only when the ORDER BY is the GROUP BY columns in
+/// the same order, all ASC (ids walked up) or all DESC (ids walked down).
 public final class GpuQueryEligibility {
   private GpuQueryEligibility() {
   }
@@ -47,9 +53,17 @@ public final class GpuQueryEligibility {
       return "not an aggregation query";
     }
     List<ExpressionContext> groupByExpressions = queryContext.getGroupByExpressions();
-    if (groupByExpressions != null && (groupByExpressions.size() != 1
-        || groupByExpressions.get(0).getType() != ExpressionContext.Type.IDENTIFIER)) {
-      return "GROUP BY must be a single column";
+    if (groupByExpressions != null) {
+      for (ExpressionContext expression : groupByExpressions) {
+        if (expression.getType() != ExpressionContext.Type.IDENTIFIER) {
+          return "GROUP BY must be on columns";
+        }
+      }
+      // Sort-aggregate emits groups in ORDER BY order, which the dense key gives only for the GROUP BY columns in
+      // order, all in one direction.
+      if (queryContext.shouldSortAggregateUnderSafeTrim() && !orderedByGroupKey(queryContext)) {
+        return "ORDER BY is not the GROUP BY columns in order with one direction";
+      }
     }
     boolean hasNonCount = false;
     for (AggregationFunction<?, ?> function : queryContext.getAggregationFunctions()) {
@@ -93,6 +107,22 @@ public final class GpuQueryEligibility {
     return null;
   }
 
+  private static boolean orderedByGroupKey(QueryContext queryContext) {
+    List<ExpressionContext> groupByExpressions = queryContext.getGroupByExpressions();
+    List<OrderByExpressionContext> orderByExpressions = queryContext.getOrderByExpressions();
+    if (orderByExpressions == null || orderByExpressions.size() != groupByExpressions.size()) {
+      return false;
+    }
+    boolean asc = orderByExpressions.get(0).isAsc();
+    for (int i = 0; i < orderByExpressions.size(); i++) {
+      OrderByExpressionContext orderBy = orderByExpressions.get(i);
+      if (orderBy.isAsc() != asc || !orderBy.getExpression().equals(groupByExpressions.get(i))) {
+        return false;
+      }
+    }
+    return true;
+  }
+
   static final long MAX_EXACT_DOUBLE_SUM = 1L << 53;
 
   @Nullable
@@ -101,20 +131,27 @@ public final class GpuQueryEligibility {
       return "mutable (consuming) segment";
     }
     long numGroups = 1;
-    if (queryContext.getGroupByExpressions() != null) {
-      String column = queryContext.getGroupByExpressions().get(0).getIdentifier();
-      String reason = checkDictionaryColumn(segment, column);
-      if (reason != null) {
-        return reason;
+    List<ExpressionContext> groupByExpressions = queryContext.getGroupByExpressions();
+    if (groupByExpressions != null) {
+      String[] columns = new String[groupByExpressions.size()];
+      for (int i = 0; i < columns.length; i++) {
+        String column = groupByExpressions.get(i).getIdentifier();
+        String reason = checkDictionaryColumn(segment, column);
+        if (reason != null) {
+          return reason;
+        }
+        if (!segment.getDataSource(column).getDictionary().isSorted()) {
+          return "column " + column + " has an unsorted dictionary";
+        }
+        columns[i] = column;
       }
-      DataSource dataSource = segment.getDataSource(column);
-      if (!dataSource.getDictionary().isSorted()) {
-        return "column " + column + " has an unsorted dictionary";
-      }
-      numGroups = dataSource.getDataSourceMetadata().getCardinality();
+      numGroups = GpuGroupKeys.cardinalityProduct(GpuGroupKeys.cardinalities(segment, columns));
       if (numGroups >= queryContext.getNumGroupsLimit()) {
         // Keeps results identical to the CPU path, which stops adding groups at the limit.
-        return "cardinality reaches numGroupsLimit";
+        return "group key cardinality reaches numGroupsLimit";
+      }
+      if (numGroups > GpuGroupKeys.MAX_DENSE_GROUPS) {
+        return "group key cardinality exceeds " + GpuGroupKeys.MAX_DENSE_GROUPS;
       }
     }
     for (AggregationFunction<?, ?> function : queryContext.getAggregationFunctions()) {

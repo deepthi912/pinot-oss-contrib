@@ -64,6 +64,7 @@ public class GpuMixedSegmentsQueriesTest extends BaseQueriesTest {
   private static final int NUM_ROWS = 10_007;
   private static final Schema SCHEMA = new Schema.SchemaBuilder().setSchemaName(TABLE)
       .addSingleValueDimension("dimStr", DataType.STRING)
+      .addSingleValueDimension("dimInt", DataType.INT)
       .addMetric("metric", DataType.INT)
       .build();
 
@@ -109,6 +110,7 @@ public class GpuMixedSegmentsQueriesTest extends BaseQueriesTest {
     for (int i = 0; i < NUM_ROWS; i++) {
       GenericRow row = new GenericRow();
       row.putValue("dimStr", "s" + random.nextInt(60));
+      row.putValue("dimInt", random.nextInt(5));
       row.putValue("metric", random.nextInt(1000));
       rows.add(row);
     }
@@ -129,7 +131,9 @@ public class GpuMixedSegmentsQueriesTest extends BaseQueriesTest {
         {"SELECT dimStr, COUNT(*) FROM testTable GROUP BY dimStr ORDER BY dimStr LIMIT 7"},
         {"SELECT dimStr, COUNT(*) FROM testTable GROUP BY dimStr ORDER BY dimStr DESC LIMIT 7"},
         {"SELECT dimStr, COUNT(*) FROM testTable GROUP BY dimStr ORDER BY COUNT(*) DESC, dimStr LIMIT 5"},
-        {"SELECT dimStr, COUNT(*) FROM testTable WHERE metric > 300 GROUP BY dimStr ORDER BY dimStr LIMIT 100"}
+        {"SELECT dimStr, COUNT(*) FROM testTable WHERE metric > 300 GROUP BY dimStr ORDER BY dimStr LIMIT 100"},
+        {"SELECT dimStr, dimInt, COUNT(*), SUM(metric) FROM testTable GROUP BY dimStr, dimInt "
+            + "ORDER BY dimStr, dimInt LIMIT 50"}
     };
   }
 

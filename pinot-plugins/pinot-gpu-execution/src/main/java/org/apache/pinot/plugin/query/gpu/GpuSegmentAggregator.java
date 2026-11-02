@@ -26,7 +26,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Supplier;
 import javax.annotation.Nullable;
+import org.apache.pinot.common.request.context.ExpressionContext;
 import org.apache.pinot.core.operator.filter.BaseFilterOperator;
 import org.apache.pinot.core.query.aggregation.function.AggregationFunction;
 import org.apache.pinot.core.query.aggregation.function.BaseDistinctAggregateAggregationFunction;
@@ -50,14 +52,19 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 
-/// Computes one segment's COUNT / SUM / AVG / DISTINCTCOUNT on the GPU, optionally grouped by one dictionary column,
+/// Computes one segment's COUNT / SUM / AVG / DISTINCTCOUNT on the GPU, optionally grouped by dictionary columns,
 /// producing the same intermediate results as the CPU aggregation functions. [#compute()] returns `null` when the
 /// segment runs on the CPU instead: no matching documents, a selective filter, a DISTINCTCOUNT bitmap too sparse or too
-/// large, a column the cache could not make resident (budget or wait), a device or backend failure (including a closed
-/// backend), or inconsistent device results. Not thread-safe; used by one segment operator.
+/// large, a multi-column group key much sparser than the matching documents, a column the cache could not make resident
+/// (budget or wait), a device or backend failure (including a closed backend), or inconsistent device results. Each
+/// ordered tuple of several GROUP BY columns gets its own resident combined key column. Not thread-safe; used by one
+/// segment operator.
 final class GpuSegmentAggregator {
   private static final Logger LOGGER = LoggerFactory.getLogger(GpuSegmentAggregator.class);
   static final int SELECTIVE_FILTER_RATIO = 16;
+  // Per-group counts and sums are sized by the multi-column key's cardinality product, not by the matching documents;
+  // beyond this many groups per document the CPU's hash table is cheaper.
+  static final int MAX_GROUPS_PER_DOC = 4;
   private static final int READ_CHUNK_SIZE = 10_000;
   // Bounds how long a segment waits for load slots and for other threads' loads of its columns (also at most a quarter
   // of the remaining query time); a load the segment runs itself is not time-bounded. Once any lease is refused, the
@@ -110,7 +117,9 @@ final class GpuSegmentAggregator {
   private final GpuColumnCache _cache;
   private final GpuQueryStats _stats;
   @Nullable
-  private final String _groupByColumn;
+  private final String[] _groupByColumns;
+  @Nullable
+  private final GpuGroupKeys _groupKeys;
 
   private int _numDocsScanned;
   private long _loadWaitDeadlineNanos;
@@ -126,8 +135,23 @@ final class GpuSegmentAggregator {
     _backend = backend;
     _cache = cache;
     _stats = stats;
-    _groupByColumn = queryContext.getGroupByExpressions() != null
-        ? queryContext.getGroupByExpressions().get(0).getIdentifier() : null;
+    List<ExpressionContext> groupByExpressions = queryContext.getGroupByExpressions();
+    if (groupByExpressions != null) {
+      _groupByColumns = new String[groupByExpressions.size()];
+      for (int i = 0; i < _groupByColumns.length; i++) {
+        _groupByColumns[i] = groupByExpressions.get(i).getIdentifier();
+      }
+      _groupKeys = new GpuGroupKeys(GpuGroupKeys.cardinalities(segment, _groupByColumns));
+    } else {
+      _groupByColumns = null;
+      _groupKeys = null;
+    }
+  }
+
+  /// The dense key of the GROUP BY columns, `null` without GROUP BY.
+  @Nullable
+  GpuGroupKeys getGroupKeys() {
+    return _groupKeys;
   }
 
   int getNumDocsScanned() {
@@ -147,8 +171,8 @@ final class GpuSegmentAggregator {
   /// Columns read per matching document, matching the CPU projection for scan statistics.
   int getNumColumnsProjected() {
     Set<String> columns = new LinkedHashSet<>();
-    if (_groupByColumn != null) {
-      columns.add(_groupByColumn);
+    if (_groupByColumns != null) {
+      columns.addAll(Arrays.asList(_groupByColumns));
     }
     for (AggregationFunction<?, ?> function : _queryContext.getAggregationFunctions()) {
       if (!function.getInputExpressions().isEmpty()) {
@@ -175,7 +199,7 @@ final class GpuSegmentAggregator {
       _stats.recordSelectiveOnCpu();
       return null;
     }
-    if (distinctBitmapTooSparse()) {
+    if (distinctBitmapTooSparse() || combinedKeyTooSparse()) {
       _stats.recordSelectiveOnCpu();
       return null;
     }
@@ -212,9 +236,10 @@ final class GpuSegmentAggregator {
         : TimeUnit.MILLISECONDS.toNanos(Math.max(0, Math.min(MAX_LOAD_WAIT_MS, remainingMs / 4))));
     GpuColumn keys = null;
     int numGroups = 1;
-    if (_groupByColumn != null) {
-      numGroups = _segment.getDataSource(_groupByColumn).getDictionary().length();
-      keys = resident(_groupByColumn, false, numDocs, leases);
+    if (_groupKeys != null) {
+      numGroups = _groupKeys.getNumGroups();
+      keys = _groupByColumns.length == 1 ? residentColumn(_groupByColumns[0], false, numDocs, leases)
+          : residentCombinedKeys(numDocs, leases);
       if (keys == null) {
         return null;
       }
@@ -229,7 +254,7 @@ final class GpuSegmentAggregator {
         continue;
       }
       columns[i] = functions[i].getInputExpressions().get(0).getIdentifier();
-      inputs[i] = resident(columns[i], type != AggregationFunctionType.DISTINCTCOUNT, numDocs, leases);
+      inputs[i] = residentColumn(columns[i], type != AggregationFunctionType.DISTINCTCOUNT, numDocs, leases);
       if (inputs[i] == null) {
         return null;
       }
@@ -297,7 +322,7 @@ final class GpuSegmentAggregator {
   /// DISTINCTCOUNT's bitmap has `numGroups * cardinality` bits whatever the filter; when it has more 32-bit words than
   /// matching documents, or more bits than [GpuBackend#MAX_DISTINCT_BITS], the CPU's value sets are cheaper.
   private boolean distinctBitmapTooSparse() {
-    long numGroups = _groupByColumn != null ? _segment.getDataSource(_groupByColumn).getDictionary().length() : 1;
+    long numGroups = _groupKeys != null ? _groupKeys.getNumGroups() : 1;
     for (AggregationFunction<?, ?> function : _queryContext.getAggregationFunctions()) {
       if (function.getType() == AggregationFunctionType.DISTINCTCOUNT) {
         String column = function.getInputExpressions().get(0).getIdentifier();
@@ -308,6 +333,11 @@ final class GpuSegmentAggregator {
       }
     }
     return false;
+  }
+
+  private boolean combinedKeyTooSparse() {
+    return _groupByColumns != null && _groupByColumns.length > 1
+        && _groupKeys.getNumGroups() > (long) MAX_GROUPS_PER_DOC * _numDocsScanned;
   }
 
   /// Every group with matching documents must have at least one distinct value, and no other group may have any.
@@ -338,21 +368,38 @@ final class GpuSegmentAggregator {
   }
 
   @Nullable
-  private GpuColumn resident(String column, boolean intValues, int numDocs, List<GpuColumnCache.Lease> leases) {
+  private GpuColumn residentColumn(String column, boolean intValues, int numDocs,
+      List<GpuColumnCache.Lease> leases) {
+    DataSource dataSource = _segment.getDataSource(column);
+    return acquireResident(column + (intValues ? "#values" : "#dictIds"), numDocs, leases,
+        () -> uploadColumn(dataSource, intValues, numDocs));
+  }
+
+  @Nullable
+  private GpuColumn residentCombinedKeys(int numDocs, List<GpuColumnCache.Lease> leases) {
+    // Length-prefixed names: unambiguous whatever characters the column names contain.
+    StringBuilder name = new StringBuilder();
+    for (String column : _groupByColumns) {
+      name.append(column.length()).append(':').append(column);
+    }
+    return acquireResident(name.append("#combined").toString(), numDocs, leases, () -> uploadCombinedKeys(numDocs));
+  }
+
+  @Nullable
+  private GpuColumn acquireResident(String name, int numDocs, List<GpuColumnCache.Lease> leases,
+      Supplier<GpuColumn> loader) {
     long instanceId = _cache.getOrAssignInstanceId(_segment);
     long maxWaitNanos = Math.max(0, _loadWaitDeadlineNanos - System.nanoTime());
     String key = GpuColumnCache.cacheKey(_backend.getType(), _queryContext.getTableName(), _segment.getSegmentName(),
-        instanceId, column + (intValues ? "#values" : "#dictIds"));
-    DataSource dataSource = _segment.getDataSource(column);
-    GpuColumnCache.Lease lease = _cache.acquire(key, instanceId, _backend.residentBytes(numDocs), maxWaitNanos,
-        () -> uploadColumn(dataSource, intValues, numDocs));
+        instanceId, name);
+    GpuColumnCache.Lease lease = _cache.acquire(key, instanceId, _backend.residentBytes(numDocs), maxWaitNanos, loader);
     if (lease == null) {
       _stats.markLoadWaitExpired();
       return null;
     }
     leases.add(lease);
     if (lease.getColumn().getNumValues() != numDocs) {
-      throw new InconsistentResultException("Resident column " + column + " has " + lease.getColumn().getNumValues()
+      throw new InconsistentResultException("Resident column " + name + " has " + lease.getColumn().getNumValues()
           + " values, segment has " + numDocs + " documents");
     }
     return lease.getColumn();
@@ -366,28 +413,14 @@ final class GpuSegmentAggregator {
     Dictionary dictionary = dataSource.getDictionary();
     ForwardIndexReaderContext context = reader.createContext();
     try {
-      int[] docIds = new int[READ_CHUNK_SIZE];
-      return _backend.uploadIntColumn(numDocs, (start, length, buffer) -> {
-        QueryThreadContext.checkTerminationAndSampleUsage("GpuSegmentAggregator");
-        int done = 0;
-        while (done < length) {
-          int n = Math.min(READ_CHUNK_SIZE, length - done);
-          for (int i = 0; i < n; i++) {
-            docIds[i] = start + done + i;
+      return upload(numDocs, (docIds, n, out) -> {
+        if (reader.isDictionaryEncoded()) {
+          reader.readDictIds(docIds, n, out, context);
+          if (intValues) {
+            dictionary.readIntValues(out, n, out);
           }
-          int[] out = done == 0 && n == length ? buffer : new int[n];
-          if (reader.isDictionaryEncoded()) {
-            reader.readDictIds(docIds, n, out, context);
-            if (intValues) {
-              dictionary.readIntValues(out, n, out);
-            }
-          } else {
-            reader.readValuesSV(docIds, n, out, context);
-          }
-          if (out != buffer) {
-            System.arraycopy(out, 0, buffer, done, n);
-          }
-          done += n;
+        } else {
+          reader.readValuesSV(docIds, n, out, context);
         }
       });
     } finally {
@@ -395,6 +428,61 @@ final class GpuSegmentAggregator {
         context.close();
       }
     }
+  }
+
+  /// Streams the combined group ids of the GROUP BY columns to the device, reading each column's dictionary ids.
+  @SuppressWarnings("unchecked")
+  private GpuColumn uploadCombinedKeys(int numDocs) {
+    int numColumns = _groupByColumns.length;
+    ForwardIndexReader<ForwardIndexReaderContext>[] readers = new ForwardIndexReader[numColumns];
+    ForwardIndexReaderContext[] contexts = new ForwardIndexReaderContext[numColumns];
+    try {
+      for (int c = 0; c < numColumns; c++) {
+        readers[c] = (ForwardIndexReader<ForwardIndexReaderContext>) _segment.getDataSource(_groupByColumns[c])
+            .getForwardIndex();
+        contexts[c] = readers[c].createContext();
+      }
+      int[][] dictIds = new int[numColumns][READ_CHUNK_SIZE];
+      return upload(numDocs, (docIds, n, out) -> {
+        for (int c = 0; c < numColumns; c++) {
+          readers[c].readDictIds(docIds, n, dictIds[c], contexts[c]);
+        }
+        _groupKeys.encode(dictIds, n, out);
+      });
+    } finally {
+      for (ForwardIndexReaderContext context : contexts) {
+        if (context != null) {
+          context.close();
+        }
+      }
+    }
+  }
+
+  /// Reads the values of `n` documents into `out`.
+  private interface DocReader {
+    void read(int[] docIds, int n, int[] out);
+  }
+
+  /// Uploads a column of `numDocs` values, read in chunks of at most [#READ_CHUNK_SIZE] consecutive documents.
+  private GpuColumn upload(int numDocs, DocReader docReader) {
+    int[] docIds = new int[READ_CHUNK_SIZE];
+    int[] chunk = new int[READ_CHUNK_SIZE];
+    return _backend.uploadIntColumn(numDocs, (start, length, buffer) -> {
+      QueryThreadContext.checkTerminationAndSampleUsage("GpuSegmentAggregator");
+      int done = 0;
+      while (done < length) {
+        int n = Math.min(READ_CHUNK_SIZE, length - done);
+        for (int i = 0; i < n; i++) {
+          docIds[i] = start + done + i;
+        }
+        int[] out = done == 0 && n == length ? buffer : chunk;
+        docReader.read(docIds, n, out);
+        if (out != buffer) {
+          System.arraycopy(out, 0, buffer, done, n);
+        }
+        done += n;
+      }
+    });
   }
 
   /// Converts the filter result to the bitmap layout of [GpuBackend#uploadFilter], one Roaring container at a time.

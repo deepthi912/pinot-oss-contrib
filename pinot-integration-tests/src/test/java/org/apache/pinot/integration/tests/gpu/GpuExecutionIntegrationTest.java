@@ -72,23 +72,29 @@ public class GpuExecutionIntegrationTest extends BaseClusterIntegrationTest {
     waitForAllDocsLoaded(600_000L);
   }
 
+  /// Each query with a fragment its EXPLAIN plan must contain.
   @DataProvider
   public Object[][] queries() {
     return new Object[][]{
-        {"SELECT Carrier, COUNT(*) FROM mytable GROUP BY Carrier ORDER BY Carrier LIMIT 100"},
-        {"SELECT DayOfWeek, COUNT(*) FROM mytable GROUP BY DayOfWeek ORDER BY COUNT(*) DESC, DayOfWeek LIMIT 10"},
+        {"SELECT Carrier, COUNT(*) FROM mytable GROUP BY Carrier ORDER BY Carrier LIMIT 100",
+            "GPU_GROUP_BY(backend:"},
+        {"SELECT DayOfWeek, COUNT(*) FROM mytable GROUP BY DayOfWeek ORDER BY COUNT(*) DESC, DayOfWeek LIMIT 10",
+            "GPU_GROUP_BY(backend:"},
         {"SELECT OriginState, COUNT(*) FROM mytable WHERE DayOfWeek > 2 GROUP BY OriginState "
-            + "ORDER BY OriginState LIMIT 100"},
+            + "ORDER BY OriginState LIMIT 100", "GPU_GROUP_BY(backend:"},
         {"SELECT Carrier, SUM(Distance), AVG(ActualElapsedTime), DISTINCTCOUNT(Origin) FROM mytable "
-            + "GROUP BY Carrier ORDER BY Carrier LIMIT 100"},
+            + "GROUP BY Carrier ORDER BY Carrier LIMIT 100", "GPU_GROUP_BY(backend:"},
         {"SELECT DayOfWeek, DISTINCTCOUNT(Dest) FROM mytable GROUP BY DayOfWeek "
-            + "ORDER BY DISTINCTCOUNT(Dest) DESC, DayOfWeek LIMIT 3"},
-        {"SELECT SUM(Distance), AVG(CRSDepTime), DISTINCTCOUNT(FlightNum) FROM mytable WHERE DayOfWeek > 2"}
+            + "ORDER BY DISTINCTCOUNT(Dest) DESC, DayOfWeek LIMIT 3", "GPU_GROUP_BY(backend:"},
+        {"SELECT SUM(Distance), AVG(CRSDepTime), DISTINCTCOUNT(FlightNum) FROM mytable WHERE DayOfWeek > 2",
+            "GPU_AGGREGATE(backend:"},
+        {"SELECT Carrier, DayOfWeek, COUNT(*), SUM(Distance) FROM mytable GROUP BY Carrier, DayOfWeek "
+            + "ORDER BY Carrier, DayOfWeek LIMIT 100", "groupKeys:Carrier, DayOfWeek, aggregations:"}
     };
   }
 
   @Test(dataProvider = "queries")
-  public void testGpuResultsMatchCpu(String query)
+  public void testGpuResultsMatchCpu(String query, String explain)
       throws Exception {
     JsonNode cpu = postQuery("SET useMultistageEngine = false; SET useGpu = false; " + query);
     int callsBefore = TestGpuBackendProvider.getNumBackendCalls();
@@ -100,15 +106,14 @@ public class GpuExecutionIntegrationTest extends BaseClusterIntegrationTest {
   }
 
   @Test(dataProvider = "queries")
-  public void testExplainShowsGpuOperator(String query)
+  public void testExplainShowsGpuOperator(String query, String explain)
       throws Exception {
     JsonNode plan = postQuery("SET useMultistageEngine = false; SET useGpu = true; EXPLAIN PLAN FOR " + query);
-    String operator = query.contains("GROUP BY") ? "GPU_GROUP_BY" : "GPU_AGGREGATE";
-    assertTrue(plan.toString().contains(operator), plan.toString());
+    assertTrue(plan.toString().contains(explain), plan.toString());
   }
 
   @Test(dataProvider = "queries")
-  public void testMultiStageEngineStaysOnCpu(String query)
+  public void testMultiStageEngineStaysOnCpu(String query, String explain)
       throws Exception {
     JsonNode cpu = postQuery("SET useMultistageEngine = true; SET useGpu = false; " + query);
     int callsBefore = TestGpuBackendProvider.getNumBackendCalls();

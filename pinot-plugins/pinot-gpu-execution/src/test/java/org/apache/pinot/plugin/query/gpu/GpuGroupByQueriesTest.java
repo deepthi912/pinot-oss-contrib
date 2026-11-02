@@ -247,7 +247,28 @@ public class GpuGroupByQueriesTest extends BaseQueriesTest {
         {"SELECT dimStr, DISTINCTCOUNT(dimInt), SUM(dimInt) FROM testTable GROUP BY dimStr ORDER BY dimStr LIMIT 1000"},
         {"SELECT SUM(metric), DISTINCTCOUNT(metric), COUNT(*) FROM testTable WHERE metric > 100"},
         {"SELECT SUM(rawMetric), AVG(rawMetric), DISTINCTCOUNT(dimStr), COUNT(*) FROM testTable WHERE metric > 100"},
-        {"SELECT DISTINCTCOUNT(dimHigh) FROM testTable WHERE dimBool = true"}
+        {"SELECT DISTINCTCOUNT(dimHigh) FROM testTable WHERE dimBool = true"},
+        // Several GROUP BY columns: up to three keys of mixed types, both sort-aggregate directions with segment trim,
+        // HAVING, a filter, and ORDER BY an aggregation.
+        {"SELECT dimStr, dimBool, COUNT(*), SUM(metric), AVG(rawMetric), DISTINCTCOUNT(dimInt) FROM testTable "
+            + "GROUP BY dimStr, dimBool ORDER BY dimStr, dimBool LIMIT 1000"},
+        {"SET minSegmentGroupTrimSize = 10; SELECT dimStr, dimFloat, COUNT(*), SUM(metric) FROM testTable "
+            + "GROUP BY dimStr, dimFloat ORDER BY dimStr, dimFloat LIMIT 7"},
+        {"SET minSegmentGroupTrimSize = 10; SELECT dimStr, dimFloat, COUNT(*), SUM(metric) FROM testTable "
+            + "GROUP BY dimStr, dimFloat ORDER BY dimStr DESC, dimFloat DESC LIMIT 7"},
+        {"SELECT dimStr, dimBool, dimFloat, COUNT(*), SUM(metric) FROM testTable GROUP BY dimStr, dimBool, dimFloat "
+            + "ORDER BY dimStr, dimBool, dimFloat LIMIT 9000"},
+        {"SELECT dimBytes, dimBool, dimLong, COUNT(*) FROM testTable GROUP BY dimBytes, dimBool, dimLong "
+            + "ORDER BY dimBytes DESC, dimBool DESC, dimLong DESC LIMIT 20"},
+        {"SELECT dimStr, dimBool, COUNT(*) AS c FROM testTable GROUP BY dimStr, dimBool HAVING c > 100 "
+            + "ORDER BY dimStr, dimBool LIMIT 1000"},
+        {"SELECT dimStr, dimBool, SUM(metric) FROM testTable WHERE metric > 100 GROUP BY dimStr, dimBool "
+            + "ORDER BY dimStr DESC, dimBool DESC LIMIT 5"},
+        {"SELECT dimStr, dimBool, COUNT(*) FROM testTable GROUP BY dimStr, dimBool "
+            + "ORDER BY COUNT(*) DESC, dimStr, dimBool LIMIT 5"},
+        // LIMIT above the sort-aggregate threshold: all groups are emitted, whatever the ORDER BY.
+        {"SELECT dimHigh, dimBool, SUM(rawMetric), AVG(metric) FROM testTable GROUP BY dimHigh, dimBool "
+            + "ORDER BY dimBool DESC, dimHigh LIMIT 20000"}
     };
   }
 
@@ -261,7 +282,17 @@ public class GpuGroupByQueriesTest extends BaseQueriesTest {
         // Without a filter, Pinot answers these from the dictionary or metadata without scanning.
         {"SELECT DISTINCTCOUNT(dimStr) FROM testTable"},
         {"SELECT COUNT(*), DISTINCTCOUNT(dimStr) FROM testTable"},
+        // 100 x 1000 possible groups reach the default numGroupsLimit.
         {"SELECT dimStr, dimInt, COUNT(*) FROM testTable GROUP BY dimStr, dimInt ORDER BY dimStr, dimInt LIMIT 100"},
+        // Above the dense-key bound, even when numGroupsLimit allows them.
+        {"SET numGroupsLimit = 10000000; SELECT dimHigh, dimInt, COUNT(*) FROM testTable GROUP BY dimHigh, dimInt "
+            + "ORDER BY dimHigh, dimInt LIMIT 10"},
+        // Sort-aggregate in an order the dense key does not give.
+        {"SELECT dimStr, dimBool, COUNT(*) FROM testTable GROUP BY dimStr, dimBool "
+            + "ORDER BY dimStr ASC, dimBool DESC LIMIT 5"},
+        {"SELECT dimStr, dimBool, COUNT(*) FROM testTable GROUP BY dimStr, dimBool ORDER BY dimBool, dimStr LIMIT 5"},
+        {"SELECT dimStr, rawStr, COUNT(*) FROM testTable GROUP BY dimStr, rawStr ORDER BY dimStr, rawStr LIMIT 100"},
+        {"SELECT dimStr, mvInt, COUNT(*) FROM testTable GROUP BY dimStr, mvInt ORDER BY dimStr, mvInt LIMIT 100"},
         {"SELECT rawStr, COUNT(*) FROM testTable GROUP BY rawStr ORDER BY rawStr LIMIT 1000"},
         {"SELECT mvInt, COUNT(*) FROM testTable GROUP BY mvInt ORDER BY mvInt LIMIT 1000"},
         {"SELECT dimStr FROM testTable ORDER BY dimStr LIMIT 10"},
@@ -307,7 +338,9 @@ public class GpuGroupByQueriesTest extends BaseQueriesTest {
         {GROUP_BY_VALUES_QUERY}, {AGGREGATION_QUERY},
         // DISTINCTCOUNT without SUM/AVG, so the distinct-result validation is what triggers the fallback.
         {"SELECT dimStr, DISTINCTCOUNT(dimInt) FROM testTable GROUP BY dimStr ORDER BY dimStr LIMIT 1000"},
-        {"SELECT DISTINCTCOUNT(dimStr), COUNT(*) FROM testTable WHERE metric > 100"}
+        {"SELECT DISTINCTCOUNT(dimStr), COUNT(*) FROM testTable WHERE metric > 100"},
+        {"SELECT dimStr, dimBool, SUM(metric), DISTINCTCOUNT(dimInt) FROM testTable GROUP BY dimStr, dimBool "
+            + "ORDER BY dimStr, dimBool LIMIT 1000"}
     };
   }
 
@@ -363,7 +396,10 @@ public class GpuGroupByQueriesTest extends BaseQueriesTest {
         "SELECT SUM(metric), AVG(rawMetric), DISTINCTCOUNT(dimStr) FROM testTable WHERE dimInt < 20",
         // 1000 x 5000 (group, value) bits per segment: more bitmap words than matching documents.
         "SELECT dimInt, DISTINCTCOUNT(dimHigh) FROM testTable WHERE metric > 100 GROUP BY dimInt "
-            + "ORDER BY dimInt LIMIT 2000")) {
+            + "ORDER BY dimInt LIMIT 2000",
+        // 200 x 5000 bits for the combined key: same rule.
+        "SELECT dimStr, dimBool, DISTINCTCOUNT(dimHigh) FROM testTable WHERE metric > 100 GROUP BY dimStr, dimBool "
+            + "ORDER BY dimStr, dimBool LIMIT 1000")) {
       assertSameResponse(getBrokerResponse(query, _gpuPlanMaker), getBrokerResponse(query, _cpuPlanMaker), query);
       GpuQueryStats selective = executeAndGetStats(_gpuPlanMaker, query);
       assertEquals(selective.getSegmentsOnGpu(), 0, selective.toString());
@@ -372,12 +408,49 @@ public class GpuGroupByQueriesTest extends BaseQueriesTest {
   }
 
   @Test
-  public void testResidentColumnsAreReused() {
-    String query = "SELECT dimInt, COUNT(*) FROM testTable WHERE metric < 0 GROUP BY dimInt ORDER BY dimInt LIMIT 10";
-    assertSameResults(query, _gpuPlanMaker, _gpuProvider, true);
+  public void testSparseCombinedKeyStaysOnCpu()
+      throws Exception {
+    // 5000 x 100 and 1000 x 100 groups for about 9000 and 20000 matching documents per segment.
+    for (String query : List.of(
+        "SET numGroupsLimit = 1000000; SELECT dimHigh, dimStr, COUNT(*), SUM(metric) FROM testTable "
+            + "WHERE metric > 100 GROUP BY dimHigh, dimStr ORDER BY dimHigh, dimStr LIMIT 10",
+        "SET numGroupsLimit = 200000; SELECT dimInt, dimStr, COUNT(*), SUM(metric) FROM testTable "
+            + "GROUP BY dimInt, dimStr ORDER BY dimInt DESC, dimStr DESC LIMIT 7")) {
+      assertSameResults(query, _gpuPlanMaker, _gpuProvider, false);
+      GpuQueryStats stats = executeAndGetStats(_gpuPlanMaker, query);
+      assertEquals(stats.getSegmentsOnGpu(), 0, stats.toString());
+      assertEquals(stats.getSegmentsSelectiveOnCpu(), _indexSegments.size(), stats.toString());
+    }
+    // 100 x 40 groups for the same filter: dense enough for the GPU.
+    String dense = "SELECT dimStr, dimFloat, COUNT(*), SUM(metric) FROM testTable WHERE metric > 100 "
+        + "GROUP BY dimStr, dimFloat ORDER BY dimStr, dimFloat LIMIT 10";
+    assertSameResults(dense, _gpuPlanMaker, _gpuProvider, true);
+    GpuQueryStats stats = executeAndGetStats(_gpuPlanMaker, dense);
+    assertEquals(stats.getSegmentsOnGpu(), _indexSegments.size(), stats.toString());
+  }
+
+  @Test
+  public void testColumnOrderGetsItsOwnCombinedKey() {
+    String select = "SELECT dimFloat, dimBool, COUNT(*), SUM(metric) FROM testTable WHERE metric > -500 ";
+    assertSameResults(select + "GROUP BY dimFloat, dimBool ORDER BY dimFloat, dimBool LIMIT 100", _gpuPlanMaker,
+        _gpuProvider, true);
     int uploads = _gpuProvider.getNumUploads();
-    assertSameResults(query, _gpuPlanMaker, _gpuProvider, true);
-    assertEquals(_gpuProvider.getNumUploads(), uploads, "second query must reuse the resident columns");
+    assertSameResults(select + "GROUP BY dimBool, dimFloat ORDER BY dimBool, dimFloat LIMIT 100", _gpuPlanMaker,
+        _gpuProvider, true);
+    assertTrue(_gpuProvider.getNumUploads() > uploads, "reversed GROUP BY columns must upload their own key");
+  }
+
+  @Test
+  public void testResidentColumnsAreReused() {
+    for (String query : List.of(
+        "SELECT dimInt, COUNT(*) FROM testTable WHERE metric < 0 GROUP BY dimInt ORDER BY dimInt LIMIT 10",
+        "SELECT dimInt, dimBool, COUNT(*) FROM testTable WHERE metric < 0 GROUP BY dimInt, dimBool "
+            + "ORDER BY dimInt, dimBool LIMIT 10")) {
+      assertSameResults(query, _gpuPlanMaker, _gpuProvider, true);
+      int uploads = _gpuProvider.getNumUploads();
+      assertSameResults(query, _gpuPlanMaker, _gpuProvider, true);
+      assertEquals(_gpuProvider.getNumUploads(), uploads, "second query must reuse the resident columns: " + query);
+    }
   }
 
   @Test

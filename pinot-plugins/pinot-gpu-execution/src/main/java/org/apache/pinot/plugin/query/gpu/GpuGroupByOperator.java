@@ -21,6 +21,7 @@ package org.apache.pinot.plugin.query.gpu;
 import java.util.ArrayList;
 import java.util.List;
 import javax.annotation.Nullable;
+import org.apache.pinot.common.request.context.ExpressionContext;
 import org.apache.pinot.common.utils.DataSchema;
 import org.apache.pinot.common.utils.DataSchema.ColumnDataType;
 import org.apache.pinot.core.common.Operator;
@@ -43,7 +44,7 @@ import org.apache.pinot.segment.spi.index.reader.Dictionary;
 import org.roaringbitmap.buffer.ImmutableRoaringBitmap;
 
 
-/// Segment-level aggregation GROUP BY one dictionary column on a GPU backend ([GpuSegmentAggregator]), producing the
+/// Segment-level aggregation GROUP BY dictionary columns on a GPU backend ([GpuSegmentAggregator]), producing the
 /// same [GroupByResultsBlock] as [GroupByOperator]; runs [GroupByOperator] over the filter result when the segment
 /// is routed to the CPU. Not thread-safe; used by one thread.
 public class GpuGroupByOperator extends BaseOperator<GroupByResultsBlock> {
@@ -55,7 +56,7 @@ public class GpuGroupByOperator extends BaseOperator<GroupByResultsBlock> {
   private final BaseFilterOperator _filterOperator;
   private final GpuBackend _backend;
   private final GpuSegmentAggregator _aggregator;
-  private final String _groupByColumn;
+  private final String[] _groupByColumns;
   private final DataSchema _dataSchema;
   @Nullable
   private GroupByOperator _cpuOperator;
@@ -68,17 +69,22 @@ public class GpuGroupByOperator extends BaseOperator<GroupByResultsBlock> {
     _filterOperator = filterOperator;
     _backend = backend;
     _aggregator = new GpuSegmentAggregator(_indexSegment, queryContext, filterOperator, backend, columnCache, stats);
-    _groupByColumn = queryContext.getGroupByExpressions().get(0).getIdentifier();
+    List<ExpressionContext> groupByExpressions = queryContext.getGroupByExpressions();
+    int numKeys = groupByExpressions.size();
+    _groupByColumns = new String[numKeys];
 
     AggregationFunction[] functions = queryContext.getAggregationFunctions();
-    String[] columnNames = new String[1 + functions.length];
-    ColumnDataType[] columnDataTypes = new ColumnDataType[1 + functions.length];
-    columnNames[0] = _groupByColumn;
-    columnDataTypes[0] = ColumnDataType.fromDataTypeSV(
-        _indexSegment.getDataSource(_groupByColumn).getDataSourceMetadata().getDataType());
+    String[] columnNames = new String[numKeys + functions.length];
+    ColumnDataType[] columnDataTypes = new ColumnDataType[numKeys + functions.length];
+    for (int i = 0; i < numKeys; i++) {
+      _groupByColumns[i] = groupByExpressions.get(i).getIdentifier();
+      columnNames[i] = _groupByColumns[i];
+      columnDataTypes[i] = ColumnDataType.fromDataTypeSV(
+          _indexSegment.getDataSource(_groupByColumns[i]).getDataSourceMetadata().getDataType());
+    }
     for (int i = 0; i < functions.length; i++) {
-      columnNames[i + 1] = functions[i].getResultColumnName();
-      columnDataTypes[i + 1] = functions[i].getIntermediateResultColumnType();
+      columnNames[numKeys + i] = functions[i].getResultColumnName();
+      columnDataTypes[numKeys + i] = functions[i].getIntermediateResultColumnType();
     }
     _dataSchema = new DataSchema(columnNames, columnDataTypes);
   }
@@ -93,11 +99,14 @@ public class GpuGroupByOperator extends BaseOperator<GroupByResultsBlock> {
       return computeOnCpu(_aggregator.getMatchingDocs());
     }
 
-    // Sorted dictionaries give ORDER BY order on the group key. Under sort-aggregate (safe trim, LIMIT below the
-    // threshold) this keeps the first trim-size groups like GroupByOperator. Otherwise all groups are emitted, where
-    // GroupByOperator under safe trim keeps only LIMIT of them when there are more: a superset the combine trims
-    // to the same result.
-    Dictionary dictionary = _indexSegment.getDataSource(_groupByColumn).getDictionary();
+    // Under sort-aggregate, group ids walked in the ORDER BY direction are in ORDER BY order (GpuQueryEligibility), so
+    // the first trim-size groups match GroupByOperator. Otherwise all groups are emitted: a superset the combine trims.
+    GpuGroupKeys groupKeys = _aggregator.getGroupKeys();
+    int numKeys = _groupByColumns.length;
+    Dictionary[] dictionaries = new Dictionary[numKeys];
+    for (int c = 0; c < numKeys; c++) {
+      dictionaries[c] = _indexSegment.getDataSource(_groupByColumns[c]).getDictionary();
+    }
     boolean sorted = _queryContext.shouldSortAggregateUnderSafeTrim();
     boolean ascending = !sorted || _queryContext.getOrderByExpressions().get(0).isAsc();
     int maxGroups = sorted && _queryContext.getEffectiveSegmentGroupTrimSize() > 0
@@ -111,17 +120,20 @@ public class GpuGroupByOperator extends BaseOperator<GroupByResultsBlock> {
     }
     List<IntermediateRecord> records = new ArrayList<>(Math.min(numGroups, maxGroups));
     for (int i = 0; i < result._numGroups && records.size() < maxGroups; i++) {
-      int dictId = ascending ? i : result._numGroups - 1 - i;
-      if (result._counts[dictId] == 0) {
+      int groupId = ascending ? i : result._numGroups - 1 - i;
+      if (result._counts[groupId] == 0) {
         continue;
       }
-      Object key = dictionary.getInternal(dictId);
-      Object[] row = new Object[1 + numFunctions];
-      row[0] = key;
-      for (int f = 0; f < numFunctions; f++) {
-        row[1 + f] = result.getValue(f, dictId);
+      Object[] keys = new Object[numKeys];
+      Object[] row = new Object[numKeys + numFunctions];
+      for (int c = 0; c < numKeys; c++) {
+        keys[c] = dictionaries[c].getInternal(groupKeys.decodeDictId(groupId, c));
+        row[c] = keys[c];
       }
-      records.add(IntermediateRecord.withoutOrderByValues(new Key(new Object[]{key}), new Record(row)));
+      for (int f = 0; f < numFunctions; f++) {
+        row[numKeys + f] = result.getValue(f, groupId);
+      }
+      records.add(IntermediateRecord.withoutOrderByValues(new Key(keys), new Record(row)));
     }
     GroupByResultsBlock resultsBlock = new GroupByResultsBlock(_dataSchema, records, _queryContext);
     resultsBlock.setNumGroupsWarningLimitReached(numGroups >= _queryContext.getNumGroupsWarningLimit());
@@ -162,7 +174,7 @@ public class GpuGroupByOperator extends BaseOperator<GroupByResultsBlock> {
 
   @Override
   public String toExplainString() {
-    return EXPLAIN_NAME + "(backend:" + _backend.getName() + ", groupKeys:" + _groupByColumn + ", aggregations:"
-        + GpuAggregationOperator.explainAggregations(_queryContext) + ')';
+    return EXPLAIN_NAME + "(backend:" + _backend.getName() + ", groupKeys:" + String.join(", ", _groupByColumns)
+        + ", aggregations:" + GpuAggregationOperator.explainAggregations(_queryContext) + ')';
   }
 }
