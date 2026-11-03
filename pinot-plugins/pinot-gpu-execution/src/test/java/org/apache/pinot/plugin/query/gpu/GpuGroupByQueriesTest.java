@@ -23,6 +23,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
+import javax.annotation.Nullable;
 import org.apache.commons.io.FileUtils;
 import org.apache.pinot.common.datatable.DataTableFactory;
 import org.apache.pinot.common.request.BrokerRequest;
@@ -75,7 +76,6 @@ import static org.testng.Assert.assertEquals;
 import static org.testng.Assert.assertFalse;
 import static org.testng.Assert.assertThrows;
 import static org.testng.Assert.assertTrue;
-import static org.testng.Assert.fail;
 
 
 /// Runs every query through the regular CPU plan maker and through [GpuPlanMaker], end to end (segment plan, combine,
@@ -89,7 +89,6 @@ public class GpuGroupByQueriesTest extends BaseQueriesTest {
   private static final File INDEX_DIR = new File(FileUtils.getTempDirectory(), "GpuGroupByQueriesTest");
   private static final String TABLE = "testTable";
   private static final int NUM_ROWS_PER_SEGMENT = 20_003;
-  private static final String METAL_PROPERTY = "pinot.gpu.metal";
   private static final String QUERY =
       "SELECT dimStr, COUNT(*) FROM testTable GROUP BY dimStr ORDER BY dimStr LIMIT 1000";
   private static final String GROUP_BY_VALUES_QUERY = "SELECT dimStr, SUM(metric), AVG(rawMetric), "
@@ -485,6 +484,11 @@ public class GpuGroupByQueriesTest extends BaseQueriesTest {
     assertEquals(stats.getSegmentsOnGpu(), _indexSegments.size(), stats.toString());
     assertEquals(stats.getSegmentsFallbackToCpu(), 0, stats.toString());
 
+    checkSelectiveQueriesStayOnCpu(_gpuPlanMaker);
+  }
+
+  private void checkSelectiveQueriesStayOnCpu(GpuPlanMaker planMaker)
+      throws Exception {
     for (String query : List.of(
         "SELECT dimStr, COUNT(*) FROM testTable WHERE dimInt < 20 GROUP BY dimStr ORDER BY dimStr LIMIT 1000",
         "SELECT SUM(metric), AVG(rawMetric), DISTINCTCOUNT(dimStr) FROM testTable WHERE dimInt < 20",
@@ -494,8 +498,8 @@ public class GpuGroupByQueriesTest extends BaseQueriesTest {
         // 200 x 5000 bits for the combined key: same rule.
         "SELECT dimStr, dimBool, DISTINCTCOUNT(dimHigh) FROM testTable WHERE metric > 100 GROUP BY dimStr, dimBool "
             + "ORDER BY dimStr, dimBool LIMIT 1000")) {
-      assertSameResponse(getBrokerResponse(query, _gpuPlanMaker), getBrokerResponse(query, _cpuPlanMaker), query);
-      GpuQueryStats selective = executeAndGetStats(_gpuPlanMaker, query);
+      assertSameResponse(getBrokerResponse(query, planMaker), getBrokerResponse(query, _cpuPlanMaker), query);
+      GpuQueryStats selective = executeAndGetStats(planMaker, query);
       assertEquals(selective.getSegmentsOnGpu(), 0, selective.toString());
       assertEquals(selective.getSegmentsSelectiveOnCpu(), _indexSegments.size(), selective.toString());
     }
@@ -595,6 +599,12 @@ public class GpuGroupByQueriesTest extends BaseQueriesTest {
   @Test
   public void testQueryableDocIdsSnapshotMatchesCpu()
       throws Exception {
+    checkQueryableDocIdsSnapshot(_gpuPlanMaker, _gpuProvider);
+  }
+
+  /// `provider` is the plan maker's test backend, whose calls are counted, or `null` for a discovered backend.
+  private void checkQueryableDocIdsSnapshot(GpuPlanMaker planMaker, @Nullable JavaGpuBackendProvider provider)
+      throws Exception {
     Random random = new Random(3);
     List<SegmentContext> segmentContexts = new ArrayList<>();
     for (IndexSegment segment : _indexSegments) {
@@ -617,12 +627,14 @@ public class GpuGroupByQueriesTest extends BaseQueriesTest {
         "SELECT dimStr, SUM(metric), DISTINCTCOUNT(dimInt) FROM testTable WHERE metric > 0 GROUP BY dimStr "
             + "ORDER BY dimStr LIMIT 1000")) {
       BrokerResponseNative expected = getBrokerResponse(query, _cpuPlanMaker, segmentContexts);
-      int callsBefore = _gpuProvider.getNumBackendCalls();
-      BrokerResponseNative actual = getBrokerResponse(query, _gpuPlanMaker, segmentContexts);
+      int callsBefore = provider != null ? provider.getNumBackendCalls() : 0;
+      BrokerResponseNative actual = getBrokerResponse(query, planMaker, segmentContexts);
       assertSameResponse(actual, expected, query);
-      assertTrue(_gpuProvider.getNumBackendCalls() > callsBefore, query);
+      if (provider != null) {
+        assertTrue(provider.getNumBackendCalls() > callsBefore, query);
+      }
       assertTrue(expected.getNumDocsScanned() < (long) NUM_ROWS_PER_SEGMENT * _indexSegments.size(), query);
-      GpuQueryStats stats = executeAndGetStats(_gpuPlanMaker, query, segmentContexts);
+      GpuQueryStats stats = executeAndGetStats(planMaker, query, segmentContexts);
       assertEquals(stats.getSegmentsOnGpu(), _indexSegments.size(), query + " " + stats);
     }
   }
@@ -688,14 +700,7 @@ public class GpuGroupByQueriesTest extends BaseQueriesTest {
   @Test
   public void testMetalBackendEndToEnd()
       throws Exception {
-    GpuBackendProvider.Availability availability = new MetalGpuBackendProvider().probe();
-    if (!availability.isAvailable()) {
-      if (Boolean.getBoolean(METAL_PROPERTY)) {
-        fail("-D" + METAL_PROPERTY + "=true but the Metal backend is unavailable: " + availability);
-      }
-      throw new SkipException("Metal backend not available: " + availability);
-    }
-    GpuPlanMaker metalPlanMaker = gpuPlanMaker(null);
+    GpuPlanMaker metalPlanMaker = MetalTestSupport.metalPlanMaker();
     try {
       assertEquals(metalPlanMaker.getRouter().decide(GpuQueryOptions.NONE, 1).getBackend().getType(),
           GpuBackendType.METAL);
@@ -713,6 +718,8 @@ public class GpuGroupByQueriesTest extends BaseQueriesTest {
         assertEquals(stats.getSegmentsFallbackToCpu(), 0, stats.toString());
         assertTrue(stats.getGpuKernelNs() > 0, stats.toString());
       }
+      checkQueryableDocIdsSnapshot(metalPlanMaker, null);
+      checkSelectiveQueriesStayOnCpu(metalPlanMaker);
       checkMetalKernels(metalPlanMaker.getRouter().decide(GpuQueryOptions.NONE, 1).getBackend());
     } finally {
       metalPlanMaker.close();
@@ -766,6 +773,8 @@ public class GpuGroupByQueriesTest extends BaseQueriesTest {
       assertEquals(result.getSums(), expectedGroupSums);
     }
 
+    checkMetalSliceBoundary(metal);
+
     // Filtered kernels without group keys, and grouped distinct pairs: every 3rd document matches.
     int numDocs = 300_001;
     int[] filterWords = new int[(numDocs + 31) >>> 5];
@@ -802,6 +811,55 @@ public class GpuGroupByQueriesTest extends BaseQueriesTest {
         }
       }
     }
+  }
+
+  /// Low-cardinality SUM kernel past 512 slices of kMaxRowsPerSlice rows (metal_ops.mm), where the rows per slice stop
+  /// growing and the slice count does; columns are generated chunk by chunk to keep the heap small.
+  private static void checkMetalSliceBoundary(GpuBackend metal) {
+    int numRows = 512 * 65536 + 4097;
+    int numGroups = 1024;
+    long[] expectedSums = new long[numGroups];
+    long[] expectedCounts = new long[numGroups];
+    int[] filterWords = new int[(numRows + 31) >>> 5];
+    long expectedFilteredCount = 0;
+    long expectedFilteredSum = 0;
+    for (int i = 0; i < numRows; i++) {
+      int key = sliceBoundaryKey(i);
+      int value = sliceBoundaryValue(i);
+      expectedSums[key] += value;
+      expectedCounts[key]++;
+      if (key % 5 != 0) {
+        filterWords[i >>> 5] |= 1 << i;
+        expectedFilteredCount++;
+        expectedFilteredSum += value;
+      }
+    }
+    try (GpuColumn keys = metal.uploadIntColumn(numRows, (start, length, buffer) -> {
+      for (int i = 0; i < length; i++) {
+        buffer[i] = sliceBoundaryKey(start + i);
+      }
+    }); GpuColumn values = metal.uploadIntColumn(numRows, (start, length, buffer) -> {
+      for (int i = 0; i < length; i++) {
+        buffer[i] = sliceBoundaryValue(start + i);
+      }
+    }); GpuColumn filter = metal.uploadFilter(filterWords)) {
+      GpuAggregationResult grouped = metal.aggregate(keys, numGroups, values, numRows, null);
+      assertEquals(grouped.getCounts(), expectedCounts);
+      assertEquals(grouped.getSums(), expectedSums);
+      GpuAggregationResult total = metal.aggregate(null, 1, values, numRows, filter);
+      assertEquals(total.getCounts(), new long[]{expectedFilteredCount});
+      assertEquals(total.getSums(), new long[]{expectedFilteredSum});
+    }
+  }
+
+  private static int sliceBoundaryKey(int row) {
+    return (int) ((row * 0x9E3779B97F4A7C15L) >>> 54);
+  }
+
+  private static int sliceBoundaryValue(int row) {
+    // Full int range, extremes included.
+    return row % 97 == 0 ? (row % 2 == 0 ? Integer.MAX_VALUE : Integer.MIN_VALUE)
+        : (int) ((row * 0x2545F4914F6CDD1DL) >>> 32);
   }
 
   /// After close, calls are rejected (the plan falls back to the CPU) and a column still leased by a query can be

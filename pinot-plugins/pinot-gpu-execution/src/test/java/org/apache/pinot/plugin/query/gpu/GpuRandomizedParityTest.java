@@ -43,7 +43,6 @@ import org.apache.pinot.core.query.request.context.QueryContext;
 import org.apache.pinot.core.query.request.context.utils.QueryContextConverterUtils;
 import org.apache.pinot.core.transport.ServerRoutingInstance;
 import org.apache.pinot.plugin.query.gpu.JavaGpuBackendProvider.Behavior;
-import org.apache.pinot.plugin.query.gpu.metal.MetalGpuBackendProvider;
 import org.apache.pinot.queries.BaseQueriesTest;
 import org.apache.pinot.segment.local.indexsegment.immutable.ImmutableSegmentLoader;
 import org.apache.pinot.segment.local.segment.creator.impl.SegmentIndexCreationDriverImpl;
@@ -63,7 +62,6 @@ import org.apache.pinot.spi.utils.ReadMode;
 import org.apache.pinot.spi.utils.builder.TableConfigBuilder;
 import org.apache.pinot.sql.parsers.CalciteSqlCompiler;
 import org.apache.pinot.sql.parsers.CalciteSqlParser;
-import org.testng.SkipException;
 import org.testng.annotations.AfterClass;
 import org.testng.annotations.BeforeClass;
 import org.testng.annotations.Test;
@@ -85,7 +83,6 @@ import static org.testng.Assert.fail;
 public class GpuRandomizedParityTest extends BaseQueriesTest {
   private static final File INDEX_DIR = new File(FileUtils.getTempDirectory(), "GpuRandomizedParityTest");
   private static final String TABLE = "testTable";
-  private static final String METAL_PROPERTY = "pinot.gpu.metal";
   private static final String SEED_PROPERTY = "pinot.gpu.fuzz.seed";
   private static final String QUERIES_PROPERTY = "pinot.gpu.fuzz.queries";
   private static final long DEFAULT_SEED = 20261103L;
@@ -170,8 +167,8 @@ public class GpuRandomizedParityTest extends BaseQueriesTest {
     return gpuPlanMaker(List.of(new JavaGpuBackendProvider(GpuBackendType.CUDA, true, behavior)));
   }
 
-  private static GpuPlanMaker gpuPlanMaker(@Nullable List<GpuBackendProvider> providers) {
-    GpuPlanMaker planMaker = providers != null ? new GpuPlanMaker(providers) : new GpuPlanMaker();
+  private static GpuPlanMaker gpuPlanMaker(List<GpuBackendProvider> providers) {
+    GpuPlanMaker planMaker = new GpuPlanMaker(providers);
     planMaker.init(new PinotConfiguration(
         Map.of(GpuExecutionConfig.ENABLED, "true", GpuExecutionConfig.MIN_ROWS, "0")));
     return planMaker;
@@ -235,14 +232,7 @@ public class GpuRandomizedParityTest extends BaseQueriesTest {
 
   @Test
   public void testMetalBackendMatchesCpu() {
-    GpuBackendProvider.Availability availability = new MetalGpuBackendProvider().probe();
-    if (!availability.isAvailable()) {
-      if (Boolean.getBoolean(METAL_PROPERTY)) {
-        fail("-D" + METAL_PROPERTY + "=true but the Metal backend is unavailable: " + availability);
-      }
-      throw new SkipException("Metal backend not available: " + availability);
-    }
-    GpuPlanMaker metalPlanMaker = gpuPlanMaker(null);
+    GpuPlanMaker metalPlanMaker = MetalTestSupport.metalPlanMaker();
     try {
       runAll(metalPlanMaker, "metal", true);
     } finally {

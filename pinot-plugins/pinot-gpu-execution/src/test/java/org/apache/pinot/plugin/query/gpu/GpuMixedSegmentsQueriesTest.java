@@ -140,21 +140,41 @@ public class GpuMixedSegmentsQueriesTest extends BaseQueriesTest {
   @Test(dataProvider = "queries")
   public void testMixedSegmentsMatchCpu(String query)
       throws Exception {
+    checkMixedSegments(query, _gpuPlanMaker);
+  }
+
+  @Test
+  public void testMixedSegmentsMatchCpuOnMetal()
+      throws Exception {
+    GpuPlanMaker metalPlanMaker = MetalTestSupport.metalPlanMaker();
+    try {
+      for (Object[] query : queries()) {
+        checkMixedSegments((String) query[0], metalPlanMaker);
+      }
+    } finally {
+      metalPlanMaker.close();
+    }
+  }
+
+  private void checkMixedSegments(String query, GpuPlanMaker gpuPlanMaker)
+      throws Exception {
     BrokerResponseNative expected = getBrokerResponse(query, _cpuPlanMaker);
-    BrokerResponseNative actual = getBrokerResponse(query, _gpuPlanMaker);
+    BrokerResponseNative actual = getBrokerResponse(query, gpuPlanMaker);
     assertTrue(actual.getExceptions().isEmpty(), "GPU failed: " + actual.getExceptions());
     assertEquals(actual.getResultTable().getRows().size(), expected.getResultTable().getRows().size(), query);
     for (int i = 0; i < expected.getResultTable().getRows().size(); i++) {
       assertEquals(actual.getResultTable().getRows().get(i), expected.getResultTable().getRows().get(i), query);
     }
     assertEquals(actual.getNumDocsScanned(), expected.getNumDocsScanned(), query);
+    assertEquals(actual.getNumEntriesScannedInFilter(), expected.getNumEntriesScannedInFilter(), query);
+    assertEquals(actual.getNumEntriesScannedPostFilter(), expected.getNumEntriesScannedPostFilter(), query);
 
-    GpuQueryStats stats = executeAndGetStats(query);
+    GpuQueryStats stats = executeAndGetStats(query, gpuPlanMaker);
     assertEquals(stats.getSegmentsOnGpu(), 2, stats.toString());
     assertEquals(stats.getSegmentsIneligible(), 1, stats.toString());
   }
 
-  private GpuQueryStats executeAndGetStats(String query)
+  private GpuQueryStats executeAndGetStats(String query, GpuPlanMaker gpuPlanMaker)
       throws Exception {
     QueryContext queryContext = QueryContextConverterUtils.getQueryContext(query);
     queryContext.setEndTimeMs(System.currentTimeMillis() + 60_000);
@@ -163,7 +183,7 @@ public class GpuMixedSegmentsQueriesTest extends BaseQueriesTest {
       segmentContexts.add(new SegmentContext(segment));
     }
     try (QueryThreadContext ignore = QueryThreadContext.openForSseTest()) {
-      Plan plan = _gpuPlanMaker.makeInstancePlan(segmentContexts, queryContext, EXECUTOR_SERVICE);
+      Plan plan = gpuPlanMaker.makeInstancePlan(segmentContexts, queryContext, EXECUTOR_SERVICE);
       plan.execute();
       return ((GpuInstancePlan) plan).getStats();
     }
