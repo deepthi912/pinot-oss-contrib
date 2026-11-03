@@ -122,6 +122,7 @@ public class GpuRandomizedParityTest extends BaseQueriesTest {
           "SUM(metric + 1)", "DISTINCTCOUNTHLL(dStr)");
   private static final List<String> UNSUPPORTED_KEYS = List.of("rawMetric", "dInt + 1");
   private static final int[] LIMITS = {1, 3, 10, 50, 1000, 100_000};
+  private static final String SELECTION_ORDER_BY = "SELECT dStr, metric, rawMetric FROM testTable";
 
   private final PlanMaker _cpuPlanMaker = new InstancePlanMakerImplV2();
   private long _seed;
@@ -262,7 +263,7 @@ public class GpuRandomizedParityTest extends BaseQueriesTest {
       if (!expected._response.getExceptions().isEmpty()) {
         cpuErrors++;
       }
-      String difference = compare(actual._response, expected._response, query._ordered);
+      String difference = compare(actual._response, expected._response, query._ordered, query._deterministicScan);
       if (difference != null) {
         mismatches.add(String.format("seed=%d backend=%s query#%d: %s%n  %s%n  gpuStats=%s", _seed, backend, i,
             query._sql, difference, actual._stats));
@@ -291,10 +292,17 @@ public class GpuRandomizedParityTest extends BaseQueriesTest {
     final String _sql;
     // Whether the result rows have a deterministic order; otherwise they are compared as a multiset.
     final boolean _ordered;
+    // Selection ORDER BY skips segments by min/max against a boundary other threads set, so its scan counts vary.
+    final boolean _deterministicScan;
 
     GeneratedQuery(String sql, boolean ordered) {
+      this(sql, ordered, true);
+    }
+
+    GeneratedQuery(String sql, boolean ordered, boolean deterministicScan) {
       _sql = sql;
       _ordered = ordered;
+      _deterministicScan = deterministicScan;
     }
   }
 
@@ -331,7 +339,8 @@ public class GpuRandomizedParityTest extends BaseQueriesTest {
     }
     String where = randomFilter(random);
     if (random.nextInt(100) < 8) {
-      return new GeneratedQuery(options + unsupportedShape(random, where), true);
+      String shape = unsupportedShape(random, where);
+      return new GeneratedQuery(options + shape, true, !shape.startsWith(SELECTION_ORDER_BY));
     }
 
     List<String> keys = new ArrayList<>();
@@ -467,8 +476,7 @@ public class GpuRandomizedParityTest extends BaseQueriesTest {
     int limit = pick(random, LIMITS);
     switch (random.nextInt(5)) {
       case 0:
-        return "SELECT dStr, metric, rawMetric FROM testTable" + where + " ORDER BY dStr, metric, rawMetric LIMIT "
-            + limit;
+        return SELECTION_ORDER_BY + where + " ORDER BY dStr, metric, rawMetric LIMIT " + limit;
       case 1:
         return "SELECT DISTINCT dStr, dInt FROM testTable" + where + " ORDER BY dStr, dInt LIMIT " + limit;
       case 2:
@@ -528,7 +536,8 @@ public class GpuRandomizedParityTest extends BaseQueriesTest {
 
   /// Returns a description of the first difference, or `null` when the responses match.
   @Nullable
-  private static String compare(BrokerResponseNative actual, BrokerResponseNative expected, boolean ordered) {
+  private static String compare(BrokerResponseNative actual, BrokerResponseNative expected, boolean ordered,
+      boolean deterministicScan) {
     if (!expected.getExceptions().isEmpty() || !actual.getExceptions().isEmpty()) {
       if (expected.getExceptions().size() != actual.getExceptions().size()) {
         return "exceptions differ: cpu=" + expected.getExceptions() + " gpu=" + actual.getExceptions();
@@ -556,13 +565,16 @@ public class GpuRandomizedParityTest extends BaseQueriesTest {
     if (actualRows.size() != expectedRows.size()) {
       return "row count differs: cpu=" + expectedRows.size() + " gpu=" + actualRows.size();
     }
-    String stats = compareStat("numDocsScanned", actual.getNumDocsScanned(), expected.getNumDocsScanned());
-    stats = stats != null ? stats : compareStat("numEntriesScannedInFilter", actual.getNumEntriesScannedInFilter(),
-        expected.getNumEntriesScannedInFilter());
-    stats = stats != null ? stats : compareStat("numEntriesScannedPostFilter",
-        actual.getNumEntriesScannedPostFilter(), expected.getNumEntriesScannedPostFilter());
-    stats = stats != null ? stats : compareStat("numSegmentsMatched", actual.getNumSegmentsMatched(),
-        expected.getNumSegmentsMatched());
+    String stats = null;
+    if (deterministicScan) {
+      stats = compareStat("numDocsScanned", actual.getNumDocsScanned(), expected.getNumDocsScanned());
+      stats = stats != null ? stats : compareStat("numEntriesScannedInFilter", actual.getNumEntriesScannedInFilter(),
+          expected.getNumEntriesScannedInFilter());
+      stats = stats != null ? stats : compareStat("numEntriesScannedPostFilter",
+          actual.getNumEntriesScannedPostFilter(), expected.getNumEntriesScannedPostFilter());
+      stats = stats != null ? stats : compareStat("numSegmentsMatched", actual.getNumSegmentsMatched(),
+          expected.getNumSegmentsMatched());
+    }
     stats = stats != null ? stats : compareStat("numGroupsLimitReached", actual.isNumGroupsLimitReached(),
         expected.isNumGroupsLimitReached());
     stats = stats != null ? stats : compareStat("numGroupsWarningLimitReached",
