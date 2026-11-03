@@ -342,7 +342,10 @@ public class GpuGroupByQueriesTest extends BaseQueriesTest {
         {"SELECT dimStr, DISTINCTCOUNT(dimInt) FROM testTable GROUP BY dimStr ORDER BY dimStr LIMIT 1000"},
         {"SELECT DISTINCTCOUNT(dimStr), COUNT(*) FROM testTable WHERE metric > 100"},
         {"SELECT dimStr, dimBool, SUM(metric), DISTINCTCOUNT(dimInt) FROM testTable GROUP BY dimStr, dimBool "
-            + "ORDER BY dimStr, dimBool LIMIT 1000"}
+            + "ORDER BY dimStr, dimBool LIMIT 1000"},
+        // Unfiltered: the CPU fallback resolves DISTINCTCOUNT from the dictionary, as core does.
+        {"SELECT SUM(metric), DISTINCTCOUNT(dimStr), COUNT(*) FROM testTable"},
+        {"SELECT dimStr, SUM(metric), DISTINCTCOUNT(dimInt) FROM testTable GROUP BY dimStr ORDER BY dimStr LIMIT 1000"}
     };
   }
 

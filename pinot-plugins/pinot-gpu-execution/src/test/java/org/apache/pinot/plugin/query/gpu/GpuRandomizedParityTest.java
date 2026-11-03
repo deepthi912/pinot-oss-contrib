@@ -68,6 +68,7 @@ import org.testng.annotations.AfterClass;
 import org.testng.annotations.BeforeClass;
 import org.testng.annotations.Test;
 
+import static org.testng.Assert.assertEquals;
 import static org.testng.Assert.assertTrue;
 import static org.testng.Assert.fail;
 
@@ -76,7 +77,8 @@ import static org.testng.Assert.fail;
 /// COUNT / SUM / AVG / DISTINCTCOUNT, filters of varying selectivity on indexed and scanned columns, ORDER BY on keys
 /// or aggregations, HAVING, LIMIT and trim / group-limit query options), plus shapes the GPU does not support, and runs
 /// each through the CPU plan maker and the [GpuPlanMaker] (Java test backend, and Metal with
-/// `-Dpinot.gpu.metal=true`). Rows and scan statistics must be identical; routing must never change results.
+/// `-Dpinot.gpu.metal=true`), and through failing and corrupting test backends, where every segment the GPU would run
+/// falls back to the CPU. Rows and scan statistics must be identical; routing must never change results.
 ///
 /// `-Dpinot.gpu.fuzz.seed=<long>` and `-Dpinot.gpu.fuzz.queries=<count>` override the default seed and query count. A
 /// failure reports the seed, the query and the first differing row, so it reproduces with the same seed.
@@ -124,12 +126,12 @@ public class GpuRandomizedParityTest extends BaseQueriesTest {
   private static final List<String> UNSUPPORTED_KEYS = List.of("rawMetric", "dInt + 1");
   private static final int[] LIMITS = {1, 3, 10, 50, 1000, 100_000};
 
-  private final JavaGpuBackendProvider _javaProvider =
-      new JavaGpuBackendProvider(GpuBackendType.CUDA, true, Behavior.CORRECT);
   private final PlanMaker _cpuPlanMaker = new InstancePlanMakerImplV2();
   private long _seed;
   private int _numQueries;
   private GpuPlanMaker _javaPlanMaker;
+  private GpuPlanMaker _failingPlanMaker;
+  private GpuPlanMaker _corruptPlanMaker;
   private List<IndexSegment> _indexSegments;
 
   @Override
@@ -159,7 +161,13 @@ public class GpuRandomizedParityTest extends BaseQueriesTest {
       segments.add(buildSegment("segment" + i, SEGMENT_SIZES[i], random.nextLong()));
     }
     _indexSegments = segments;
-    _javaPlanMaker = gpuPlanMaker(List.of(_javaProvider));
+    _javaPlanMaker = javaPlanMaker(Behavior.CORRECT);
+    _failingPlanMaker = javaPlanMaker(Behavior.FAIL);
+    _corruptPlanMaker = javaPlanMaker(Behavior.CORRUPT);
+  }
+
+  private static GpuPlanMaker javaPlanMaker(Behavior behavior) {
+    return gpuPlanMaker(List.of(new JavaGpuBackendProvider(GpuBackendType.CUDA, true, behavior)));
   }
 
   private static GpuPlanMaker gpuPlanMaker(@Nullable List<GpuBackendProvider> providers) {
@@ -212,7 +220,17 @@ public class GpuRandomizedParityTest extends BaseQueriesTest {
 
   @Test
   public void testJavaBackendMatchesCpu() {
-    runAll(_javaPlanMaker, "java");
+    runAll(_javaPlanMaker, "java", true);
+  }
+
+  @Test
+  public void testFailingBackendFallbackMatchesCpu() {
+    runAll(_failingPlanMaker, "java-fail", false);
+  }
+
+  @Test
+  public void testCorruptBackendFallbackMatchesCpu() {
+    runAll(_corruptPlanMaker, "java-corrupt", false);
   }
 
   @Test
@@ -226,13 +244,14 @@ public class GpuRandomizedParityTest extends BaseQueriesTest {
     }
     GpuPlanMaker metalPlanMaker = gpuPlanMaker(null);
     try {
-      runAll(metalPlanMaker, "metal");
+      runAll(metalPlanMaker, "metal", true);
     } finally {
       metalPlanMaker.close();
     }
   }
 
-  private void runAll(GpuPlanMaker gpuPlanMaker, String backend) {
+  /// With `onGpu`, a good share of the queries must run on the GPU; otherwise none may, and some must fall back.
+  private void runAll(GpuPlanMaker gpuPlanMaker, String backend, boolean onGpu) {
     Random random = new Random(_seed);
     List<String> mismatches = new ArrayList<>();
     int queriesOnGpu = 0;
@@ -269,8 +288,13 @@ public class GpuRandomizedParityTest extends BaseQueriesTest {
       fail(mismatches.size() + " CPU/GPU mismatch(es):\n" + String.join("\n", mismatches));
     }
     assertTrue(cpuErrors * 20 < _numQueries, "too many generated queries fail on the CPU: " + cpuErrors);
-    // Keeps the generator honest: a good share of the queries must actually exercise the GPU path.
-    assertTrue(queriesOnGpu * 5 >= _numQueries, "too few queries ran on the GPU: " + queriesOnGpu);
+    if (onGpu) {
+      // Keeps the generator honest: a good share of the queries must actually exercise the GPU path.
+      assertTrue(queriesOnGpu * 5 >= _numQueries, "too few queries ran on the GPU: " + queriesOnGpu);
+    } else {
+      assertEquals(segmentsOnGpu, 0);
+      assertTrue(segmentsFallback * 5 >= _numQueries, "too few segments fell back: " + segmentsFallback);
+    }
   }
 
   private static final class GeneratedQuery {
@@ -563,7 +587,9 @@ public class GpuRandomizedParityTest extends BaseQueriesTest {
 
   @AfterClass
   public void tearDown() {
-    _javaPlanMaker.close();
+    for (GpuPlanMaker planMaker : List.of(_javaPlanMaker, _failingPlanMaker, _corruptPlanMaker)) {
+      planMaker.close();
+    }
     for (IndexSegment segment : _indexSegments) {
       segment.destroy();
     }

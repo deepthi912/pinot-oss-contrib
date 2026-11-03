@@ -33,8 +33,8 @@ import org.apache.pinot.core.operator.ExecutionStatistics;
 import org.apache.pinot.core.operator.blocks.results.GroupByResultsBlock;
 import org.apache.pinot.core.operator.filter.BaseFilterOperator;
 import org.apache.pinot.core.operator.filter.BitmapBasedFilterOperator;
-import org.apache.pinot.core.operator.filter.MatchAllFilterOperator;
 import org.apache.pinot.core.operator.query.GroupByOperator;
+import org.apache.pinot.core.plan.GroupByPlanNode;
 import org.apache.pinot.core.query.aggregation.function.AggregationFunction;
 import org.apache.pinot.core.query.aggregation.function.AggregationFunctionUtils;
 import org.apache.pinot.core.query.request.context.QueryContext;
@@ -45,8 +45,8 @@ import org.roaringbitmap.buffer.ImmutableRoaringBitmap;
 
 
 /// Segment-level aggregation GROUP BY dictionary columns on a GPU backend ([GpuSegmentAggregator]), producing the
-/// same [GroupByResultsBlock] as [GroupByOperator]; runs [GroupByOperator] over the filter result when the segment
-/// is routed to the CPU. Not thread-safe; used by one thread.
+/// same [GroupByResultsBlock] as [GroupByOperator]. When the segment is routed to the CPU, runs [GroupByOperator] over
+/// the filter result, or core's own plan when every document matches. Not thread-safe; used by one thread.
 public class GpuGroupByOperator extends BaseOperator<GroupByResultsBlock> {
   private static final String EXPLAIN_NAME = "GPU_GROUP_BY";
 
@@ -59,7 +59,7 @@ public class GpuGroupByOperator extends BaseOperator<GroupByResultsBlock> {
   private final String[] _groupByColumns;
   private final DataSchema _dataSchema;
   @Nullable
-  private GroupByOperator _cpuOperator;
+  private Operator<GroupByResultsBlock> _cpuOperator;
 
   public GpuGroupByOperator(SegmentContext segmentContext, QueryContext queryContext,
       BaseFilterOperator filterOperator, GpuBackend backend, GpuColumnCache columnCache, GpuQueryStats stats) {
@@ -141,11 +141,14 @@ public class GpuGroupByOperator extends BaseOperator<GroupByResultsBlock> {
   }
 
   private GroupByResultsBlock computeOnCpu(@Nullable ImmutableRoaringBitmap matchingDocs) {
-    int numDocs = _indexSegment.getSegmentMetadata().getTotalDocs();
-    BaseFilterOperator filter = matchingDocs != null ? new BitmapBasedFilterOperator(matchingDocs, false, numDocs)
-        : new MatchAllFilterOperator(numDocs);
-    _cpuOperator = new GroupByOperator(_queryContext, AggregationFunctionUtils.buildAggregationInfoWithoutStarTree(
-        _segmentContext, _queryContext, _queryContext.getAggregationFunctions(), filter), numDocs);
+    if (matchingDocs == null) {
+      _cpuOperator = new GroupByPlanNode(_segmentContext, _queryContext).run();
+    } else {
+      int numDocs = _indexSegment.getSegmentMetadata().getTotalDocs();
+      BaseFilterOperator filter = new BitmapBasedFilterOperator(matchingDocs, false, numDocs);
+      _cpuOperator = new GroupByOperator(_queryContext, AggregationFunctionUtils.buildAggregationInfoWithoutStarTree(
+          _segmentContext, _queryContext, _queryContext.getAggregationFunctions(), filter), numDocs);
+    }
     return _cpuOperator.nextBlock();
   }
 

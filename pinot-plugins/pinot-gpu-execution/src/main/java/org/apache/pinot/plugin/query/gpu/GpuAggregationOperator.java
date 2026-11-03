@@ -27,20 +27,20 @@ import org.apache.pinot.core.operator.ExecutionStatistics;
 import org.apache.pinot.core.operator.blocks.results.AggregationResultsBlock;
 import org.apache.pinot.core.operator.filter.BaseFilterOperator;
 import org.apache.pinot.core.operator.filter.BitmapBasedFilterOperator;
-import org.apache.pinot.core.operator.filter.MatchAllFilterOperator;
 import org.apache.pinot.core.operator.query.AggregationOperator;
+import org.apache.pinot.core.plan.AggregationPlanNode;
 import org.apache.pinot.core.query.aggregation.function.AggregationFunction;
 import org.apache.pinot.core.query.aggregation.function.AggregationFunctionUtils;
 import org.apache.pinot.core.query.request.context.QueryContext;
 import org.apache.pinot.segment.spi.IndexSegment;
 import org.apache.pinot.segment.spi.SegmentContext;
 import org.roaringbitmap.buffer.ImmutableRoaringBitmap;
-import org.roaringbitmap.buffer.MutableRoaringBitmap;
 
 
 /// Segment-level aggregation without GROUP BY on a GPU backend ([GpuSegmentAggregator]), producing the same
-/// [AggregationResultsBlock] as the scanning [AggregationOperator]; runs that operator over the filter result when the
-/// segment is routed to the CPU. Not thread-safe; used by one thread.
+/// [AggregationResultsBlock] as the scanning [AggregationOperator]. When the segment is routed to the CPU, runs that
+/// operator over the filter result, or core's own plan when every document matches (it resolves some functions from
+/// dictionaries and metadata). Not thread-safe; used by one thread.
 public class GpuAggregationOperator extends BaseOperator<AggregationResultsBlock> {
   private static final String EXPLAIN_NAME = "GPU_AGGREGATE";
 
@@ -51,7 +51,7 @@ public class GpuAggregationOperator extends BaseOperator<AggregationResultsBlock
   private final GpuBackend _backend;
   private final GpuSegmentAggregator _aggregator;
   @Nullable
-  private AggregationOperator _cpuOperator;
+  private Operator<AggregationResultsBlock> _cpuOperator;
 
   public GpuAggregationOperator(SegmentContext segmentContext, QueryContext queryContext,
       BaseFilterOperator filterOperator, GpuBackend backend, GpuColumnCache columnCache, GpuQueryStats stats) {
@@ -67,8 +67,7 @@ public class GpuAggregationOperator extends BaseOperator<AggregationResultsBlock
   protected AggregationResultsBlock getNextBlock() {
     GpuSegmentAggregator.Result result = _aggregator.compute();
     if (result == null) {
-      return computeOnCpu(_aggregator.getNumDocsScanned() == 0 ? null : _aggregator.getMatchingDocs(),
-          _aggregator.getNumDocsScanned() == 0);
+      return computeOnCpu(_aggregator.getMatchingDocs());
     }
     AggregationFunction[] functions = _queryContext.getAggregationFunctions();
     List<Object> results = new ArrayList<>(functions.length);
@@ -78,18 +77,16 @@ public class GpuAggregationOperator extends BaseOperator<AggregationResultsBlock
     return new AggregationResultsBlock(functions, results, _queryContext);
   }
 
-  private AggregationResultsBlock computeOnCpu(@Nullable ImmutableRoaringBitmap matchingDocs, boolean noMatch) {
-    int numDocs = _indexSegment.getSegmentMetadata().getTotalDocs();
-    BaseFilterOperator filter;
-    if (noMatch) {
-      filter = new BitmapBasedFilterOperator(new MutableRoaringBitmap(), false, numDocs);
-    } else if (matchingDocs != null) {
-      filter = new BitmapBasedFilterOperator(matchingDocs, false, numDocs);
+  private AggregationResultsBlock computeOnCpu(@Nullable ImmutableRoaringBitmap matchingDocs) {
+    if (matchingDocs == null) {
+      _cpuOperator = new AggregationPlanNode(_segmentContext, _queryContext).run();
     } else {
-      filter = new MatchAllFilterOperator(numDocs);
+      int numDocs = _indexSegment.getSegmentMetadata().getTotalDocs();
+      BaseFilterOperator filter = new BitmapBasedFilterOperator(matchingDocs, false, numDocs);
+      _cpuOperator = new AggregationOperator(_queryContext, AggregationFunctionUtils
+          .buildAggregationInfoWithoutStarTree(_segmentContext, _queryContext, _queryContext.getAggregationFunctions(),
+              filter), numDocs);
     }
-    _cpuOperator = new AggregationOperator(_queryContext, AggregationFunctionUtils.buildAggregationInfoWithoutStarTree(
-        _segmentContext, _queryContext, _queryContext.getAggregationFunctions(), filter), numDocs);
     return _cpuOperator.nextBlock();
   }
 
