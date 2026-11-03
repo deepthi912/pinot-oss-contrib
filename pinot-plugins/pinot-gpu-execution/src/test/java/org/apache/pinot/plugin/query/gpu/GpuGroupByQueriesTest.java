@@ -308,9 +308,19 @@ public class GpuGroupByQueriesTest extends BaseQueriesTest {
   public void testSafeTrimKeepsTheCpuGroups(String query)
       throws Exception {
     assertSameResults(query, _gpuPlanMaker, _gpuProvider, true);
+    // Matching results alone would also pass on a CPU fallback.
+    GpuQueryStats queryStats = executeAndGetStats(_gpuPlanMaker, query);
+    assertEquals(queryStats.getSegmentsFallbackToCpu(), 0, query + " " + queryStats);
+    assertEquals(queryStats.getSegmentsOnGpu(), _indexSegments.size(), query + " " + queryStats);
     for (IndexSegment segment : _indexSegments) {
-      List<IntermediateRecord> cpu = segmentGroups(query, segment, false);
-      List<IntermediateRecord> gpu = segmentGroups(query, segment, true);
+      QueryContext cpuContext = segmentQueryContext(query);
+      List<IntermediateRecord> cpu = segmentGroups(query, cpuContext, segment, null);
+      // The CPU segment is trimmed, so the comparison below is not of every group against every group.
+      assertEquals(cpu.size(), cpuContext.getEffectiveSegmentGroupTrimSize(), query);
+      GpuQueryStats segmentStats = new GpuQueryStats("segment", 1);
+      List<IntermediateRecord> gpu = segmentGroups(query, segmentQueryContext(query), segment, segmentStats);
+      assertEquals(segmentStats.getSegmentsOnGpu(), 1, query + " " + segmentStats);
+      assertEquals(segmentStats.getSegmentsFallbackToCpu(), 0, query + " " + segmentStats);
       assertEquals(gpu.size(), cpu.size(), query);
       for (int i = 0; i < cpu.size(); i++) {
         assertEquals(gpu.get(i)._key, cpu.get(i)._key, query + " group " + i);
@@ -323,26 +333,32 @@ public class GpuGroupByQueriesTest extends BaseQueriesTest {
       throws Exception {
     assertSameResults(query, _gpuPlanMaker, _gpuProvider, true);
     for (IndexSegment segment : _indexSegments) {
-      int numCpuGroups = segmentGroups(query, segment, false).size();
-      int numGpuGroups = segmentGroups(query, segment, true).size();
+      int numCpuGroups = segmentGroups(query, segmentQueryContext(query), segment, null).size();
+      int numGpuGroups =
+          segmentGroups(query, segmentQueryContext(query), segment, new GpuQueryStats("segment", 1)).size();
       assertTrue(numGpuGroups > numCpuGroups, query);
     }
   }
 
-  /// One segment's group-by records from core's plan or the GPU operator, with the query options applied as the
-  /// server does.
-  private List<IntermediateRecord> segmentGroups(String query, IndexSegment segment, boolean gpu)
-      throws Exception {
+  private static QueryContext segmentQueryContext(String query) {
     QueryContext queryContext = QueryContextConverterUtils.getQueryContext(query);
     queryContext.setEndTimeMs(System.currentTimeMillis() + 60_000);
+    return queryContext;
+  }
+
+  /// One segment's group-by records from core's plan, or from the GPU operator recording into `gpuStats` when it is
+  /// set, with the query options applied to `queryContext` as the server does.
+  private List<IntermediateRecord> segmentGroups(String query, QueryContext queryContext, IndexSegment segment,
+      @Nullable GpuQueryStats gpuStats)
+      throws Exception {
     SegmentContext segmentContext = new SegmentContext(segment);
     try (QueryThreadContext ignore = QueryThreadContext.openForSseTest()) {
       _cpuPlanMaker.makeInstancePlan(List.of(segmentContext), queryContext, EXECUTOR_SERVICE);
       Operator<?> operator;
-      if (gpu) {
+      if (gpuStats != null) {
         GpuBackend backend = _gpuPlanMaker.getRouter().decide(GpuQueryOptions.NONE, 1).getBackend();
         operator = new GpuSegmentPlanNode(segmentContext, queryContext, backend, _gpuPlanMaker.getColumnCache(),
-            new GpuQueryStats(backend.getName(), 1)).run();
+            gpuStats).run();
         assertTrue(operator instanceof GpuGroupByOperator, query);
       } else {
         operator = new GroupByPlanNode(segmentContext, queryContext).run();

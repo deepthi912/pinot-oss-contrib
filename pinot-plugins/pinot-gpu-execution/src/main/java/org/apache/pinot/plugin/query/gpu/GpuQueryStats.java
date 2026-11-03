@@ -83,6 +83,10 @@ public final class GpuQueryStats {
     return _segmentsOnGpu.get();
   }
 
+  public int getSegmentsNoMatchingDocs() {
+    return _segmentsNoMatchingDocs.get();
+  }
+
   public int getSegmentsIneligible() {
     return _segmentsIneligible.get();
   }

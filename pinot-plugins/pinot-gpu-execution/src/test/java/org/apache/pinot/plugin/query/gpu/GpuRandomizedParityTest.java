@@ -29,6 +29,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Random;
 import java.util.Set;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import javax.annotation.Nullable;
 import org.apache.commons.io.FileUtils;
 import org.apache.pinot.common.datatable.DataTable;
@@ -76,7 +78,9 @@ import static org.testng.Assert.fail;
 /// or aggregations, HAVING, LIMIT and trim / group-limit query options), plus shapes the GPU does not support, and runs
 /// each through the CPU plan maker and the [GpuPlanMaker] (Java test backend, and Metal with
 /// `-Dpinot.gpu.metal=true`), and through failing and corrupting test backends, where every segment the GPU would run
-/// falls back to the CPU. Rows and scan statistics must be identical; routing must never change results.
+/// falls back to the CPU. Rows and scan statistics must be identical; routing must never change results. On the
+/// backends that should run on the GPU, a segment may stay on the CPU only for a planned reason (ineligible, selective
+/// filter, no matching documents); a silent fallback or a column that could not be made resident fails the query.
 ///
 /// `-Dpinot.gpu.fuzz.seed=<long>` and `-Dpinot.gpu.fuzz.queries=<count>` override the default seed and query count. A
 /// failure reports the seed, the query and the first differing row, so it reproduces with the same seed.
@@ -89,6 +93,8 @@ public class GpuRandomizedParityTest extends BaseQueriesTest {
   private static final int DEFAULT_NUM_QUERIES = 300;
   private static final int[] SEGMENT_SIZES = {7_001, 20_003, 1};
   private static final int MAX_REPORTED_MISMATCHES = 10;
+  // Far above what the generated queries load, so the column cache never refuses a load for lack of budget.
+  private static final long CACHE_MAX_BYTES = 8L * 1024 * 1024 * 1024;
 
   private static final Schema SCHEMA = new Schema.SchemaBuilder().setSchemaName(TABLE)
       .addSingleValueDimension("dInt", DataType.INT)
@@ -125,6 +131,10 @@ public class GpuRandomizedParityTest extends BaseQueriesTest {
   private static final String SELECTION_ORDER_BY = "SELECT dStr, metric, rawMetric FROM testTable";
 
   private final PlanMaker _cpuPlanMaker = new InstancePlanMakerImplV2();
+  // No more combine threads than column-cache load slots: a load never waits for a slot, so with the budget above a
+  // column is never left non-resident by the bounded load wait, and segmentsNotResident is deterministically 0.
+  private final ExecutorService _executorService = QueryThreadContext.contextAwareExecutorService(
+      Executors.newFixedThreadPool(GpuColumnCache.MAX_CONCURRENT_LOADS));
   private long _seed;
   private int _numQueries;
   private GpuPlanMaker _javaPlanMaker;
@@ -169,9 +179,12 @@ public class GpuRandomizedParityTest extends BaseQueriesTest {
   }
 
   private static GpuPlanMaker gpuPlanMaker(List<GpuBackendProvider> providers) {
-    GpuPlanMaker planMaker = new GpuPlanMaker(providers);
-    planMaker.init(new PinotConfiguration(
-        Map.of(GpuExecutionConfig.ENABLED, "true", GpuExecutionConfig.MIN_ROWS, "0")));
+    return init(new GpuPlanMaker(providers));
+  }
+
+  private static GpuPlanMaker init(GpuPlanMaker planMaker) {
+    planMaker.init(new PinotConfiguration(Map.of(GpuExecutionConfig.ENABLED, "true", GpuExecutionConfig.MIN_ROWS, "0",
+        GpuExecutionConfig.CACHE_MAX_BYTES, Long.toString(CACHE_MAX_BYTES))));
     return planMaker;
   }
 
@@ -233,7 +246,9 @@ public class GpuRandomizedParityTest extends BaseQueriesTest {
 
   @Test
   public void testMetalBackendMatchesCpu() {
-    GpuPlanMaker metalPlanMaker = MetalTestSupport.metalPlanMaker();
+    MetalTestSupport.requireMetal();
+    // Discovered backends (Metal here), with this test's cache budget.
+    GpuPlanMaker metalPlanMaker = init(new GpuPlanMaker());
     try {
       runAll(metalPlanMaker, "metal", true);
     } finally {
@@ -241,7 +256,8 @@ public class GpuRandomizedParityTest extends BaseQueriesTest {
     }
   }
 
-  /// With `onGpu`, a good share of the queries must run on the GPU; otherwise none may, and some must fall back.
+  /// With `onGpu`, a good share of the queries must run on the GPU, and no segment may fall back or miss residency;
+  /// otherwise none may run on the GPU, and some must fall back.
   private void runAll(GpuPlanMaker gpuPlanMaker, String backend, boolean onGpu) {
     Random random = new Random(_seed);
     List<String> mismatches = new ArrayList<>();
@@ -264,6 +280,9 @@ public class GpuRandomizedParityTest extends BaseQueriesTest {
         cpuErrors++;
       }
       String difference = compare(actual._response, expected._response, query._ordered, query._deterministicScan);
+      if (difference == null && onGpu) {
+        difference = checkGpuRouting(actual);
+      }
       if (difference != null) {
         mismatches.add(String.format("seed=%d backend=%s query#%d: %s%n  %s%n  gpuStats=%s", _seed, backend, i,
             query._sql, difference, actual._stats));
@@ -276,7 +295,7 @@ public class GpuRandomizedParityTest extends BaseQueriesTest {
             + "segmentsFallbackToCpu=%d cpuErrors=%d mismatches=%d%n", _seed, backend, _numQueries, queriesOnGpu,
         segmentsOnGpu, segmentsFallback, cpuErrors, mismatches.size());
     if (!mismatches.isEmpty()) {
-      fail(mismatches.size() + " CPU/GPU mismatch(es):\n" + String.join("\n", mismatches));
+      fail(mismatches.size() + " CPU/GPU mismatch(es) or unplanned CPU segment(s):\n" + String.join("\n", mismatches));
     }
     assertTrue(cpuErrors * 20 < _numQueries, "too many generated queries fail on the CPU: " + cpuErrors);
     if (onGpu) {
@@ -286,6 +305,29 @@ public class GpuRandomizedParityTest extends BaseQueriesTest {
       assertEquals(segmentsOnGpu, 0);
       assertTrue(segmentsFallback * 5 >= _numQueries, "too few segments fell back: " + segmentsFallback);
     }
+  }
+
+  /// Returns why a query on a backend that should run on the GPU left a segment on the CPU without a planned reason,
+  /// or `null`. Matching results alone would also pass on a silent CPU fallback.
+  @Nullable
+  private static String checkGpuRouting(Execution actual) {
+    GpuQueryStats stats = actual._stats;
+    if (stats == null) {
+      // Routed to the CPU by the query options (useGpu = false).
+      return null;
+    }
+    if (stats.getSegmentsFallbackToCpu() != 0) {
+      return "segments fell back to the CPU";
+    }
+    if (stats.getSegmentsNotResident() != 0) {
+      return "segments were not resident on the GPU";
+    }
+    if (stats.getSegmentsIneligible() == 0 && stats.getSegmentsSelectiveOnCpu() == 0
+        && stats.getSegmentsNoMatchingDocs() == 0 && actual._response.getExceptions().isEmpty()
+        && stats.getSegmentsOnGpu() != actual._response.getNumSegmentsMatched()) {
+      return "segmentsOnGpu differs from numSegmentsMatched=" + actual._response.getNumSegmentsMatched();
+    }
+    return null;
   }
 
   private static final class GeneratedQuery {
@@ -514,7 +556,7 @@ public class GpuRandomizedParityTest extends BaseQueriesTest {
     byte[] dataTable;
     GpuQueryStats stats = null;
     try (QueryThreadContext ignore = QueryThreadContext.openForSseTest()) {
-      Plan plan = planMaker.makeInstancePlan(segmentContexts, queryContext, EXECUTOR_SERVICE);
+      Plan plan = planMaker.makeInstancePlan(segmentContexts, queryContext, _executorService);
       dataTable = plan.execute().toDataTable().toBytes();
       if (plan instanceof GpuInstancePlan) {
         stats = ((GpuInstancePlan) plan).getStats();
@@ -595,6 +637,7 @@ public class GpuRandomizedParityTest extends BaseQueriesTest {
     for (IndexSegment segment : _indexSegments) {
       segment.destroy();
     }
+    _executorService.shutdownNow();
     FileUtils.deleteQuietly(INDEX_DIR);
   }
 }

@@ -72,7 +72,7 @@ public class GpuSegmentPlanNode implements PlanNode {
   }
 
   /// Mirrors core's non-scan plan for the GPU functions: it skips the scan only when every function is COUNT or a
-  /// DISTINCTCOUNT on a dictionary column; with SUM/AVG present core would scan on the CPU, so the GPU does it all.
+  /// DISTINCTCOUNT on a dictionary column; with SUM/AVG present core still scans, so the GPU computes every function.
   private boolean answerableWithoutScan() {
     for (AggregationFunction<?, ?> function : _queryContext.getAggregationFunctions()) {
       AggregationFunctionType type = function.getType();
