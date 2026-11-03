@@ -931,8 +931,12 @@ public abstract class BaseDistinctAggregateAggregationFunction<T extends Compara
 
   /// Helper method to read dictionary and convert dictionary ids to values for dictionary-encoded expression.
   private static Set convertToValueSet(DictIdsWrapper dictIdsWrapper) {
-    Dictionary dictionary = dictIdsWrapper._dictionary;
-    RoaringBitmap dictIdBitmap = dictIdsWrapper._dictIdBitmap;
+    return convertToValueSet(dictIdsWrapper._dictionary, dictIdsWrapper._dictIdBitmap);
+  }
+
+  /// Converts dictionary ids to the typed value set used as the intermediate result of distinct aggregations, so
+  /// segment results computed elsewhere merge with the regular ones.
+  public static Set<?> convertToValueSet(Dictionary dictionary, RoaringBitmap dictIdBitmap) {
     int numValues = dictIdBitmap.getCardinality();
     PeekableIntIterator iterator = dictIdBitmap.getIntIterator();
     DataType storedType = dictionary.getValueType();

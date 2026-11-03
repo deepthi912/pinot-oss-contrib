@@ -68,4 +68,8 @@ public interface PlanMaker {
   /// Returns a segment level [PlanNode] for a streaming query which contains the logical execution plan for one
   /// segment.
   PlanNode makeStreamingSegmentPlanNode(SegmentContext segmentContext, QueryContext queryContext);
+
+  /// Releases resources held by the plan maker; called when the query executor shuts down.
+  default void close() {
+  }
 }
