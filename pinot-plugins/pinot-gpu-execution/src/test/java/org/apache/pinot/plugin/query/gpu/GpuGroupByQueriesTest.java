@@ -390,7 +390,16 @@ public class GpuGroupByQueriesTest extends BaseQueriesTest {
             + "SELECT dimInt, COUNT(*) FROM testTable GROUP BY dimInt ORDER BY dimInt LIMIT 2000"},
         {"SELECT dimInt, COUNT(*) FROM testTable WHERE dimStr IN ('s1', 's2', 's3') GROUP BY dimInt "
             + "ORDER BY dimInt LIMIT 2000"},
-        {"SELECT dimStr, COUNT(*) FROM testTable WHERE dimInt < 20 GROUP BY dimStr ORDER BY dimStr LIMIT 1000"}
+        {"SELECT dimStr, COUNT(*) FROM testTable WHERE dimInt < 20 GROUP BY dimStr ORDER BY dimStr LIMIT 1000"},
+        // Unsafe segment trim: the CPU keeps the top groups by aggregation value, or before HAVING.
+        {"SET minSegmentGroupTrimSize = 10; "
+            + "SELECT dimInt, COUNT(*) FROM testTable GROUP BY dimInt ORDER BY COUNT(*) DESC, dimInt LIMIT 3"},
+        {"SET minSegmentGroupTrimSize = 10; SELECT dimInt, COUNT(*) FROM testTable GROUP BY dimInt "
+            + "HAVING COUNT(*) > 10 ORDER BY dimInt LIMIT 3"},
+        {"SET minSegmentGroupTrimSize = 10; SELECT dimStr, dimFloat, COUNT(*) FROM testTable GROUP BY dimStr, dimFloat "
+            + "ORDER BY COUNT(*) DESC, dimStr, dimFloat LIMIT 3"},
+        {"SET minSegmentGroupTrimSize = 10; SELECT dimStr, dimFloat, COUNT(*) FROM testTable GROUP BY dimStr, dimFloat "
+            + "HAVING COUNT(*) > 10 ORDER BY dimStr, dimFloat LIMIT 3"}
     };
   }
 

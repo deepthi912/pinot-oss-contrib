@@ -96,7 +96,9 @@ public final class GpuQueryEligibility {
       return "server returns final results with unpartitioned keys";
     }
     if (queryContext.isUnsafeTrim() && queryContext.getEffectiveSegmentGroupTrimSize() > 0) {
-      return "segment group trim on aggregation order";
+      // GroupByOperator keeps the top groups by values the GPU operator does not order by; emitting more would change
+      // the approximate result.
+      return "unsafe segment group trim (ORDER BY other than the GROUP BY columns, or HAVING)";
     }
     if (queryContext.getLimit() == 0) {
       return "LIMIT 0";

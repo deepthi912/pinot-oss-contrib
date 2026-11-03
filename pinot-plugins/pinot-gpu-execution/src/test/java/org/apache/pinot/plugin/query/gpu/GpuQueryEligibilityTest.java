@@ -71,6 +71,22 @@ public class GpuQueryEligibilityTest {
   }
 
   @Test
+  public void testUnsafeSegmentTrimStaysOnCpu() {
+    String reason = "unsafe segment group trim (ORDER BY other than the GROUP BY columns, or HAVING)";
+    for (String query : new String[]{
+        "SELECT dimInt, COUNT(*) FROM t GROUP BY dimInt ORDER BY COUNT(*) DESC, dimInt LIMIT 3",
+        "SELECT dimInt, COUNT(*) FROM t GROUP BY dimInt HAVING COUNT(*) > 10 ORDER BY dimInt LIMIT 3",
+        "SELECT a, b, COUNT(*) FROM t GROUP BY a, b ORDER BY COUNT(*) DESC, a, b LIMIT 3",
+        "SELECT a, b, COUNT(*) FROM t GROUP BY a, b HAVING COUNT(*) > 10 ORDER BY a, b LIMIT 3"}) {
+      QueryContext queryContext = QueryContextConverterUtils.getQueryContext(query);
+      // Without a segment trim size, every group is kept and the GPU runs it.
+      assertNull(GpuQueryEligibility.checkQuery(queryContext), query);
+      queryContext.setMinSegmentGroupTrimSize(10);
+      assertEquals(GpuQueryEligibility.checkQuery(queryContext), reason, query);
+    }
+  }
+
+  @Test
   public void testCombinedGroupKeyBounds() {
     QueryContext query = QueryContextConverterUtils.getQueryContext("SELECT a, b, COUNT(*) FROM t GROUP BY a, b");
     query.setNumGroupsLimit(Integer.MAX_VALUE);
