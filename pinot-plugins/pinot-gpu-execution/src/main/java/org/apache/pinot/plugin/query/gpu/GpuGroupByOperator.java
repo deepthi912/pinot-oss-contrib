@@ -99,18 +99,19 @@ public class GpuGroupByOperator extends BaseOperator<GroupByResultsBlock> {
       return computeOnCpu(_aggregator.getMatchingDocs());
     }
 
-    // Under sort-aggregate, group ids walked in the ORDER BY direction are in ORDER BY order (GpuQueryEligibility), so
-    // the first trim-size groups match GroupByOperator. Otherwise all groups are emitted: a superset the combine trims.
+    // Under safe trim GroupByOperator keeps the first trim-size groups in ORDER BY order. When that order is the dense
+    // key's (always under sort-aggregate, see GpuQueryEligibility), group ids walked in the ORDER BY direction give
+    // the same groups. Otherwise all groups are emitted: a superset that loses nothing, as the trim is on group keys.
     GpuGroupKeys groupKeys = _aggregator.getGroupKeys();
     int numKeys = _groupByColumns.length;
     Dictionary[] dictionaries = new Dictionary[numKeys];
     for (int c = 0; c < numKeys; c++) {
       dictionaries[c] = _indexSegment.getDataSource(_groupByColumns[c]).getDictionary();
     }
-    boolean sorted = _queryContext.shouldSortAggregateUnderSafeTrim();
+    int trimSize = _queryContext.getEffectiveSegmentGroupTrimSize();
+    boolean sorted = !_queryContext.isUnsafeTrim() && GpuQueryEligibility.orderedByGroupKey(_queryContext);
     boolean ascending = !sorted || _queryContext.getOrderByExpressions().get(0).isAsc();
-    int maxGroups = sorted && _queryContext.getEffectiveSegmentGroupTrimSize() > 0
-        ? _queryContext.getEffectiveSegmentGroupTrimSize() : Integer.MAX_VALUE;
+    int maxGroups = sorted && trimSize > 0 ? trimSize : Integer.MAX_VALUE;
     int numFunctions = _queryContext.getAggregationFunctions().length;
     int numGroups = 0;
     for (long count : result._counts) {

@@ -28,6 +28,10 @@ import org.apache.pinot.common.datatable.DataTableFactory;
 import org.apache.pinot.common.request.BrokerRequest;
 import org.apache.pinot.common.request.PinotQuery;
 import org.apache.pinot.common.response.broker.BrokerResponseNative;
+import org.apache.pinot.core.common.Operator;
+import org.apache.pinot.core.data.table.IntermediateRecord;
+import org.apache.pinot.core.operator.blocks.results.GroupByResultsBlock;
+import org.apache.pinot.core.plan.GroupByPlanNode;
 import org.apache.pinot.core.plan.Plan;
 import org.apache.pinot.core.plan.maker.InstancePlanMakerImplV2;
 import org.apache.pinot.core.plan.maker.PlanMaker;
@@ -272,6 +276,82 @@ public class GpuGroupByQueriesTest extends BaseQueriesTest {
         {"SELECT dimHigh, dimBool, SUM(rawMetric), AVG(metric) FROM testTable GROUP BY dimHigh, dimBool "
             + "ORDER BY dimBool DESC, dimHigh LIMIT 20000"}
     };
+  }
+
+  /// Safe trim (ORDER BY the GROUP BY columns, no HAVING) with a LIMIT above the sort-aggregate threshold and below
+  /// the number of groups: GroupByOperator trims each segment to LIMIT groups.
+  @DataProvider
+  public Object[][] safeTrimQueries() {
+    String options = "SET minSegmentGroupTrimSize = 10; SET sortAggregateLimitThreshold = 5; ";
+    return new Object[][]{
+        {options + "SELECT dimInt, COUNT(*), SUM(metric) FROM testTable GROUP BY dimInt ORDER BY dimInt LIMIT 20"},
+        {options + "SELECT dimInt, COUNT(*), SUM(metric) FROM testTable GROUP BY dimInt ORDER BY dimInt DESC LIMIT 20"},
+        {options + "SELECT dimStr, dimFloat, COUNT(*), DISTINCTCOUNT(dimBool) FROM testTable GROUP BY dimStr, dimFloat "
+            + "ORDER BY dimStr, dimFloat LIMIT 50"},
+        {options + "SELECT dimStr, dimFloat, COUNT(*), AVG(rawMetric) FROM testTable WHERE metric > -500 "
+            + "GROUP BY dimStr, dimFloat ORDER BY dimStr DESC, dimFloat DESC LIMIT 50"}
+    };
+  }
+
+  /// Safe trim in an order the dense key does not give: the GPU emits every group, a superset of the CPU's.
+  @DataProvider
+  public Object[][] safeTrimSupersetQueries() {
+    String options = "SET minSegmentGroupTrimSize = 10; SET sortAggregateLimitThreshold = 5; ";
+    return new Object[][]{
+        {options + "SELECT dimStr, dimFloat, COUNT(*), SUM(metric) FROM testTable GROUP BY dimStr, dimFloat "
+            + "ORDER BY dimFloat, dimStr LIMIT 50"},
+        {options + "SELECT dimStr, dimFloat, COUNT(*), SUM(metric) FROM testTable GROUP BY dimStr, dimFloat "
+            + "ORDER BY dimStr, dimFloat DESC LIMIT 50"}
+    };
+  }
+
+  @Test(dataProvider = "safeTrimQueries")
+  public void testSafeTrimKeepsTheCpuGroups(String query)
+      throws Exception {
+    assertSameResults(query, _gpuPlanMaker, _gpuProvider, true);
+    for (IndexSegment segment : _indexSegments) {
+      List<IntermediateRecord> cpu = segmentGroups(query, segment, false);
+      List<IntermediateRecord> gpu = segmentGroups(query, segment, true);
+      assertEquals(gpu.size(), cpu.size(), query);
+      for (int i = 0; i < cpu.size(); i++) {
+        assertEquals(gpu.get(i)._key, cpu.get(i)._key, query + " group " + i);
+      }
+    }
+  }
+
+  @Test(dataProvider = "safeTrimSupersetQueries")
+  public void testSafeTrimInAnotherOrderEmitsAllGroups(String query)
+      throws Exception {
+    assertSameResults(query, _gpuPlanMaker, _gpuProvider, true);
+    for (IndexSegment segment : _indexSegments) {
+      int numCpuGroups = segmentGroups(query, segment, false).size();
+      int numGpuGroups = segmentGroups(query, segment, true).size();
+      assertTrue(numGpuGroups > numCpuGroups, query);
+    }
+  }
+
+  /// One segment's group-by records from core's plan or the GPU operator, with the query options applied as the
+  /// server does.
+  private List<IntermediateRecord> segmentGroups(String query, IndexSegment segment, boolean gpu)
+      throws Exception {
+    QueryContext queryContext = QueryContextConverterUtils.getQueryContext(query);
+    queryContext.setEndTimeMs(System.currentTimeMillis() + 60_000);
+    SegmentContext segmentContext = new SegmentContext(segment);
+    try (QueryThreadContext ignore = QueryThreadContext.openForSseTest()) {
+      _cpuPlanMaker.makeInstancePlan(List.of(segmentContext), queryContext, EXECUTOR_SERVICE);
+      Operator<?> operator;
+      if (gpu) {
+        GpuBackend backend = _gpuPlanMaker.getRouter().decide(GpuQueryOptions.NONE, 1).getBackend();
+        operator = new GpuSegmentPlanNode(segmentContext, queryContext, backend, _gpuPlanMaker.getColumnCache(),
+            new GpuQueryStats(backend.getName(), 1)).run();
+        assertTrue(operator instanceof GpuGroupByOperator, query);
+      } else {
+        operator = new GroupByPlanNode(segmentContext, queryContext).run();
+      }
+      GroupByResultsBlock block = (GroupByResultsBlock) operator.nextBlock();
+      assertTrue(block.getIntermediateRecords() != null, query);
+      return block.getIntermediateRecords();
+    }
   }
 
   @DataProvider

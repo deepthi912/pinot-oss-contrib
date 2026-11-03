@@ -107,7 +107,8 @@ public final class GpuQueryEligibility {
     return null;
   }
 
-  private static boolean orderedByGroupKey(QueryContext queryContext) {
+  /// Whether the ORDER BY is the GROUP BY columns in order with one direction: the order dense group ids follow.
+  static boolean orderedByGroupKey(QueryContext queryContext) {
     List<ExpressionContext> groupByExpressions = queryContext.getGroupByExpressions();
     List<OrderByExpressionContext> orderByExpressions = queryContext.getOrderByExpressions();
     if (orderByExpressions == null || orderByExpressions.size() != groupByExpressions.size()) {
