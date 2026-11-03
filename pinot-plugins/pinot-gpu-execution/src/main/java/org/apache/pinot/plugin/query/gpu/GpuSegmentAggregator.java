@@ -168,13 +168,19 @@ final class GpuSegmentAggregator {
     return _matchingDocs;
   }
 
-  /// Columns read per matching document, matching the CPU projection for scan statistics.
+  /// Columns read per matching document, matching the CPU projection for scan statistics. Without GROUP BY and with a
+  /// filter matching every document, core answers DISTINCTCOUNT on a dictionary column from the dictionary and does
+  /// not project its column (see `AggregationPlanNode`), so neither is it counted here.
   int getNumColumnsProjected() {
     Set<String> columns = new LinkedHashSet<>();
     if (_groupByColumns != null) {
       columns.addAll(Arrays.asList(_groupByColumns));
     }
+    boolean distinctFromDictionary = _groupByColumns == null && _filterOperator.isResultMatchingAll();
     for (AggregationFunction<?, ?> function : _queryContext.getAggregationFunctions()) {
+      if (distinctFromDictionary && function.getType() == AggregationFunctionType.DISTINCTCOUNT) {
+        continue;
+      }
       if (!function.getInputExpressions().isEmpty()) {
         columns.add(function.getInputExpressions().get(0).getIdentifier());
       }

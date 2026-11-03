@@ -248,6 +248,8 @@ public class GpuGroupByQueriesTest extends BaseQueriesTest {
         {"SELECT SUM(metric), DISTINCTCOUNT(metric), COUNT(*) FROM testTable WHERE metric > 100"},
         {"SELECT SUM(rawMetric), AVG(rawMetric), DISTINCTCOUNT(dimStr), COUNT(*) FROM testTable WHERE metric > 100"},
         {"SELECT DISTINCTCOUNT(dimHigh) FROM testTable WHERE dimBool = true"},
+        // Unfiltered: core answers DISTINCTCOUNT from the dictionary and does not count its column as scanned.
+        {"SELECT SUM(metric), DISTINCTCOUNT(dimStr), DISTINCTCOUNT(metric) FROM testTable"},
         // Several GROUP BY columns: up to three keys of mixed types, both sort-aggregate directions with segment trim,
         // HAVING, a filter, and ORDER BY an aggregation.
         {"SELECT dimStr, dimBool, COUNT(*), SUM(metric), AVG(rawMetric), DISTINCTCOUNT(dimInt) FROM testTable "
