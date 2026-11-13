@@ -100,8 +100,9 @@ public class OfflineTableDataManager extends BaseTableDataManager {
     super.doAddSegment(immutableSegment, zkMetadata);
   }
 
-  /// Takes the upsert snapshot, then removes the expired primary keys, as a REALTIME segment commit does with metadata
-  /// TTL. Both are no-op when snapshot or TTL is disabled. Failures are not rethrown, as the segment is already added.
+  /// Takes the upsert snapshot and removes the expired primary keys in the same order as a REALTIME segment commit (see
+  /// RealtimeSegmentDataManager). Both are no-op when snapshot or TTL is disabled. Failures are not rethrown, as the
+  /// segment is already added.
   @Override
   protected void onUpsertSegmentAdded(PartitionUpsertMetadataManager partitionUpsertMetadataManager) {
     if (!isAllSegmentsLoaded()) {
@@ -109,9 +110,16 @@ public class OfflineTableDataManager extends BaseTableDataManager {
       return;
     }
     try {
-      // Take the snapshot first to persist the final state of the keys before they are removed for metadata TTL
-      partitionUpsertMetadataManager.takeSnapshot();
-      partitionUpsertMetadataManager.removeExpiredPrimaryKeys();
+      if (partitionUpsertMetadataManager.getContext().getMetadataTTL() > 0) {
+        // Take the snapshot first to persist the final state of the keys before they are removed for metadata TTL
+        partitionUpsertMetadataManager.takeSnapshot();
+        partitionUpsertMetadataManager.removeExpiredPrimaryKeys();
+      } else {
+        // Remove the deleted keys out of TTL first so that the snapshot reflects their removed valid docs right away,
+        // instead of on the next segment upload
+        partitionUpsertMetadataManager.removeExpiredPrimaryKeys();
+        partitionUpsertMetadataManager.takeSnapshot();
+      }
     } catch (Exception e) {
       _logger.warn("Caught exception while taking upsert snapshot or removing expired primary keys", e);
     }

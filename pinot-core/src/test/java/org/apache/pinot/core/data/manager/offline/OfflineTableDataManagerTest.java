@@ -19,6 +19,7 @@
 package org.apache.pinot.core.data.manager.offline;
 
 import org.apache.pinot.segment.local.upsert.PartitionUpsertMetadataManager;
+import org.apache.pinot.segment.local.upsert.UpsertContext;
 import org.mockito.InOrder;
 import org.slf4j.LoggerFactory;
 import org.testng.annotations.Test;
@@ -28,15 +29,16 @@ import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
 
-/// Tests that [OfflineTableDataManager] takes the upsert snapshot and then removes the expired primary keys after a
-/// segment is added to an upsert partition, as a REALTIME segment commit does.
+/// Tests that [OfflineTableDataManager] takes the upsert snapshot and removes the expired primary keys after a segment
+/// is added to an upsert partition, in the same order as a REALTIME segment commit.
 public class OfflineTableDataManagerTest {
 
   @Test
-  public void testSnapshotThenRemoveExpiredKeys() {
-    PartitionUpsertMetadataManager partitionManager = mock(PartitionUpsertMetadataManager.class);
+  public void testSnapshotBeforeRemovingExpiredKeysWithMetadataTTL() {
+    PartitionUpsertMetadataManager partitionManager = mockPartitionManager(30);
     newTableDataManager(true).onUpsertSegmentAdded(partitionManager);
     InOrder inOrder = inOrder(partitionManager);
     inOrder.verify(partitionManager).takeSnapshot();
@@ -44,8 +46,17 @@ public class OfflineTableDataManagerTest {
   }
 
   @Test
+  public void testRemoveExpiredKeysBeforeSnapshotWithoutMetadataTTL() {
+    PartitionUpsertMetadataManager partitionManager = mockPartitionManager(0);
+    newTableDataManager(true).onUpsertSegmentAdded(partitionManager);
+    InOrder inOrder = inOrder(partitionManager);
+    inOrder.verify(partitionManager).removeExpiredPrimaryKeys();
+    inOrder.verify(partitionManager).takeSnapshot();
+  }
+
+  @Test
   public void testSkipBeforeAllSegmentsLoaded() {
-    PartitionUpsertMetadataManager partitionManager = mock(PartitionUpsertMetadataManager.class);
+    PartitionUpsertMetadataManager partitionManager = mockPartitionManager(30);
     newTableDataManager(false).onUpsertSegmentAdded(partitionManager);
     verify(partitionManager, never()).takeSnapshot();
     verify(partitionManager, never()).removeExpiredPrimaryKeys();
@@ -54,10 +65,18 @@ public class OfflineTableDataManagerTest {
   /// The segment is already added, so a failure must not fail the segment state transition.
   @Test
   public void testFailureIsNotRethrown() {
-    PartitionUpsertMetadataManager partitionManager = mock(PartitionUpsertMetadataManager.class);
+    PartitionUpsertMetadataManager partitionManager = mockPartitionManager(30);
     doThrow(new RuntimeException("test")).when(partitionManager).removeExpiredPrimaryKeys();
     newTableDataManager(true).onUpsertSegmentAdded(partitionManager);
     verify(partitionManager).takeSnapshot();
+  }
+
+  private static PartitionUpsertMetadataManager mockPartitionManager(double metadataTTL) {
+    UpsertContext context = mock(UpsertContext.class);
+    when(context.getMetadataTTL()).thenReturn(metadataTTL);
+    PartitionUpsertMetadataManager partitionManager = mock(PartitionUpsertMetadataManager.class);
+    when(partitionManager.getContext()).thenReturn(context);
+    return partitionManager;
   }
 
   private static OfflineTableDataManager newTableDataManager(boolean allSegmentsLoaded) {
