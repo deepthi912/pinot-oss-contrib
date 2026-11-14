@@ -90,6 +90,10 @@ public class ConcurrentMapTableUpsertMetadataManagerTest {
     // Never tracked via any UpsertViewManager, yet a direct read still populates the snapshot.
     manager.setSegmentContexts(List.of(segmentContext), Map.of(QueryOptionKey.SKIP_UPSERT_DELETE, "true"));
     assertSame(segmentContext.getDocIdsSnapshot(), segment.getValidDocIds().getMutableRoaringBitmap());
+
+    // Without skipUpsertDelete, the direct read serves queryable docs (delete markers excluded).
+    manager.setSegmentContexts(List.of(segmentContext), Map.of());
+    assertSame(segmentContext.getDocIdsSnapshot(), segment.getQueryableDocIds().getMutableRoaringBitmap());
   }
 
   @Test
@@ -101,6 +105,9 @@ public class ConcurrentMapTableUpsertMetadataManagerTest {
     manager.setSegmentContexts(List.of(segmentContext),
         Map.of(QueryOptionKey.SKIP_UPSERT_VIEW, "true", QueryOptionKey.SKIP_UPSERT_DELETE, "true"));
     assertSame(segmentContext.getDocIdsSnapshot(), segment.getValidDocIds().getMutableRoaringBitmap());
+
+    manager.setSegmentContexts(List.of(segmentContext), Map.of(QueryOptionKey.SKIP_UPSERT_VIEW, "true"));
+    assertSame(segmentContext.getDocIdsSnapshot(), segment.getQueryableDocIds().getMutableRoaringBitmap());
   }
 
   /// ConcurrentMapTableUpsertMetadataManager's dispatch only special-cases NONE (see the other tests above);

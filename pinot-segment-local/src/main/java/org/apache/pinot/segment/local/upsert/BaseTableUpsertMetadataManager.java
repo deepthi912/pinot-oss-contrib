@@ -19,13 +19,21 @@
 package org.apache.pinot.segment.local.upsert;
 
 import com.google.common.base.Preconditions;
+import java.util.Collection;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.function.Supplier;
 import javax.annotation.Nullable;
 import javax.annotation.concurrent.ThreadSafe;
 import org.apache.commons.collections4.CollectionUtils;
+import org.apache.pinot.common.utils.config.QueryOptionsUtils;
 import org.apache.pinot.segment.local.data.manager.TableDataManager;
 import org.apache.pinot.segment.local.utils.SegmentOperationsThrottlerSet;
+import org.apache.pinot.segment.spi.ImmutableSegment;
+import org.apache.pinot.segment.spi.IndexSegment;
+import org.apache.pinot.segment.spi.SegmentContext;
 import org.apache.pinot.spi.config.table.TableConfig;
 import org.apache.pinot.spi.config.table.UpsertConfig;
 import org.apache.pinot.spi.data.Schema;
@@ -154,6 +162,71 @@ public abstract class BaseTableUpsertMetadataManager implements TableUpsertMetad
   /// Can be overridden to initialize custom variables after other variables are set but before preload starts. This is
   /// needed because preload will load segments which might require these custom variables.
   protected void initCustomVariables() {
+  }
+
+  /// Returns the partition managers this table holds. The table-level upsert view operations below
+  /// ([#lockForSegmentContexts()], [#unlockForSegmentContexts()], [#getNewlyAddedSegments()] and
+  /// [#setSegmentContexts(List, Map)]) apply to each of them.
+  protected abstract Collection<? extends BasePartitionUpsertMetadataManager> getPartitionMetadataManagers();
+
+  @Override
+  public void lockForSegmentContexts() {
+    for (BasePartitionUpsertMetadataManager metadataManager : getPartitionMetadataManagers()) {
+      metadataManager.getUpsertViewManager().lockTrackedSegments();
+    }
+  }
+
+  @Override
+  public void unlockForSegmentContexts() {
+    for (BasePartitionUpsertMetadataManager metadataManager : getPartitionMetadataManagers()) {
+      metadataManager.getUpsertViewManager().unlockTrackedSegments();
+    }
+  }
+
+  @Override
+  public Set<String> getNewlyAddedSegments() {
+    Set<String> newlyAddedSegments = new HashSet<>();
+    for (BasePartitionUpsertMetadataManager metadataManager : getPartitionMetadataManagers()) {
+      newlyAddedSegments.addAll(metadataManager.getNewlyAddedSegments());
+    }
+    return newlyAddedSegments;
+  }
+
+  @Override
+  public void setSegmentContexts(List<SegmentContext> segmentContexts, Map<String, String> queryOptions) {
+    // Get document-ID snapshots from the partition managers' upsert views if any consistency mode is used.
+    // Otherwise, get them from the segment objects directly. Either way, skipUpsertDelete selects valid docs, which
+    // include delete markers, instead of queryable docs.
+    if (_context.getConsistencyMode() == UpsertConfig.ConsistencyMode.NONE || QueryOptionsUtils.isSkipUpsertView(
+        queryOptions)) {
+      // No shared upsert-view lock exists in this branch, so a direct read is already safe here.
+      boolean skipUpsertDelete = QueryOptionsUtils.isSkipUpsertDelete(queryOptions);
+      for (SegmentContext segmentContext : segmentContexts) {
+        IndexSegment segment = segmentContext.getIndexSegment();
+        segmentContext.setDocIdsSnapshot(skipUpsertDelete
+            ? UpsertUtils.getValidDocIdsSnapshotFromSegment(segment)
+            : UpsertUtils.getQueryableDocIdsSnapshotFromSegment(segment));
+      }
+      return;
+    }
+    // A consistency mode is active: UpsertViewManager knows the locking each mode requires for skipUpsertDelete too.
+    for (BasePartitionUpsertMetadataManager metadataManager : getPartitionMetadataManagers()) {
+      metadataManager.getUpsertViewManager().setSegmentContexts(segmentContexts, queryOptions);
+    }
+    if (LOGGER.isDebugEnabled()) {
+      for (SegmentContext segmentContext : segmentContexts) {
+        IndexSegment segment = segmentContext.getIndexSegment();
+        if (segmentContext.getDocIdsSnapshot() == null) {
+          LOGGER.debug("No upsert view for segment: {}, type: {}, total: {}", segment.getSegmentName(),
+              (segment instanceof ImmutableSegment ? "imm" : "mut"), segment.getSegmentMetadata().getTotalDocs());
+        } else {
+          int cardCnt = segmentContext.getDocIdsSnapshot().getCardinality();
+          LOGGER.debug("Got upsert view of segment: {}, type: {}, total: {}, valid: {}", segment.getSegmentName(),
+              (segment instanceof ImmutableSegment ? "imm" : "mut"), segment.getSegmentMetadata().getTotalDocs(),
+              cardCnt);
+        }
+      }
+    }
   }
 
   @Override
