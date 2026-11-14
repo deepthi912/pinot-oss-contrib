@@ -19,7 +19,9 @@
 package org.apache.pinot.integration.tests.models;
 
 import java.io.IOException;
+import java.util.Collection;
 import java.util.Iterator;
+import java.util.List;
 import java.util.Map;
 import javax.annotation.Nullable;
 import org.apache.pinot.segment.local.indexsegment.immutable.ImmutableSegmentImpl;
@@ -30,6 +32,7 @@ import org.apache.pinot.segment.local.upsert.RecordInfo;
 import org.apache.pinot.segment.local.upsert.UpsertContext;
 import org.apache.pinot.segment.spi.IndexSegment;
 import org.apache.pinot.segment.spi.MutableSegment;
+import org.apache.pinot.segment.spi.SegmentContext;
 import org.apache.pinot.segment.spi.index.mutable.ThreadSafeMutableRoaringBitmap;
 import org.apache.pinot.spi.data.readers.GenericRow;
 import org.apache.pinot.spi.data.readers.PrimaryKey;
@@ -50,6 +53,17 @@ public class DummyTableUpsertMetadataManager extends BaseTableUpsertMetadataMana
   @Override
   public Map<Integer, Long> getPartitionToPrimaryKeyCount() {
     return Map.of();
+  }
+
+  /// Keeps no partition managers: [#getOrCreatePartitionManager(int)] creates a new one on every call.
+  @Override
+  protected Collection<BasePartitionUpsertMetadataManager> getPartitionMetadataManagers() {
+    return List.of();
+  }
+
+  /// Sets no document-ID snapshots, as before the base class implemented this method.
+  @Override
+  public void setSegmentContexts(List<SegmentContext> segmentContexts, Map<String, String> queryOptions) {
   }
 
   @Override
