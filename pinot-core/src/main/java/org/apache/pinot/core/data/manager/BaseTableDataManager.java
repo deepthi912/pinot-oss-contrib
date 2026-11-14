@@ -1054,6 +1054,12 @@ public abstract class BaseTableDataManager implements TableDataManager {
     } else {
       replaceUpsertSegment(segmentName, oldSegmentManager, newSegmentManager, partitionUpsertMetadataManager);
     }
+    onUpsertSegmentAdded(partitionUpsertMetadataManager);
+  }
+
+  /// Called after an immutable segment is added to, or replaces a segment in, the given upsert partition. Not called
+  /// for preloaded segments. No-op by default.
+  protected void onUpsertSegmentAdded(PartitionUpsertMetadataManager partitionUpsertMetadataManager) {
   }
 
   protected void replaceUpsertSegment(String segmentName, SegmentDataManager oldSegmentManager,

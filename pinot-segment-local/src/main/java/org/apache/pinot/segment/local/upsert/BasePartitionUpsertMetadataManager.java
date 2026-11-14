@@ -151,6 +151,7 @@ public abstract class BasePartitionUpsertMetadataManager implements PartitionUps
   private boolean _closed;
   // The lock and boolean flag ensure only one thread can start preloading and preloading happens only once.
   private final Lock _preloadLock = new ReentrantLock();
+  private final Lock _snapshotPassLock = new ReentrantLock();
   private volatile boolean _isPreloading;
 
   // By default, the upsert consistency mode is NONE and upsertViewManager is disabled.
@@ -970,9 +971,10 @@ public abstract class BasePartitionUpsertMetadataManager implements PartitionUps
     if (!_enableSnapshot) {
       return;
     }
-    if (_partialUpsertHandler == null && !_gotFirstConsumingSegment) {
+    if (_tableType != TableType.OFFLINE && _partialUpsertHandler == null && !_gotFirstConsumingSegment) {
       // We only skip for full-Upsert tables, for partial-upsert tables, we have a check allSegmentsLoaded in
-      // RealtimeTableDataManager
+      // RealtimeTableDataManager. OFFLINE tables have no consuming segment, and OfflineTableDataManager only takes
+      // snapshots after all segments are loaded.
       _logger.info("Skip taking snapshot before getting the first consuming segment for full-upsert table");
       return;
     }
@@ -980,6 +982,8 @@ public abstract class BasePartitionUpsertMetadataManager implements PartitionUps
       _logger.info("Skip taking snapshot because metadata manager is already stopped");
       return;
     }
+    // OFFLINE tables take snapshots on the Helix threads adding segments, so serialize the snapshot passes
+    _snapshotPassLock.lock();
     // Read the started count before the in-progress count, the reverse of the order startSegmentOperation() bumps them
     // in, so an operation that overlaps the pass always shows up in one of the two
     long numSegmentOperationsStarted = _numSegmentOperationsStarted.get();
@@ -995,6 +999,7 @@ public abstract class BasePartitionUpsertMetadataManager implements PartitionUps
     } catch (Exception e) {
       _logger.warn("Caught exception while taking snapshot", e);
     } finally {
+      _snapshotPassLock.unlock();
       recordSnapshotPass(consistent);
       finishOperation();
     }
