@@ -19,27 +19,16 @@
 package org.apache.pinot.segment.local.upsert;
 
 import java.io.IOException;
+import java.util.Collection;
 import java.util.HashMap;
-import java.util.HashSet;
-import java.util.List;
 import java.util.Map;
-import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import javax.annotation.concurrent.ThreadSafe;
-import org.apache.pinot.common.utils.config.QueryOptionsUtils;
-import org.apache.pinot.segment.spi.ImmutableSegment;
-import org.apache.pinot.segment.spi.IndexSegment;
-import org.apache.pinot.segment.spi.SegmentContext;
-import org.apache.pinot.spi.config.table.UpsertConfig;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 
 /// Implementation of [TableUpsertMetadataManager] that is backed by a [ConcurrentHashMap].
 @ThreadSafe
 public class ConcurrentMapTableUpsertMetadataManager extends BaseTableUpsertMetadataManager {
-  private static final Logger LOGGER = LoggerFactory.getLogger(ConcurrentMapTableUpsertMetadataManager.class);
-
   private final Map<Integer, BasePartitionUpsertMetadataManager> _partitionMetadataManagerMap =
       new ConcurrentHashMap<>();
 
@@ -68,59 +57,8 @@ public class ConcurrentMapTableUpsertMetadataManager extends BaseTableUpsertMeta
   }
 
   @Override
-  public void lockForSegmentContexts() {
-    _partitionMetadataManagerMap.forEach(
-        (partitionID, upsertMetadataManager) -> upsertMetadataManager.getUpsertViewManager().lockTrackedSegments());
-  }
-
-  @Override
-  public void unlockForSegmentContexts() {
-    _partitionMetadataManagerMap.forEach(
-        (partitionID, upsertMetadataManager) -> upsertMetadataManager.getUpsertViewManager().unlockTrackedSegments());
-  }
-
-  @Override
-  public Set<String> getNewlyAddedSegments() {
-    Set<String> newlyAddedSegments = new HashSet<>();
-    _partitionMetadataManagerMap.forEach((partitionID, upsertMetadataManager) -> newlyAddedSegments.addAll(
-        upsertMetadataManager.getNewlyAddedSegments()));
-    return newlyAddedSegments;
-  }
-
-  @Override
-  public void setSegmentContexts(List<SegmentContext> segmentContexts, Map<String, String> queryOptions) {
-    // Get queryableDocIds bitmaps from partitionMetadataManagers if any consistency mode is used.
-    // Otherwise, get queryableDocIds bitmaps as kept by the segment objects directly as before.
-    if (_context.getConsistencyMode() == UpsertConfig.ConsistencyMode.NONE || QueryOptionsUtils.isSkipUpsertView(
-        queryOptions)) {
-      // No shared upsert-view lock exists in this branch, so a direct read is already safe here.
-      boolean skipUpsertDelete = QueryOptionsUtils.isSkipUpsertDelete(queryOptions);
-      for (SegmentContext segmentContext : segmentContexts) {
-        IndexSegment segment = segmentContext.getIndexSegment();
-        segmentContext.setDocIdsSnapshot(skipUpsertDelete
-            ? UpsertUtils.getValidDocIdsSnapshotFromSegment(segment)
-            : UpsertUtils.getQueryableDocIdsSnapshotFromSegment(segment));
-      }
-      return;
-    }
-    // A consistency mode is active: UpsertViewManager knows the locking each mode requires for skipUpsertDelete too.
-    _partitionMetadataManagerMap.forEach(
-        (partitionID, upsertMetadataManager) -> upsertMetadataManager.getUpsertViewManager()
-            .setSegmentContexts(segmentContexts, queryOptions));
-    if (LOGGER.isDebugEnabled()) {
-      for (SegmentContext segmentContext : segmentContexts) {
-        IndexSegment segment = segmentContext.getIndexSegment();
-        if (segmentContext.getDocIdsSnapshot() == null) {
-          LOGGER.debug("No upsert view for segment: {}, type: {}, total: {}", segment.getSegmentName(),
-              (segment instanceof ImmutableSegment ? "imm" : "mut"), segment.getSegmentMetadata().getTotalDocs());
-        } else {
-          int cardCnt = segmentContext.getDocIdsSnapshot().getCardinality();
-          LOGGER.debug("Got upsert view of segment: {}, type: {}, total: {}, valid: {}", segment.getSegmentName(),
-              (segment instanceof ImmutableSegment ? "imm" : "mut"), segment.getSegmentMetadata().getTotalDocs(),
-              cardCnt);
-        }
-      }
-    }
+  protected Collection<BasePartitionUpsertMetadataManager> getPartitionMetadataManagers() {
+    return _partitionMetadataManagerMap.values();
   }
 
   @Override
