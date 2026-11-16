@@ -54,9 +54,13 @@ public class DistinctPlanNode implements PlanNode {
   @Override
   public Operator<DistinctResultsBlock> run() {
     List<ExpressionContext> expressions = _queryContext.getSelectExpressions();
+    // Every operator below reads the segment through this filter. Besides the WHERE clause, it applies the upsert
+    // valid-document snapshot, which hides the rows that newer records replaced.
+    BaseFilterOperator filterOperator = new FilterPlanNode(_segmentContext, _queryContext).run();
 
-    // Use dictionary to solve the query if possible
-    if (_queryContext.getFilter() == null && expressions.size() == 1) {
+    // A dictionary lists every value the segment stores, including values only hidden rows have, so it answers the
+    // query only when the filter keeps every document
+    if (filterOperator.isResultMatchingAll() && expressions.size() == 1) {
       String column = expressions.get(0).getIdentifier();
       if (column != null) {
         DataSource dataSource = _indexSegment.getDataSource(column, _queryContext.getSchema());
@@ -83,7 +87,6 @@ public class DistinctPlanNode implements PlanNode {
 
       // JSON index path
       if (JsonIndexDistinctOperator.canUseJsonIndexDistinct(expr)) {
-        BaseFilterOperator filterOperator = new FilterPlanNode(_segmentContext, _queryContext).run();
         return new JsonIndexDistinctOperator(_indexSegment, _queryContext, filterOperator);
       }
 
@@ -98,7 +101,6 @@ public class DistinctPlanNode implements PlanNode {
               invertedIndexReader instanceof SortedIndexReader ? FieldConfig.IndexType.SORTED
                   : FieldConfig.IndexType.INVERTED;
           if (_queryContext.isIndexUseAllowed(column, indexType)) {
-            BaseFilterOperator filterOperator = new FilterPlanNode(_segmentContext, _queryContext).run();
             return new InvertedIndexDistinctOperator(_indexSegment, _segmentContext, _queryContext, filterOperator,
                 dataSource);
           }
@@ -107,7 +109,8 @@ public class DistinctPlanNode implements PlanNode {
     }
 
     BaseProjectOperator<?> projectOperator =
-        new ProjectPlanNode(_segmentContext, _queryContext, expressions, DocIdSetPlanNode.MAX_DOC_PER_CALL).run();
+        new ProjectPlanNode(_segmentContext, _queryContext, expressions, DocIdSetPlanNode.MAX_DOC_PER_CALL,
+            filterOperator).run();
     return new DistinctOperator(_indexSegment, _queryContext, projectOperator);
   }
 }

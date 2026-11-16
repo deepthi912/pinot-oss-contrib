@@ -83,6 +83,18 @@ public class BitmapBasedFilterOperator extends BaseFilterOperator {
     return _nullBitmap != null ? BitmapDocIdSet.create(_nullBitmap, _numDocs) : EmptyDocIdSet.unscanned();
   }
 
+  /// Matches all when the bitmap keeps every document of the segment, for example the upsert valid-document snapshot
+  /// of a segment where no row was replaced. Callers then take the shortcuts that need every document, such as
+  /// answering from the dictionary. A filter with a null bitmap is three-valued and never reports matching all.
+  @Override
+  public boolean isResultMatchingAll() {
+    if (_nullBitmap != null) {
+      return false;
+    }
+    long numDocIdsInSegment = _docIds.rangeCardinality(0L, _numDocs);
+    return _exclusive ? numDocIdsInSegment == 0 : numDocIdsInSegment == _numDocs;
+  }
+
   @Override
   public boolean canOptimizeCount() {
     return true;
