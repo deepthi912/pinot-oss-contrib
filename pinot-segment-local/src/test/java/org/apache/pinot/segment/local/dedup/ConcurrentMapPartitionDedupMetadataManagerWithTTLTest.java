@@ -20,8 +20,11 @@ package org.apache.pinot.segment.local.dedup;
 
 import java.io.File;
 import java.io.IOException;
+import java.util.Arrays;
+import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Map;
 import java.util.TreeMap;
 import org.apache.commons.io.FileUtils;
 import org.apache.commons.lang3.tuple.Pair;
@@ -247,6 +250,9 @@ public class ConcurrentMapPartitionDedupMetadataManagerWithTTLTest {
 
   private void verifyAddTwoDifferentSegmentsRemoveEarlySegmentFirst(HashFunction hashFunction)
       throws IOException {
+    // Start each hash function as a fresh server, without the watermark file the previous run persisted. Otherwise
+    // the keys added below are out of TTL against that watermark and are not added.
+    FileUtils.cleanDirectory(TEMP_DIR);
     _dedupContextBuilder.setHashFunction(hashFunction);
     ConcurrentMapPartitionDedupMetadataManager metadataManager =
         new ConcurrentMapPartitionDedupMetadataManager(DedupTestUtils.REALTIME_TABLE_NAME, 0,
@@ -296,6 +302,9 @@ public class ConcurrentMapPartitionDedupMetadataManagerWithTTLTest {
 
   private void verifyAddTwoDifferentSegmentsRemoveRecentSegmentFirst(HashFunction hashFunction)
       throws IOException {
+    // Start each hash function as a fresh server, without the watermark file the previous run persisted. Otherwise
+    // the keys added below are out of TTL against that watermark and are not added.
+    FileUtils.cleanDirectory(TEMP_DIR);
     _dedupContextBuilder.setHashFunction(hashFunction);
     ConcurrentMapPartitionDedupMetadataManager metadataManager =
         new ConcurrentMapPartitionDedupMetadataManager(DedupTestUtils.REALTIME_TABLE_NAME, 0,
@@ -428,6 +437,238 @@ public class ConcurrentMapPartitionDedupMetadataManagerWithTTLTest {
       Mockito.when(dedupTimeColumnReader.getValue(i)).thenReturn(time);
     }
     return new DedupUtils.DedupRecordInfoReader(primaryKeyReader, dedupTimeColumnReader);
+  }
+
+  // Each segment below holds 10 keys: segment n has keys [10n, 10n + 9] with dedup time key * 1000, so one TTL
+  // (10000) spans 10 keys. "Window" in the comments means the keys within TTL of the watermark: 11 keys, both ends
+  // included.
+
+  // A server newly assigned a partition has no watermark file, so the watermark starts at 0. Loading the history
+  // oldest first used to put every key into the map; expired keys must be dropped while the segments load.
+  @Test
+  public void testColdBootstrapOldestFirstKeepsMapBounded()
+      throws IOException {
+    verifyColdBootstrapOldestFirst(false);
+    verifyColdBootstrapOldestFirst(true);
+  }
+
+  private void verifyColdBootstrapOldestFirst(boolean preload)
+      throws IOException {
+    RowFeedingDedupMetadataManager metadataManager = newRowFeedingMetadataManager();
+    ImmutableSegmentImpl[] segments = new ImmutableSegmentImpl[6];
+    for (int i = 0; i < 6; i++) {
+      segments[i] = metadataManager.addRows(i, 10 * i, 10);
+      if (preload) {
+        metadataManager.preloadSegment(segments[i]);
+      } else {
+        metadataManager.addSegment(segments[i]);
+      }
+      // One window plus the segment being loaded, never the whole history.
+      assertTrue(metadataManager.getNumPrimaryKeys() <= 21,
+          "Map holds " + metadataManager.getNumPrimaryKeys() + " keys after loading segment " + i);
+    }
+    assertEquals(metadataManager._largestSeenTime.get(), 59000.0);
+    assertEquals(metadataManager.getNumPrimaryKeys(), 11);
+    verifyKey(metadataManager, 49, segments[4]);
+    for (int key = 50; key < 60; key++) {
+      verifyKey(metadataManager, key, segments[5]);
+    }
+    closeMetadataManager(metadataManager);
+  }
+
+  // Loading newest first skips the older segments as a whole, and the rows of the segment straddling the TTL
+  // boundary that are already expired must not be added either.
+  @Test
+  public void testColdBootstrapNewestFirstSkipsExpiredRows()
+      throws IOException {
+    RowFeedingDedupMetadataManager metadataManager = newRowFeedingMetadataManager();
+    ImmutableSegmentImpl[] segments = new ImmutableSegmentImpl[6];
+    for (int i = 5; i >= 0; i--) {
+      segments[i] = metadataManager.addRows(i, 10 * i, 10);
+      metadataManager.addSegment(segments[i]);
+    }
+    assertEquals(metadataManager.getNumPrimaryKeys(), 11);
+    verifyKey(metadataManager, 49, segments[4]);
+    for (int key = 40; key < 49; key++) {
+      assertFalse(metadataManager._primaryKeyToSegmentAndTimeMap.containsKey(hash(key)));
+    }
+    closeMetadataManager(metadataManager);
+  }
+
+  // Restart: the watermark loaded from the file already sets the window, so loading needs no sweep. The expired
+  // rows of a segment straddling the boundary are still not added.
+  @Test
+  public void testRestartWithPersistedWatermark()
+      throws IOException {
+    RowFeedingDedupMetadataManager previousRun = newRowFeedingMetadataManager();
+    WatermarkUtils.persistWatermark(59000, previousRun.getWatermarkFile());
+    closeMetadataManager(previousRun);
+
+    RowFeedingDedupMetadataManager metadataManager = newRowFeedingMetadataManager();
+    assertEquals(metadataManager._largestSeenTime.get(), 59000.0);
+    for (int i = 0; i < 6; i++) {
+      metadataManager.addSegment(metadataManager.addRows(i, 10 * i, 10));
+    }
+    assertEquals(metadataManager.getNumPrimaryKeys(), 11);
+    assertEquals(metadataManager._numSweeps, 0);
+    closeMetadataManager(metadataManager);
+  }
+
+  // Segment commit replaces the consuming segment through replaceSegment, which must keep its behavior: stale
+  // entries move to the committed segment, no row is skipped and no sweep runs on the commit path.
+  @Test
+  public void testCommitReplaceDoesNotSkipRowsOrSweep()
+      throws IOException {
+    RowFeedingDedupMetadataManager metadataManager = newRowFeedingMetadataManager();
+    IndexSegment consumingSegment = mock(IndexSegment.class);
+    for (int key = 0; key < 30; key++) {
+      metadataManager.checkRecordPresentOrUpdate(new DedupRecordInfo(DedupTestUtils.getPrimaryKey(key), key * 1000),
+          consumingSegment);
+    }
+    // The watermark is 29000, so keys 0 to 18 are out of TTL, and it moved past TTL since the last sweep.
+    ImmutableSegmentImpl committedSegment = metadataManager.addRows(1, 0, 30);
+    metadataManager.replaceSegment(consumingSegment, committedSegment);
+    assertEquals(metadataManager.getNumPrimaryKeys(), 30);
+    for (int key = 0; key < 30; key++) {
+      verifyKey(metadataManager, key, committedSegment);
+    }
+    assertEquals(metadataManager._numSweeps, 0);
+    closeMetadataManager(metadataManager);
+  }
+
+  // TTL cleanup: the consuming thread's sweep counts as the last sweep, so loading a segment soon after it does not
+  // sweep again.
+  @Test
+  public void testConsumingSweepCountsAsLastSweep()
+      throws IOException {
+    RowFeedingDedupMetadataManager metadataManager = newRowFeedingMetadataManager();
+    metadataManager.checkRecordPresentOrUpdate(new DedupRecordInfo(DedupTestUtils.getPrimaryKey(50), 50000),
+        mock(IndexSegment.class));
+    metadataManager.removeExpiredPrimaryKeys();
+    assertEquals(metadataManager._numSweeps, 1);
+    // Moves the watermark from 50000 to 59000, less than TTL past the consuming sweep.
+    metadataManager.addSegment(metadataManager.addRows(5, 50, 10));
+    assertEquals(metadataManager._numSweeps, 1);
+    // Moves the watermark to 69000, a full TTL past the consuming sweep.
+    metadataManager.addSegment(metadataManager.addRows(6, 60, 10));
+    assertEquals(metadataManager._numSweeps, 2);
+    assertEquals(metadataManager.getNumPrimaryKeys(), 11);
+    closeMetadataManager(metadataManager);
+  }
+
+  // Backfill: an uploaded segment goes through addSegment. Its expired rows are not added, and a segment that moves
+  // the watermark by TTL or more sweeps right away instead of at the next consuming segment.
+  @Test
+  public void testBackfillSegment()
+      throws IOException {
+    RowFeedingDedupMetadataManager metadataManager = newRowFeedingMetadataManager();
+    IndexSegment consumingSegment = mock(IndexSegment.class);
+    metadataManager.checkRecordPresentOrUpdate(new DedupRecordInfo(DedupTestUtils.getPrimaryKey(59), 59000),
+        consumingSegment);
+    metadataManager.removeExpiredPrimaryKeys();
+
+    // Backfill of keys 30 to 59: keys 30 to 48 are out of TTL against the watermark 59000.
+    ImmutableSegmentImpl backfill = metadataManager.addRows(100, 30, 30);
+    metadataManager.addSegment(backfill);
+    assertEquals(metadataManager.getNumPrimaryKeys(), 11);
+    for (int key = 30; key < 49; key++) {
+      assertFalse(metadataManager._primaryKeyToSegmentAndTimeMap.containsKey(hash(key)));
+    }
+
+    // Backfill with newer data: the watermark moves to 109000 and the keys before 99000 are swept.
+    ImmutableSegmentImpl newerBackfill = metadataManager.addRows(101, 100, 10);
+    metadataManager.addSegment(newerBackfill);
+    assertEquals(metadataManager._largestSeenTime.get(), 109000.0);
+    assertEquals(metadataManager.getNumPrimaryKeys(), 10);
+    for (int key = 100; key < 110; key++) {
+      verifyKey(metadataManager, key, newerBackfill);
+    }
+    closeMetadataManager(metadataManager);
+  }
+
+  // Preload puts each row without comparing dedup times, and segments preload in any order. A key re-ingested after
+  // its old copy expired is in two segments; if the older segment straddles the TTL boundary and preloads last, its
+  // expired copy used to overwrite the live entry, so a duplicate within TTL was accepted.
+  @Test
+  public void testPreloadDoesNotOverwriteLiveKeyWithExpiredCopy()
+      throws IOException {
+    RowFeedingDedupMetadataManager metadataManager = newRowFeedingMetadataManager();
+    ImmutableSegmentImpl newerSegment = metadataManager.addRows(2, 50, 10);
+    metadataManager.preloadSegment(newerSegment);
+    // Key 50 at 30000 is out of TTL against the watermark 59000; key 70 at 55000 keeps the segment within TTL.
+    ImmutableSegmentImpl olderSegment = metadataManager.addRows(1, new int[]{50, 70}, new double[]{30000, 55000});
+    metadataManager.preloadSegment(olderSegment);
+    verifyKey(metadataManager, 50, newerSegment);
+    assertTrue(metadataManager.checkRecordPresentOrUpdate(
+        new DedupRecordInfo(DedupTestUtils.getPrimaryKey(50), 52000), mock(IndexSegment.class)));
+    closeMetadataManager(metadataManager);
+  }
+
+  private RowFeedingDedupMetadataManager newRowFeedingMetadataManager() {
+    return new RowFeedingDedupMetadataManager(_dedupContextBuilder.setHashFunction(HashFunction.NONE).build());
+  }
+
+  private static Object hash(int key) {
+    return HashUtils.hashPrimaryKey(DedupTestUtils.getPrimaryKey(key), HashFunction.NONE);
+  }
+
+  private static void verifyKey(ConcurrentMapPartitionDedupMetadataManager metadataManager, int key,
+      IndexSegment segment) {
+    assertEquals(metadataManager._primaryKeyToSegmentAndTimeMap.get(hash(key)), Pair.of(segment, key * 1000.0));
+  }
+
+  private static void closeMetadataManager(ConcurrentMapPartitionDedupMetadataManager metadataManager)
+      throws IOException {
+    metadataManager.stop();
+    metadataManager.close();
+  }
+
+  /// Feeds each segment's rows to the manager and counts the expired key sweeps.
+  private static class RowFeedingDedupMetadataManager extends ConcurrentMapPartitionDedupMetadataManager {
+    private final Map<IndexSegment, DedupUtils.DedupRecordInfoReader> _readers = new HashMap<>();
+    private int _numSweeps;
+
+    RowFeedingDedupMetadataManager(DedupContext dedupContext) {
+      super(DedupTestUtils.REALTIME_TABLE_NAME, 0, dedupContext);
+    }
+
+    /// Returns a segment with keys [startKey, startKey + numDocs - 1], each with dedup time key * 1000.
+    ImmutableSegmentImpl addRows(int sequenceNumber, int startKey, int numDocs) {
+      int[] keys = new int[numDocs];
+      double[] times = new double[numDocs];
+      for (int i = 0; i < numDocs; i++) {
+        keys[i] = startKey + i;
+        times[i] = keys[i] * 1000.0;
+      }
+      return addRows(sequenceNumber, keys, times);
+    }
+
+    /// Returns a segment whose doc i has primary key keys[i] and dedup time times[i].
+    ImmutableSegmentImpl addRows(int sequenceNumber, int[] keys, double[] times) {
+      ImmutableSegmentImpl segment = DedupTestUtils.mockSegment(sequenceNumber, keys.length);
+      ColumnMetadata columnMetadata = mock(ColumnMetadata.class);
+      doReturn(Arrays.stream(times).max().orElseThrow()).when(columnMetadata).getMaxValue();
+      when(segment.getSegmentMetadata().getColumnMetadataFor(DEDUP_TIME_COLUMN_NAME)).thenReturn(columnMetadata);
+      PrimaryKeyReader primaryKeyReader = mock(PrimaryKeyReader.class);
+      PinotSegmentColumnReader dedupTimeColumnReader = mock(PinotSegmentColumnReader.class);
+      for (int i = 0; i < keys.length; i++) {
+        when(primaryKeyReader.getPrimaryKey(i)).thenReturn(DedupTestUtils.getPrimaryKey(keys[i]));
+        when(dedupTimeColumnReader.getValue(i)).thenReturn(times[i]);
+      }
+      _readers.put(segment, new DedupUtils.DedupRecordInfoReader(primaryKeyReader, dedupTimeColumnReader));
+      return segment;
+    }
+
+    @Override
+    DedupUtils.DedupRecordInfoReader createDedupRecordInfoReader(IndexSegment segment) {
+      return _readers.get(segment);
+    }
+
+    @Override
+    protected void doRemoveExpiredPrimaryKeys() {
+      _numSweeps++;
+      super.doRemoveExpiredPrimaryKeys();
+    }
   }
 
   @Test
