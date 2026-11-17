@@ -21,22 +21,31 @@ package org.apache.pinot.segment.local.indexsegment.mutable;
 import java.io.File;
 import java.io.IOException;
 import java.net.URL;
+import java.util.ArrayList;
 import java.util.List;
+import org.apache.commons.io.FileUtils;
 import org.apache.pinot.segment.local.data.manager.TableDataManager;
+import org.apache.pinot.segment.local.indexsegment.immutable.ImmutableSegmentImpl;
+import org.apache.pinot.segment.local.indexsegment.immutable.ImmutableSegmentLoader;
 import org.apache.pinot.segment.local.segment.creator.TransformPipeline;
+import org.apache.pinot.segment.local.segment.creator.impl.SegmentIndexCreationDriverImpl;
+import org.apache.pinot.segment.local.segment.readers.GenericRowRecordReader;
 import org.apache.pinot.segment.local.upsert.PartitionUpsertMetadataManager;
 import org.apache.pinot.segment.local.upsert.TableUpsertMetadataManager;
 import org.apache.pinot.segment.local.upsert.TableUpsertMetadataManagerFactory;
+import org.apache.pinot.segment.spi.creator.SegmentGeneratorConfig;
 import org.apache.pinot.spi.config.table.HashFunction;
 import org.apache.pinot.spi.config.table.TableConfig;
 import org.apache.pinot.spi.config.table.TableType;
 import org.apache.pinot.spi.config.table.UpsertConfig;
+import org.apache.pinot.spi.data.FieldSpec.DataType;
 import org.apache.pinot.spi.data.Schema;
 import org.apache.pinot.spi.data.readers.FileFormat;
 import org.apache.pinot.spi.data.readers.GenericRow;
 import org.apache.pinot.spi.data.readers.RecordReader;
 import org.apache.pinot.spi.data.readers.RecordReaderFactory;
 import org.apache.pinot.spi.env.PinotConfiguration;
+import org.apache.pinot.spi.utils.ReadMode;
 import org.apache.pinot.spi.utils.builder.TableConfigBuilder;
 import org.roaringbitmap.buffer.ImmutableRoaringBitmap;
 import org.testng.annotations.Test;
@@ -189,6 +198,110 @@ public class MutableSegmentImplUpsertTest {
     testUpsertIngestion(createPartialUpsertConfig(HashFunction.NONE));
     testUpsertIngestion(createPartialUpsertConfig(HashFunction.MD5));
     testUpsertIngestion(createPartialUpsertConfig(HashFunction.MURMUR3));
+  }
+
+  /// With several comparison columns each event fills one of them. Live ingestion compares the incoming column and
+  /// carries the other columns' last values in the upsert metadata. A commit or a restart rebuilds the metadata from
+  /// the stored rows, so the stored rows must hold the same comparison values, or the rebuild picks another winner.
+  @Test
+  public void testMultipleComparisonColumnsKeepWinnerAfterCommitAndRestart()
+      throws Exception {
+    Schema schema = new Schema.SchemaBuilder().setSchemaName(RAW_TABLE_NAME)
+        .addSingleValueDimension(PRIMARY_KEY_COLUMN, DataType.STRING)
+        .addSingleValueDimension("a", DataType.LONG)
+        .addSingleValueDimension("b", DataType.LONG)
+        .addSingleValueDimension("deleted", DataType.BOOLEAN)
+        .setPrimaryKeyColumns(List.of(PRIMARY_KEY_COLUMN))
+        .build();
+    UpsertConfig upsertConfig = new UpsertConfig(UpsertConfig.Mode.FULL);
+    upsertConfig.setComparisonColumns(List.of("a", "b"));
+    upsertConfig.setDeleteRecordColumn("deleted");
+    TableConfig tableConfig = new TableConfigBuilder(TableType.REALTIME).setTableName(RAW_TABLE_NAME)
+        .setUpsertConfig(upsertConfig)
+        .setNullHandlingEnabled(true)
+        .build();
+    TransformPipeline transformPipeline = new TransformPipeline(tableConfig, schema);
+    File segmentDir = new File(FileUtils.getTempDirectory(), "MutableSegmentImplUpsertTest");
+    FileUtils.deleteQuietly(segmentDir);
+
+    PartitionUpsertMetadataManager manager = createPartitionManager(tableConfig, schema);
+    MutableSegmentImpl mutableSegment =
+        MutableSegmentImplTestUtils.createMutableSegmentImpl(schema, true, null, manager, null);
+    ImmutableSegmentImpl committedSegment = null;
+    PartitionUpsertMetadataManager restartedManager = null;
+    ImmutableSegmentImpl restartedSegment = null;
+    try {
+      // k1: CREATE a=380, DELETE b=382. The delete wins and must stay.
+      indexRow(mutableSegment, transformPipeline, "k1", 380L, null, false);
+      indexRow(mutableSegment, transformPipeline, "k1", null, 382L, true);
+      // k2: CREATE b=10, DELETE a=20, RECREATE b=30. The recreate wins and must stay.
+      indexRow(mutableSegment, transformPipeline, "k2", null, 10L, false);
+      indexRow(mutableSegment, transformPipeline, "k2", 20L, null, true);
+      indexRow(mutableSegment, transformPipeline, "k2", null, 30L, false);
+      // k3: CREATE a=380, UPDATE b=383, late a=379. The update wins; the late event must not.
+      indexRow(mutableSegment, transformPipeline, "k3", 380L, null, false);
+      indexRow(mutableSegment, transformPipeline, "k3", null, 383L, false);
+      indexRow(mutableSegment, transformPipeline, "k3", 379L, null, false);
+      assertEquals(mutableSegment.getQueryableDocIds().getMutableRoaringBitmap().toArray(), new int[]{4, 6});
+
+      // Commit: build the immutable segment from the stored rows and replace the consuming segment with it
+      List<GenericRow> rows = new ArrayList<>();
+      for (int docId = 0; docId < mutableSegment.getNumDocsIndexed(); docId++) {
+        rows.add(mutableSegment.getRecord(docId, new GenericRow()));
+      }
+      SegmentGeneratorConfig generatorConfig = new SegmentGeneratorConfig(tableConfig, schema);
+      generatorConfig.setOutDir(segmentDir.getAbsolutePath());
+      generatorConfig.setSegmentName(mutableSegment.getSegmentName());
+      generatorConfig.setTableName(RAW_TABLE_NAME);
+      SegmentIndexCreationDriverImpl driver = new SegmentIndexCreationDriverImpl();
+      driver.init(generatorConfig, new GenericRowRecordReader(rows));
+      driver.build();
+      File indexDir = new File(segmentDir, mutableSegment.getSegmentName());
+      committedSegment = (ImmutableSegmentImpl) ImmutableSegmentLoader.load(indexDir, ReadMode.mmap);
+      // The first event of k1 carries only column a
+      assertTrue(committedSegment.getDataSource("b").getNullValueVector().isNull(0));
+      manager.replaceSegment(committedSegment, mutableSegment);
+      assertEquals(committedSegment.getQueryableDocIds().getMutableRoaringBitmap().toArray(), new int[]{4, 6});
+
+      // Restart: a new metadata manager rebuilds from the committed segment alone
+      restartedManager = createPartitionManager(tableConfig, schema);
+      restartedSegment = (ImmutableSegmentImpl) ImmutableSegmentLoader.load(indexDir, ReadMode.mmap);
+      restartedManager.addSegment(restartedSegment);
+      assertEquals(restartedSegment.getQueryableDocIds().getMutableRoaringBitmap().toArray(), new int[]{4, 6});
+    } finally {
+      mutableSegment.destroy();
+      if (committedSegment != null) {
+        committedSegment.destroy();
+      }
+      if (restartedSegment != null) {
+        restartedSegment.destroy();
+      }
+      manager.stop();
+      manager.close();
+      if (restartedManager != null) {
+        restartedManager.stop();
+        restartedManager.close();
+      }
+      FileUtils.deleteQuietly(segmentDir);
+    }
+  }
+
+  private static PartitionUpsertMetadataManager createPartitionManager(TableConfig tableConfig, Schema schema) {
+    return TableUpsertMetadataManagerFactory.create(new PinotConfiguration(), tableConfig, schema,
+        mock(TableDataManager.class), null).getOrCreatePartitionManager(0);
+  }
+
+  private static void indexRow(MutableSegmentImpl segment, TransformPipeline transformPipeline, String key,
+      Long a, Long b, boolean deleted)
+      throws Exception {
+    GenericRow row = new GenericRow();
+    row.putValue(PRIMARY_KEY_COLUMN, key);
+    row.putValue("a", a);
+    row.putValue("b", b);
+    row.putValue("deleted", deleted);
+    for (GenericRow transformedRow : transformPipeline.processRow(row).getTransformedRows()) {
+      segment.index(transformedRow, null);
+    }
   }
 
   private void testUpsertIngestion(UpsertConfig upsertConfig)
