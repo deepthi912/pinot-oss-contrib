@@ -1046,11 +1046,13 @@ public abstract class BaseServerStarter implements ServiceStartable {
   }
 
   protected void triggerPageCacheWarmup() {
+    // Fail the start here: start() calls startQueryServer() again, which would fail with a secondary error that hides
+    // the cause of this one. Only a warmup failure is tolerated.
+    _serverInstance.startQueryServer();
     try {
-      _serverInstance.startQueryServer();
       _serverInstance.getPageCacheWarmupServerQueryExecutor().startWarmupOnRestart();
     } catch (Exception e) {
-      LOGGER.warn("Caught exception while pre-serving queries,", e);
+      LOGGER.warn("Caught exception while warming up the page cache", e);
     }
   }
 

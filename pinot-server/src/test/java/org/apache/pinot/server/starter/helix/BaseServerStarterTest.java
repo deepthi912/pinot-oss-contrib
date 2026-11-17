@@ -18,15 +18,24 @@
  */
 package org.apache.pinot.server.starter.helix;
 
+import org.apache.pinot.server.starter.ServerInstance;
+import org.apache.pinot.server.warmup.PageCacheWarmupServerQueryExecutor;
 import org.apache.pinot.spi.env.PinotConfiguration;
 import org.apache.pinot.spi.utils.CommonConstants.Helix;
 import org.apache.pinot.spi.utils.NetUtils;
 import org.mockito.MockedStatic;
 import org.testng.annotations.Test;
 
+import static org.mockito.Mockito.CALLS_REAL_METHODS;
+import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.mockStatic;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 import static org.testng.Assert.assertEquals;
+import static org.testng.Assert.assertSame;
+import static org.testng.Assert.expectThrows;
 
 public class BaseServerStarterTest {
   @Test
@@ -75,5 +84,31 @@ public class BaseServerStarterTest {
       netUtils.verify(NetUtils::getHostnameOrAddress);
       netUtils.verify(NetUtils::getHostAddress, never());
     }
+  }
+
+  /// A failed query server start must fail the server start with its own cause. Swallowing it made the second
+  /// startQueryServer() call in start() fail with "event executor terminated" instead.
+  @Test
+  public void testQueryServerStartFailureIsNotSwallowed() {
+    BaseServerStarter starter = mock(BaseServerStarter.class, CALLS_REAL_METHODS);
+    starter._serverInstance = mock(ServerInstance.class);
+    RuntimeException startFailure = new RuntimeException("Address already in use");
+    doThrow(startFailure).when(starter._serverInstance).startQueryServer();
+
+    assertSame(expectThrows(RuntimeException.class, starter::triggerPageCacheWarmup), startFailure);
+    verify(starter._serverInstance, never()).getPageCacheWarmupServerQueryExecutor();
+  }
+
+  @Test
+  public void testPageCacheWarmupFailureIsTolerated() {
+    BaseServerStarter starter = mock(BaseServerStarter.class, CALLS_REAL_METHODS);
+    starter._serverInstance = mock(ServerInstance.class);
+    PageCacheWarmupServerQueryExecutor warmupExecutor = mock(PageCacheWarmupServerQueryExecutor.class);
+    when(starter._serverInstance.getPageCacheWarmupServerQueryExecutor()).thenReturn(warmupExecutor);
+    doThrow(new RuntimeException("Warmup failed")).when(warmupExecutor).startWarmupOnRestart();
+
+    starter.triggerPageCacheWarmup();
+    verify(starter._serverInstance).startQueryServer();
+    verify(warmupExecutor).startWarmupOnRestart();
   }
 }

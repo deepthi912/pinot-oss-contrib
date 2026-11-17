@@ -19,6 +19,7 @@
 package org.apache.pinot.core.transport;
 
 import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Preconditions;
 import io.netty.bootstrap.ServerBootstrap;
 import io.netty.buffer.PooledByteBufAllocator;
 import io.netty.buffer.PooledByteBufAllocatorMetric;
@@ -40,6 +41,7 @@ import io.netty.util.internal.PlatformDependent;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Supplier;
 import org.apache.pinot.common.config.NettyConfig;
 import org.apache.pinot.common.config.TlsConfig;
 import org.apache.pinot.common.metrics.ServerGauge;
@@ -51,15 +53,19 @@ import org.slf4j.LoggerFactory;
 
 /// The `QueryServer` is the Netty server that runs on Pinot Server to handle the instance requests sent from
 /// Pinot Brokers.
+///
+/// [#start()] and [#shutDown()] are not thread-safe; the caller runs them one at a time.
 public class QueryServer {
   private static final Logger LOGGER = LoggerFactory.getLogger(QueryServer.class);
   private final int _port;
   private final TlsConfig _tlsConfig;
 
-  private final EventLoopGroup _bossGroup;
-  private final EventLoopGroup _workerGroup;
+  private final Supplier<EventLoopGroup> _eventLoopGroupFactory;
   private final Class<? extends ServerSocketChannel> _channelClass;
   private final ChannelHandler _instanceRequestHandler;
+  // Created by each start, so that a start can follow a failed one: a failed start shuts down the groups it created.
+  private EventLoopGroup _bossGroup;
+  private EventLoopGroup _workerGroup;
   private ServerSocketChannel _channel;
   private final ConcurrentHashMap<SocketChannel, Boolean> _allChannels = new ConcurrentHashMap<>();
   private volatile boolean _shuttingDown;
@@ -86,18 +92,15 @@ public class QueryServer {
     boolean enableNativeTransports = nettyConfig != null && nettyConfig.isNativeTransportsEnabled();
     OsCheck.OSType operatingSystemType = OsCheck.getOperatingSystemType();
     if (enableNativeTransports && operatingSystemType == OsCheck.OSType.Linux && Epoll.isAvailable()) {
-      _bossGroup = new EpollEventLoopGroup();
-      _workerGroup = new EpollEventLoopGroup();
+      _eventLoopGroupFactory = EpollEventLoopGroup::new;
       _channelClass = EpollServerSocketChannel.class;
       LOGGER.info("Using Epoll event loop");
     } else if (enableNativeTransports && operatingSystemType == OsCheck.OSType.MacOS && KQueue.isAvailable()) {
-      _bossGroup = new KQueueEventLoopGroup();
-      _workerGroup = new KQueueEventLoopGroup();
+      _eventLoopGroupFactory = KQueueEventLoopGroup::new;
       _channelClass = KQueueServerSocketChannel.class;
       LOGGER.info("Using KQueue event loop");
     } else {
-      _bossGroup = new NioEventLoopGroup();
-      _workerGroup = new NioEventLoopGroup();
+      _eventLoopGroupFactory = NioEventLoopGroup::new;
       _channelClass = NioServerSocketChannel.class;
       StringBuilder log = new StringBuilder("Using NIO event loop");
       if (operatingSystemType == OsCheck.OSType.Linux && enableNativeTransports) {
@@ -110,6 +113,10 @@ public class QueryServer {
   }
 
   public void start() {
+    Preconditions.checkState(_channel == null || !_channel.isOpen(), "Query server is already started");
+    _shuttingDown = false;
+    _bossGroup = _eventLoopGroupFactory.get();
+    _workerGroup = _eventLoopGroupFactory.get();
     try {
       ServerBootstrap serverBootstrap = new ServerBootstrap();
 
@@ -158,9 +165,9 @@ public class QueryServer {
             }
           }).bind(_port).sync().channel();
     } catch (Exception e) {
-      // Shut down immediately
-      _workerGroup.shutdownGracefully(0, 0, TimeUnit.SECONDS);
-      _bossGroup.shutdownGracefully(0, 0, TimeUnit.SECONDS);
+      // Shut down immediately. The next start creates new groups, so it can succeed once the cause (e.g. the port
+      // still bound by a stopped server) is gone.
+      shutDownEventLoopGroups();
       throw new RuntimeException(e);
     }
   }
@@ -168,7 +175,10 @@ public class QueryServer {
   public void shutDown() {
     _shuttingDown = true;
     try {
-      _channel.close().sync();
+      // The channel can be one closed by an earlier shut down when the last start failed
+      if (_channel != null && _channel.isOpen()) {
+        _channel.close().sync();
+      }
       // Close accepted connections explicitly, including registrations racing with listener shutdown.
       for (SocketChannel channel : _allChannels.keySet()) {
         channel.close();
@@ -176,7 +186,15 @@ public class QueryServer {
     } catch (Exception e) {
       throw new RuntimeException(e);
     } finally {
+      shutDownEventLoopGroups();
+    }
+  }
+
+  private void shutDownEventLoopGroups() {
+    if (_workerGroup != null) {
       _workerGroup.shutdownGracefully(0, 0, TimeUnit.SECONDS);
+    }
+    if (_bossGroup != null) {
       _bossGroup.shutdownGracefully(0, 0, TimeUnit.SECONDS);
     }
   }

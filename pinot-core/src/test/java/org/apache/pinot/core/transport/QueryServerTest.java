@@ -20,9 +20,12 @@ package org.apache.pinot.core.transport;
 
 import io.netty.channel.ChannelHandler;
 import io.netty.channel.socket.SocketChannel;
+import java.io.IOException;
 import java.net.InetSocketAddress;
+import java.net.ServerSocket;
 import java.net.Socket;
 import org.apache.commons.io.IOUtils;
+import org.apache.commons.lang3.exception.ExceptionUtils;
 import org.apache.pinot.common.config.NettyConfig;
 import org.apache.pinot.common.config.TlsConfig;
 import org.apache.pinot.common.metrics.ServerMetrics;
@@ -37,6 +40,7 @@ import static org.mockito.Mockito.mock;
 import static org.testng.Assert.assertFalse;
 import static org.testng.Assert.assertSame;
 import static org.testng.Assert.assertTrue;
+import static org.testng.Assert.expectThrows;
 
 
 public class QueryServerTest {
@@ -99,6 +103,50 @@ public class QueryServerTest {
           "Channel was not removed from _allChannels after close");
     } finally {
       IOUtils.closeQuietly(socket);
+      server.shutDown();
+    }
+  }
+
+  /// A start that fails, e.g. because the port is still held by a stopped server, must report the bind failure and
+  /// leave the server able to start once the port is free.
+  @Test(dataProvider = "parameters")
+  public void testStartAfterFailedStart(boolean nativeTransportEnabled)
+      throws Exception {
+    PinotMetricUtils.init(new PinotConfiguration());
+    ServerMetrics.register(new ServerMetrics(PinotMetricUtils.getPinotMetricsRegistry()));
+    NettyConfig nettyConfig = new NettyConfig();
+    nettyConfig.setNativeTransportsEnabled(nativeTransportEnabled);
+
+    QueryServer server;
+    try (ServerSocket portHolder = new ServerSocket(0)) {
+      server = new QueryServer(portHolder.getLocalPort(), nettyConfig, null, mock(ChannelHandler.class));
+      RuntimeException e = expectThrows(RuntimeException.class, server::start);
+      assertTrue(ExceptionUtils.indexOfType(e, IOException.class) >= 0, "Bind failure is not the cause: " + e);
+    }
+
+    // The port is free now, so the same server must start
+    server.start();
+    try {
+      assertTrue(connectionOk(server.getChannel().localAddress()));
+    } finally {
+      server.shutDown();
+    }
+  }
+
+  @Test
+  public void testShutDownWithoutStart() {
+    new QueryServer(0, new NettyConfig(), null, mock(ChannelHandler.class)).shutDown();
+  }
+
+  @Test
+  public void testStartWhileStarted() {
+    PinotMetricUtils.init(new PinotConfiguration());
+    ServerMetrics.register(new ServerMetrics(PinotMetricUtils.getPinotMetricsRegistry()));
+    QueryServer server = new QueryServer(0, new NettyConfig(), null, mock(ChannelHandler.class));
+    server.start();
+    try {
+      expectThrows(IllegalStateException.class, server::start);
+    } finally {
       server.shutDown();
     }
   }
