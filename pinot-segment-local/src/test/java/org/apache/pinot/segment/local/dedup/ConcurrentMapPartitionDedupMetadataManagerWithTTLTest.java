@@ -20,6 +20,7 @@ package org.apache.pinot.segment.local.dedup;
 
 import java.io.File;
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.Iterator;
@@ -28,6 +29,8 @@ import java.util.Map;
 import java.util.TreeMap;
 import org.apache.commons.io.FileUtils;
 import org.apache.commons.lang3.tuple.Pair;
+import org.apache.pinot.common.metadata.segment.SegmentZKMetadata;
+import org.apache.pinot.common.utils.LLCSegmentName;
 import org.apache.pinot.segment.local.data.manager.TableDataManager;
 import org.apache.pinot.segment.local.indexsegment.immutable.ImmutableSegmentImpl;
 import org.apache.pinot.segment.local.segment.readers.PinotSegmentColumnReader;
@@ -41,6 +44,7 @@ import org.apache.pinot.spi.config.table.HashFunction;
 import org.apache.pinot.spi.config.table.TableConfig;
 import org.apache.pinot.spi.data.Schema;
 import org.apache.pinot.spi.data.readers.PrimaryKey;
+import org.apache.pinot.spi.utils.CommonConstants.Segment.Realtime.Status;
 import org.mockito.Mockito;
 import org.testng.annotations.AfterMethod;
 import org.testng.annotations.BeforeMethod;
@@ -51,6 +55,7 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 import static org.testng.Assert.assertEquals;
 import static org.testng.Assert.assertFalse;
+import static org.testng.Assert.assertNull;
 import static org.testng.Assert.assertThrows;
 import static org.testng.Assert.assertTrue;
 
@@ -604,6 +609,117 @@ public class ConcurrentMapPartitionDedupMetadataManagerWithTTLTest {
     closeMetadataManager(metadataManager);
   }
 
+  // A server newly assigned the partition seeds the watermark from the segment ZK metadata before loading, so the
+  // old segments are skipped as a whole and the map never holds more than one window.
+  @Test
+  public void testSeededWatermarkSkipsOldSegments()
+      throws IOException {
+    RowFeedingDedupMetadataManager metadataManager = newRowFeedingMetadataManager();
+    metadataManager._watermarkSeed = 59000.0;
+    for (int i = 0; i < 6; i++) {
+      metadataManager.addSegment(metadataManager.addRows(i, 10 * i, 10));
+      assertTrue(metadataManager.getNumPrimaryKeys() <= 11,
+          "Map holds " + metadataManager.getNumPrimaryKeys() + " keys after loading segment " + i);
+    }
+    assertEquals(metadataManager._largestSeenTime.get(), 59000.0);
+    assertEquals(metadataManager.getNumPrimaryKeys(), 11);
+    assertEquals(metadataManager._numSweeps, 0);
+    assertEquals(metadataManager._numSeedFetches, 1);
+    closeMetadataManager(metadataManager);
+  }
+
+  // The seed only raises the watermark: a higher one from the local file is kept, and a lower one left by an earlier
+  // assignment of the partition is raised. The consuming thread seeds through removeExpiredPrimaryKeys.
+  @Test
+  public void testSeedOnlyRaisesWatermark()
+      throws IOException {
+    RowFeedingDedupMetadataManager previousRun = newRowFeedingMetadataManager();
+    WatermarkUtils.persistWatermark(69000, previousRun.getWatermarkFile());
+    closeMetadataManager(previousRun);
+    RowFeedingDedupMetadataManager metadataManager = newRowFeedingMetadataManager();
+    metadataManager._watermarkSeed = 59000.0;
+    metadataManager.removeExpiredPrimaryKeys();
+    assertEquals(metadataManager._largestSeenTime.get(), 69000.0);
+    closeMetadataManager(metadataManager);
+
+    previousRun = newRowFeedingMetadataManager();
+    WatermarkUtils.persistWatermark(9000, previousRun.getWatermarkFile());
+    closeMetadataManager(previousRun);
+    metadataManager = newRowFeedingMetadataManager();
+    metadataManager._watermarkSeed = 59000.0;
+    metadataManager.removeExpiredPrimaryKeys();
+    assertEquals(metadataManager._largestSeenTime.get(), 59000.0);
+    closeMetadataManager(metadataManager);
+  }
+
+  // A failed seed read is logged and the segments load without it, and the read is not retried on every operation.
+  @Test
+  public void testSeedFailureLoadsWithoutSeed()
+      throws IOException {
+    RowFeedingDedupMetadataManager metadataManager = newRowFeedingMetadataManager();
+    metadataManager._seedFailure = new RuntimeException("ZK unavailable");
+    metadataManager.addSegment(metadataManager.addRows(5, 50, 10));
+    metadataManager.addSegment(metadataManager.addRows(4, 40, 10));
+    assertEquals(metadataManager._largestSeenTime.get(), 59000.0);
+    assertEquals(metadataManager._numSeedFetches, 1);
+    closeMetadataManager(metadataManager);
+  }
+
+  @Test
+  public void testSelectWatermarkSeed()
+      throws IOException {
+    ConcurrentMapPartitionDedupMetadataManager metadataManager =
+        new ConcurrentMapPartitionDedupMetadataManager(DedupTestUtils.REALTIME_TABLE_NAME, 0,
+            _dedupContextBuilder.setHashFunction(HashFunction.NONE).setIgnoreNonDefaultTiers(true).build());
+    Map<String, SegmentZKMetadata> zkMetadataMap = new HashMap<>();
+    // Partition 0: committed segments 0 to 4 and the consuming segment 5
+    for (int sequenceNumber = 0; sequenceNumber < 5; sequenceNumber++) {
+      putSegmentZKMetadata(zkMetadataMap, 0, sequenceNumber, Status.DONE, sequenceNumber * 1000.0, null);
+    }
+    putSegmentZKMetadata(zkMetadataMap, 0, 5, Status.IN_PROGRESS, null, null);
+    // Other partitions and uploaded segments are ignored, even with a higher max
+    putSegmentZKMetadata(zkMetadataMap, 1, 9, Status.DONE, 99000.0, null);
+    List<String> segmentNames = new ArrayList<>(zkMetadataMap.keySet());
+    segmentNames.add("uploaded__testTable__0__20260101T0000Z__suffix");
+    assertEquals(metadataManager.selectWatermarkSeed(segmentNames, zkMetadataMap::get), 4000.0);
+
+    // The newest committed segment has no max (committed before the upgrade): use the one before it
+    putSegmentZKMetadata(zkMetadataMap, 0, 4, Status.DONE, null, null);
+    assertEquals(metadataManager.selectWatermarkSeed(segmentNames, zkMetadataMap::get), 3000.0);
+
+    // A segment on a non-default tier is not added to the dedup metadata, so its max is not used
+    putSegmentZKMetadata(zkMetadataMap, 0, 3, Status.DONE, 3000.0, "coldTier");
+    assertEquals(metadataManager.selectWatermarkSeed(segmentNames, zkMetadataMap::get), 2000.0);
+
+    // At most MAX_SEGMENTS_TO_CHECK_FOR_WATERMARK_SEED committed segments are checked
+    putSegmentZKMetadata(zkMetadataMap, 0, 2, Status.DONE, null, null);
+    assertNull(metadataManager.selectWatermarkSeed(segmentNames, zkMetadataMap::get));
+    assertNull(metadataManager.selectWatermarkSeed(List.of(), zkMetadataMap::get));
+    closeMetadataManager(metadataManager);
+  }
+
+  // Without a Helix manager, e.g. in a minion task, there is nothing to seed from.
+  @Test
+  public void testNoSeedWithoutHelixManager()
+      throws IOException {
+    ConcurrentMapPartitionDedupMetadataManager metadataManager =
+        new ConcurrentMapPartitionDedupMetadataManager(DedupTestUtils.REALTIME_TABLE_NAME, 0,
+            _dedupContextBuilder.setHashFunction(HashFunction.NONE).build());
+    assertNull(metadataManager.fetchWatermarkSeed());
+    closeMetadataManager(metadataManager);
+  }
+
+  private static void putSegmentZKMetadata(Map<String, SegmentZKMetadata> zkMetadataMap, int partitionId,
+      int sequenceNumber, Status status, Double dedupTimeMax, String tier) {
+    String segmentName =
+        new LLCSegmentName(DedupTestUtils.RAW_TABLE_NAME, partitionId, sequenceNumber, 0).getSegmentName();
+    SegmentZKMetadata segmentZKMetadata = new SegmentZKMetadata(segmentName);
+    segmentZKMetadata.setStatus(status);
+    segmentZKMetadata.setDedupTimeMax(dedupTimeMax);
+    segmentZKMetadata.setTier(tier);
+    zkMetadataMap.put(segmentName, segmentZKMetadata);
+  }
+
   private RowFeedingDedupMetadataManager newRowFeedingMetadataManager() {
     return new RowFeedingDedupMetadataManager(_dedupContextBuilder.setHashFunction(HashFunction.NONE).build());
   }
@@ -627,6 +743,9 @@ public class ConcurrentMapPartitionDedupMetadataManagerWithTTLTest {
   private static class RowFeedingDedupMetadataManager extends ConcurrentMapPartitionDedupMetadataManager {
     private final Map<IndexSegment, DedupUtils.DedupRecordInfoReader> _readers = new HashMap<>();
     private int _numSweeps;
+    private Double _watermarkSeed;
+    private RuntimeException _seedFailure;
+    private int _numSeedFetches;
 
     RowFeedingDedupMetadataManager(DedupContext dedupContext) {
       super(DedupTestUtils.REALTIME_TABLE_NAME, 0, dedupContext);
@@ -662,6 +781,15 @@ public class ConcurrentMapPartitionDedupMetadataManagerWithTTLTest {
     @Override
     DedupUtils.DedupRecordInfoReader createDedupRecordInfoReader(IndexSegment segment) {
       return _readers.get(segment);
+    }
+
+    @Override
+    Double fetchWatermarkSeed() {
+      _numSeedFetches++;
+      if (_seedFailure != null) {
+        throw _seedFailure;
+      }
+      return _watermarkSeed;
     }
 
     @Override

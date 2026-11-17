@@ -2637,6 +2637,9 @@ public class CommonConstants {
     public static final String PARTITION_METADATA = "segment.partition.metadata";
     public static final String CUSTOM_MAP = "custom.map";
     public static final String SIZE_IN_BYTES = "segment.size.in.bytes";
+    /// Max value of the dedup time column in the segment. Recorded only for dedup tables with metadataTTL, so a server
+    /// newly assigned a partition can start its dedup TTL watermark from it before loading the segments.
+    public static final String DEDUP_TIME_MAX = "segment.dedup.time.max";
 
     /// This field is used for parallel push protection to lock the segment globally.
     /// We put the segment upload start timestamp so that if the previous push failed without unlock the segment, the

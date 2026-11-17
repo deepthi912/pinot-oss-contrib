@@ -716,7 +716,8 @@ public class PinotLLCRealtimeSegmentManager implements PinotClusterConfigChangeL
     } else {
       committingSegmentZKMetadata = toCommitting
           ? updateSegmentZKMetadataToCommitting(realtimeTableName, committingSegmentDescriptor)
-          : updateSegmentZKMetadataToDone(realtimeTableName, committingSegmentDescriptor, Status.IN_PROGRESS);
+          : updateSegmentZKMetadataToDone(realtimeTableName, committingSegmentDescriptor, Status.IN_PROGRESS,
+              SegmentZKMetadataUtils.getDedupTimeColumnForTTL(tableConfig));
     }
 
     preProcessNewSegmentZKMetadata();
@@ -835,9 +836,11 @@ public class PinotLLCRealtimeSegmentManager implements PinotClusterConfigChangeL
   // Step 1: Update committing segment ZK metadata
 
   /// When invoked from non-pauseless table, expected status is IN_PROGRESS; when invoked from pauseless table, expected
-  /// status is COMMITTING.
+  /// status is COMMITTING. The dedup time max is recorded when `dedupTimeColumn` is set, see
+  /// [SegmentZKMetadataUtils#getDedupTimeColumnForTTL].
   private SegmentZKMetadata updateSegmentZKMetadataToDone(String realtimeTableName,
-      CommittingSegmentDescriptor committingSegmentDescriptor, Status expectedStatus) {
+      CommittingSegmentDescriptor committingSegmentDescriptor, Status expectedStatus,
+      @Nullable String dedupTimeColumn) {
     String segmentName = committingSegmentDescriptor.getSegmentName();
     Stat stat = new Stat();
     SegmentZKMetadata segmentZKMetadata = getSegmentZKMetadata(realtimeTableName, segmentName, stat);
@@ -855,7 +858,8 @@ public class PinotLLCRealtimeSegmentManager implements PinotClusterConfigChangeL
         ? CommonConstants.Segment.METADATA_URI_FOR_PEER_DOWNLOAD
         : segmentLocation;
     SegmentZKMetadataUtils.updateCommittingSegmentZKMetadata(realtimeTableName, segmentZKMetadata, segmentMetadata,
-        downloadUrl, committingSegmentDescriptor.getSegmentSizeBytes(), committingSegmentDescriptor.getNextOffset());
+        downloadUrl, committingSegmentDescriptor.getSegmentSizeBytes(), committingSegmentDescriptor.getNextOffset(),
+        dedupTimeColumn);
     persistSegmentZKMetadata(realtimeTableName, segmentZKMetadata, stat.getVersion());
 
     // Refresh the Broker routing
@@ -1179,9 +1183,19 @@ public class PinotLLCRealtimeSegmentManager implements PinotClusterConfigChangeL
         throw new HelixHelper.PermanentUpdaterException(
             "Exceeded max segment completion time for segment " + segmentName);
       }
+      // The table config is only needed for the dedup time max here, so a failed read leaves it out instead of failing
+      // the commit. A missing max only makes a new replica start its dedup TTL watermark lower.
+      TableConfig tableConfig = null;
+      try {
+        tableConfig = getTableConfig(realtimeTableName);
+      } catch (Exception e) {
+        LOGGER.warn("Failed to read table config of table: {} when committing segment: {}", realtimeTableName,
+            segmentName, e);
+      }
       LOGGER.info("Updating segment ZK metadata for segment: {}", segmentName);
       SegmentZKMetadata committingSegmentZKMetadata =
-          updateSegmentZKMetadataToDone(realtimeTableName, committingSegmentDescriptor, Status.COMMITTING);
+          updateSegmentZKMetadataToDone(realtimeTableName, committingSegmentDescriptor, Status.COMMITTING,
+              SegmentZKMetadataUtils.getDedupTimeColumnForTTL(tableConfig));
       LOGGER.info("Successfully updated segment metadata for segment: {}", segmentName);
       // remove the segment from the committing segment list
       LOGGER.info("Removing segment: {} from committing segment list", segmentName);
@@ -1191,7 +1205,9 @@ public class PinotLLCRealtimeSegmentManager implements PinotClusterConfigChangeL
             segmentName);
       }
       try {
-        TableConfig tableConfig = getTableConfig(realtimeTableName);
+        if (tableConfig == null) {
+          tableConfig = getTableConfig(realtimeTableName);
+        }
         StreamConfig streamConfig = IngestionConfigUtils.getFirstStreamConfig(tableConfig);
         FlushThresholdUpdater flushThresholdUpdater =
             _flushThresholdUpdateManager.getFlushThresholdUpdater(streamConfig);

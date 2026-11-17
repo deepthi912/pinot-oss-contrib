@@ -85,6 +85,7 @@ import org.apache.pinot.controller.helix.core.assignment.segment.SegmentAssignme
 import org.apache.pinot.controller.helix.core.realtime.segment.CommittingSegmentDescriptor;
 import org.apache.pinot.core.data.manager.realtime.SegmentCompletionUtils;
 import org.apache.pinot.core.realtime.impl.fakestream.FakeStreamConfigUtils;
+import org.apache.pinot.segment.spi.ColumnMetadata;
 import org.apache.pinot.segment.spi.creator.SegmentVersion;
 import org.apache.pinot.segment.spi.index.metadata.SegmentMetadataImpl;
 import org.apache.pinot.segment.spi.partition.metadata.ColumnPartitionMetadata;
@@ -326,6 +327,36 @@ public class PinotLLCRealtimeSegmentManagerTest {
     segmentManager.makeConsumingInstancePartitions();
     segmentManager._numPartitions = numPartitions;
     segmentManager.setUpNewTable();
+  }
+
+  // On a dedup table with metadataTTL, the commit records the segment's max dedup time in its ZK metadata, so a server
+  // newly assigned the partition can seed its TTL watermark from it.
+  @Test
+  public void testCommitSegmentRecordsDedupTimeMax() {
+    FakePinotLLCRealtimeSegmentManager segmentManager =
+        new FakePinotLLCRealtimeSegmentManager(mock(PinotHelixResourceManager.class));
+    setUpNewTable(segmentManager, 2, 5, 4);
+    DedupConfig dedupConfig = new DedupConfig();
+    dedupConfig.setDedupEnabled(true);
+    dedupConfig.setMetadataTTL(1000);
+    dedupConfig.setDedupTimeColumn("dedupTime");
+    segmentManager._tableConfig.setDedupConfig(dedupConfig);
+
+    String committingSegment = new LLCSegmentName(RAW_TABLE_NAME, 0, 0, CURRENT_TIME_MS).getSegmentName();
+    CommittingSegmentDescriptor committingSegmentDescriptor = createCommittingSegmentDescriptor(committingSegment);
+    ColumnMetadata columnMetadata = mock(ColumnMetadata.class);
+    doReturn(123456L).when(columnMetadata).getMaxValue();
+    when(committingSegmentDescriptor.getSegmentMetadata().getColumnMetadataFor("dedupTime")).thenReturn(columnMetadata);
+    segmentManager.commitSegmentMetadata(REALTIME_TABLE_NAME, committingSegmentDescriptor);
+    assertEquals(segmentManager._segmentZKMetadataMap.get(committingSegment).getDedupTimeMax(), 123456.0);
+
+    // Without metadataTTL, no max is recorded
+    dedupConfig.setMetadataTTL(0);
+    committingSegment = new LLCSegmentName(RAW_TABLE_NAME, 0, 1, CURRENT_TIME_MS).getSegmentName();
+    committingSegmentDescriptor = createCommittingSegmentDescriptor(committingSegment);
+    when(committingSegmentDescriptor.getSegmentMetadata().getColumnMetadataFor("dedupTime")).thenReturn(columnMetadata);
+    segmentManager.commitSegmentMetadata(REALTIME_TABLE_NAME, committingSegmentDescriptor);
+    assertNull(segmentManager._segmentZKMetadataMap.get(committingSegment).getDedupTimeMax());
   }
 
   @Test

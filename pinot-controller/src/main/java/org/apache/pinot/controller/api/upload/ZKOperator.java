@@ -361,11 +361,13 @@ public class ZKOperator {
           // If no modifier is provided, use the custom map from the segment metadata
           segmentZKMetadata.setCustomMap(null);
           SegmentZKMetadataUtils.refreshSegmentZKMetadata(tableNameWithType, segmentZKMetadata, segmentMetadata,
-              segmentDownloadURIStr, crypterName, segmentSizeInBytes);
+              segmentDownloadURIStr, crypterName, segmentSizeInBytes,
+              SegmentZKMetadataUtils.getDedupTimeColumnForTTL(tableConfig));
         } else {
           // If modifier is provided, first set the custom map from the segment metadata, then apply the modifier
           SegmentZKMetadataUtils.refreshSegmentZKMetadata(tableNameWithType, segmentZKMetadata, segmentMetadata,
-              segmentDownloadURIStr, crypterName, segmentSizeInBytes);
+              segmentDownloadURIStr, crypterName, segmentSizeInBytes,
+              SegmentZKMetadataUtils.getDedupTimeColumnForTTL(tableConfig));
           segmentZKMetadata.setCustomMap(customMapModifier.modifyMap(segmentZKMetadata.getCustomMap()));
         }
         if (!_pinotHelixResourceManager.updateZkMetadata(tableNameWithType, segmentZKMetadata, expectedVersion)) {
@@ -473,7 +475,7 @@ public class ZKOperator {
     try {
       segmentZKMetadata =
           SegmentZKMetadataUtils.createSegmentZKMetadata(tableNameWithType, segmentMetadata, segmentDownloadURIStr,
-              crypterName, segmentSizeInBytes);
+              crypterName, segmentSizeInBytes, SegmentZKMetadataUtils.getDedupTimeColumnForTTL(tableConfig));
     } catch (IllegalArgumentException e) {
       throw new ControllerApplicationException(LOGGER,
           String.format("Got invalid segment metadata when adding segment: %s for table: %s, reason: %s", segmentName,
