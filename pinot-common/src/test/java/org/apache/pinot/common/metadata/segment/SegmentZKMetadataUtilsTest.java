@@ -18,6 +18,7 @@
  */
 package org.apache.pinot.common.metadata.segment;
 
+import javax.annotation.Nullable;
 import org.apache.pinot.segment.spi.ColumnMetadata;
 import org.apache.pinot.segment.spi.SegmentMetadata;
 import org.apache.pinot.segment.spi.creator.SegmentVersion;
@@ -73,14 +74,27 @@ public class SegmentZKMetadataUtilsTest {
         "url", null, 100);
     assertNull(segmentZKMetadata.getDedupTimeMax());
 
-    SegmentZKMetadataUtils.updateCommittingSegmentZKMetadata(REALTIME_TABLE_NAME, segmentZKMetadata,
-        segmentMetadata(10, 7000L), "url", 100, "100", DEDUP_TIME_COLUMN);
+    // A commit keeps the larger of the carried partition max and the segment max
+    commit(segmentZKMetadata, segmentMetadata(10, 7000L), DEDUP_TIME_COLUMN);
     assertEquals(segmentZKMetadata.getDedupTimeMax(), 7000.0);
+    commit(segmentZKMetadata, segmentMetadata(10, 6000L), DEDUP_TIME_COLUMN);
+    assertEquals(segmentZKMetadata.getDedupTimeMax(), 7000.0);
+    commit(segmentZKMetadata, segmentMetadata(10, 8000L), DEDUP_TIME_COLUMN);
+    assertEquals(segmentZKMetadata.getDedupTimeMax(), 8000.0);
 
-    // An empty segment has no max
-    SegmentZKMetadataUtils.updateCommittingSegmentZKMetadata(REALTIME_TABLE_NAME, segmentZKMetadata,
-        segmentMetadata(0, 7000L), "url", 100, "100", DEDUP_TIME_COLUMN);
+    // An empty segment keeps the carried max
+    commit(segmentZKMetadata, segmentMetadata(0, 0L), DEDUP_TIME_COLUMN);
+    assertEquals(segmentZKMetadata.getDedupTimeMax(), 8000.0);
+
+    // A commit without the column removes it
+    commit(segmentZKMetadata, segmentMetadata(10, 9000L), null);
     assertNull(segmentZKMetadata.getDedupTimeMax());
+  }
+
+  private static void commit(SegmentZKMetadata segmentZKMetadata, SegmentMetadata segmentMetadata,
+      @Nullable String dedupTimeColumn) {
+    SegmentZKMetadataUtils.updateCommittingSegmentZKMetadata(REALTIME_TABLE_NAME, segmentZKMetadata, segmentMetadata,
+        "url", 100, "100", dedupTimeColumn);
   }
 
   private static TableConfig tableConfig(DedupConfig dedupConfig) {

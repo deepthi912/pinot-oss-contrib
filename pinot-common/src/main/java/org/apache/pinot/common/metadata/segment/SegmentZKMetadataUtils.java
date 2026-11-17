@@ -87,8 +87,16 @@ public class SegmentZKMetadataUtils {
   public static void updateCommittingSegmentZKMetadata(String realtimeTableName, SegmentZKMetadata segmentZKMetadata,
       SegmentMetadata segmentMetadata, String downloadUrl, long segmentSizeInBytes, String endOffset,
       @Nullable String dedupTimeColumn) {
+    // The committing segment carries the partition's dedup time max up to the previous segment, see
+    // PinotLLCRealtimeSegmentManager. Keep the larger one, so the newest committed segment has the partition max.
+    Double previousDedupTimeMax = segmentZKMetadata.getDedupTimeMax();
     updateSegmentZKMetadata(realtimeTableName, segmentZKMetadata, segmentMetadata, downloadUrl, null,
         segmentSizeInBytes, endOffset, false, dedupTimeColumn);
+    Double dedupTimeMax = segmentZKMetadata.getDedupTimeMax();
+    if (dedupTimeColumn != null && previousDedupTimeMax != null
+        && (dedupTimeMax == null || previousDedupTimeMax > dedupTimeMax)) {
+      segmentZKMetadata.setDedupTimeMax(previousDedupTimeMax);
+    }
   }
 
   /// Returns the column whose max is recorded as the dedup time max in the segment ZK metadata, or `null` when the

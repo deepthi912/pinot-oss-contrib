@@ -1267,6 +1267,10 @@ public class PinotLLCRealtimeSegmentManager implements PinotClusterConfigChangeL
     // Leave maxOffset as null.
     newSegmentZKMetadata.setNumReplicas(numReplicas);
     newSegmentZKMetadata.setStatus(Status.IN_PROGRESS);
+    // Carry the partition's dedup time max forward; the commit raises it with the new segment's max
+    if (committingSegmentZKMetadata != null) {
+      newSegmentZKMetadata.setDedupTimeMax(committingSegmentZKMetadata.getDedupTimeMax());
+    }
 
     // Add the partition metadata if available
     SegmentPartitionMetadata partitionMetadata =

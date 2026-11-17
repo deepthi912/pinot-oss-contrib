@@ -365,16 +365,19 @@ public abstract class BasePartitionDedupMetadataManager implements PartitionDedu
         segmentName -> ZKMetadataProvider.getSegmentZKMetadata(propertyStore, _tableNameWithType, segmentName));
   }
 
-  /// Returns the dedup time max of the newest committed segment of this partition that this server adds to the dedup
-  /// metadata, going back at most [#MAX_SEGMENTS_TO_CHECK_FOR_WATERMARK_SEED] segments, or `null` if none has it.
+  /// Returns the partition's dedup time max recorded on the newest committed segment of this partition, going back at
+  /// most [#MAX_SEGMENTS_TO_CHECK_FOR_WATERMARK_SEED] segments, or `null` if none has it.
   ///
-  /// Only LLC segments are checked: their partition is in the name, so only a few ZK records are read. Skipping the
-  /// uploaded segments, or a segment without the max, only lowers the seed, which is safe. A segment on a non-default
-  /// tier is skipped when such segments are not added to the dedup metadata, because counting it could raise the seed
-  /// above the watermark this server reaches.
+  /// Only LLC segments are checked: their partition is in the name, so only a few ZK records are read. Skipping a
+  /// segment without the max only lowers the seed, which is safe. There is no seed when segments on a non-default tier
+  /// are not added to the dedup metadata, because the partition max may come from such a segment, which would put the
+  /// seed above the watermark this server reaches.
   @VisibleForTesting
   @Nullable
   Double selectWatermarkSeed(List<String> segmentNames, Function<String, SegmentZKMetadata> segmentZKMetadataFetcher) {
+    if (_context.isIgnoreNonDefaultTiers()) {
+      return null;
+    }
     List<LLCSegmentName> partitionSegments = new ArrayList<>();
     for (String segmentName : segmentNames) {
       LLCSegmentName llcSegmentName = LLCSegmentName.of(segmentName);
@@ -391,12 +394,10 @@ public abstract class BasePartitionDedupMetadataManager implements PartitionDedu
       if (segmentZKMetadata == null || segmentZKMetadata.getStatus() != Status.DONE) {
         continue;
       }
-      if (!_context.isIgnoreNonDefaultTiers() || segmentZKMetadata.getTier() == null) {
-        Double dedupTimeMax = segmentZKMetadata.getDedupTimeMax();
-        if (dedupTimeMax != null) {
-          _logger.info("Found TTL watermark seed: {} in segment: {}", dedupTimeMax, llcSegmentName.getSegmentName());
-          return dedupTimeMax;
-        }
+      Double dedupTimeMax = segmentZKMetadata.getDedupTimeMax();
+      if (dedupTimeMax != null) {
+        _logger.info("Found TTL watermark seed: {} in segment: {}", dedupTimeMax, llcSegmentName.getSegmentName());
+        return dedupTimeMax;
       }
       if (++numSegmentsToCheck >= MAX_SEGMENTS_TO_CHECK_FOR_WATERMARK_SEED) {
         break;

@@ -26,8 +26,11 @@ import java.util.Map;
 import javax.annotation.Nullable;
 import org.apache.commons.io.FileUtils;
 import org.apache.pinot.broker.routing.manager.BrokerRoutingManager;
+import org.apache.pinot.common.metadata.segment.SegmentZKMetadata;
 import org.apache.pinot.common.request.BrokerRequest;
+import org.apache.pinot.common.restlet.resources.RebalanceConfig;
 import org.apache.pinot.common.utils.PauselessConsumptionUtils;
+import org.apache.pinot.controller.helix.core.rebalance.TableRebalancer;
 import org.apache.pinot.core.routing.RoutingTable;
 import org.apache.pinot.core.routing.SegmentsToQuery;
 import org.apache.pinot.core.transport.ServerInstance;
@@ -53,10 +56,12 @@ import org.testng.annotations.BeforeClass;
 import org.testng.annotations.Test;
 
 import static org.testng.Assert.assertEquals;
+import static org.testng.Assert.assertNotNull;
 
 
 public class BaseDedupIntegrationTest extends BaseClusterIntegrationTestSet {
   protected static final String DEDUP_TABLE_WITH_REPLICAS = "DedupTableWithReplicas";
+  protected static final String DEDUP_TABLE_REPLICATION_INCREASE = "DedupTableReplicationIncrease";
 
   protected List<File> _avroFiles;
 
@@ -98,8 +103,13 @@ public class BaseDedupIntegrationTest extends BaseClusterIntegrationTestSet {
     TableConfig tableConfigWithReplicas =
         createDedupTableWithReplicas(_avroFiles.get(0), "id", getNumKafkaPartitions());
     addTableConfig(tableConfigWithReplicas);
+    waitForBothServersToServe(DEDUP_TABLE_WITH_REPLICAS);
+  }
+
+  /// Waits until both servers serve all documents of the table.
+  protected void waitForBothServersToServe(String tableName) {
     BrokerRequest countStarBrokerRequest = CalciteSqlCompiler.compileToBrokerRequest(
-        "SELECT COUNT(*) FROM " + TableNameBuilder.REALTIME.tableNameWithType(DEDUP_TABLE_WITH_REPLICAS));
+        "SELECT COUNT(*) FROM " + TableNameBuilder.REALTIME.tableNameWithType(tableName));
     long countStarResult = getCountStarResult();
     TestUtils.waitForCondition(aVoid -> {
       // Ensure both servers are ready to be queried
@@ -111,7 +121,7 @@ public class BaseDedupIntegrationTest extends BaseClusterIntegrationTestSet {
       // Query 10 times to get result from both servers (query should be distributed to both servers in a round-robin
       // fashion, but query more times to be more robust)
       for (int i = 0; i < 10; i++) {
-        if (getCurrentCountStarResult(DEDUP_TABLE_WITH_REPLICAS) != countStarResult) {
+        if (getCurrentCountStarResult(tableName) != countStarResult) {
           return false;
         }
       }
@@ -147,6 +157,12 @@ public class BaseDedupIntegrationTest extends BaseClusterIntegrationTestSet {
   /// Creates a new Dedup enabled table config with replication=2 and metadatTTL=30
   protected TableConfig createDedupTableWithReplicas(File sampleAvroFile, String primaryKeyColumn,
       int numPartitions) {
+    return createDedupTableWithTTL(DEDUP_TABLE_WITH_REPLICAS, 2, sampleAvroFile, primaryKeyColumn, numPartitions);
+  }
+
+  /// Creates a new Dedup enabled table config with metadatTTL=30
+  protected TableConfig createDedupTableWithTTL(String tableName, int numReplicas, File sampleAvroFile,
+      String primaryKeyColumn, int numPartitions) {
     AvroFileSchemaKafkaAvroMessageDecoder._avroFile = sampleAvroFile;
     Map<String, ColumnPartitionConfig> columnPartitionConfigMap = new HashMap<>();
     columnPartitionConfigMap.put(primaryKeyColumn, new ColumnPartitionConfig("Murmur", numPartitions));
@@ -154,10 +170,10 @@ public class BaseDedupIntegrationTest extends BaseClusterIntegrationTestSet {
     DedupConfig dedupConfig = new DedupConfig();
     dedupConfig.setMetadataTTL(30);
     dedupConfig.setPreload(Enablement.ENABLE);
-    TableConfig tableConfig = new TableConfigBuilder(TableType.REALTIME).setTableName(DEDUP_TABLE_WITH_REPLICAS)
+    TableConfig tableConfig = new TableConfigBuilder(TableType.REALTIME).setTableName(tableName)
         .setTimeColumnName(getTimeColumnName())
         .setFieldConfigList(getFieldConfigs())
-        .setNumReplicas(2)
+        .setNumReplicas(numReplicas)
         .setSegmentVersion(getSegmentVersion())
         .setLoadMode(getLoadMode())
         .setTaskConfig(getTaskConfig())
@@ -170,7 +186,7 @@ public class BaseDedupIntegrationTest extends BaseClusterIntegrationTestSet {
         .setSegmentPartitionConfig(new SegmentPartitionConfig(columnPartitionConfigMap))
         .setDedupConfig(dedupConfig)
         .build();
-    if (PauselessConsumptionUtils.isPauselessEnabled(tableConfig)) {
+    if (numReplicas > 1 && PauselessConsumptionUtils.isPauselessEnabled(tableConfig)) {
       tableConfig.getValidationConfig().setPeerSegmentDownloadScheme(CommonConstants.HTTP_PROTOCOL);
     }
     return tableConfig;
@@ -263,5 +279,58 @@ public class BaseDedupIntegrationTest extends BaseClusterIntegrationTestSet {
           getPinotConnection().execute("SELECT name FROM " + DEDUP_TABLE_WITH_REPLICAS + " WHERE id = " + i)
               .getResultSet(0).getString(0), "" + i);
     }
+  }
+
+  /// A new replica seeds its dedup TTL watermark from the segment ZK metadata, and serves the same rows.
+  @Test
+  public void testReplicationIncreaseWithTTL()
+      throws Exception {
+    String tableName = DEDUP_TABLE_REPLICATION_INCREASE;
+    String realtimeTableName = TableNameBuilder.REALTIME.tableNameWithType(tableName);
+    Schema schema = createSchema();
+    schema.setSchemaName(tableName);
+    addSchema(schema);
+    addTableConfig(createDedupTableWithTTL(tableName, 1, _avroFiles.get(0), "id", getNumKafkaPartitions()));
+    TestUtils.waitForCondition(aVoid -> {
+      try {
+        return getCurrentCountStarResult(tableName) == getCountStarResult();
+      } catch (Exception e) {
+        // The broker may not know the new table yet
+        return false;
+      }
+    }, 600_000L, "Failed to load all documents");
+
+    // Every committed segment records its max dedup time
+    TestUtils.waitForCondition(aVoid -> _helixResourceManager.getSegmentsZKMetadata(realtimeTableName).stream()
+        .anyMatch(metadata -> metadata.getStatus() == CommonConstants.Segment.Realtime.Status.DONE), 600_000L,
+        "Failed to commit a segment");
+    for (SegmentZKMetadata metadata : _helixResourceManager.getSegmentsZKMetadata(realtimeTableName)) {
+      if (metadata.getStatus() == CommonConstants.Segment.Realtime.Status.DONE) {
+        assertNotNull(metadata.getDedupTimeMax(), metadata.getSegmentName());
+      }
+    }
+
+    // Add a replica on the other server
+    TableConfig tableConfig = getRealtimeTableConfig(tableName);
+    tableConfig.getValidationConfig().setReplication("2");
+    if (PauselessConsumptionUtils.isPauselessEnabled(tableConfig)) {
+      tableConfig.getValidationConfig().setPeerSegmentDownloadScheme(CommonConstants.HTTP_PROTOCOL);
+    }
+    updateTableConfig(tableConfig);
+    RebalanceConfig rebalanceConfig = new RebalanceConfig();
+    rebalanceConfig.setMinAvailableReplicas(0);
+    rebalanceConfig.setIncludeConsuming(true);
+    new TableRebalancer(_helixResourceManager.getHelixZkManager()).rebalance(tableConfig, rebalanceConfig, null);
+    waitForBothServersToServe(tableName);
+
+    // Duplicates are still dropped on both replicas
+    pushAvroIntoKafka(_avroFiles);
+    Thread.sleep(5000);
+    waitForBothServersToServe(tableName);
+    for (int i = 0; i < getCountStarResult(); i++) {
+      assertEquals(getPinotConnection().execute("SELECT name FROM " + tableName + " WHERE id = " + i)
+          .getResultSet(0).getString(0), "" + i);
+    }
+    dropRealtimeTable(tableName);
   }
 }

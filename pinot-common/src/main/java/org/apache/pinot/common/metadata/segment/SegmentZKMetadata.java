@@ -204,8 +204,9 @@ public class SegmentZKMetadata implements ZKMetadata {
     return _simpleFields.get(Segment.TIER);
   }
 
-  /// Returns the max value of the dedup time column in the segment, or `null` if it is not recorded. It is recorded
-  /// only for dedup tables with metadataTTL, see [SegmentZKMetadataUtils#getDedupTimeColumnForTTL].
+  /// Returns the max value of the dedup time column, or `null` if it is not recorded. It is recorded only for dedup
+  /// tables with metadataTTL, see [SegmentZKMetadataUtils#getDedupTimeColumnForTTL]. For a committed LLC segment it is
+  /// the max over the partition's segments up to this one; for an uploaded segment, the max in the segment.
   @Nullable
   public Double getDedupTimeMax() {
     String dedupTimeMax = _simpleFields.get(Segment.DEDUP_TIME_MAX);

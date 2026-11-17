@@ -670,7 +670,7 @@ public class ConcurrentMapPartitionDedupMetadataManagerWithTTLTest {
       throws IOException {
     ConcurrentMapPartitionDedupMetadataManager metadataManager =
         new ConcurrentMapPartitionDedupMetadataManager(DedupTestUtils.REALTIME_TABLE_NAME, 0,
-            _dedupContextBuilder.setHashFunction(HashFunction.NONE).setIgnoreNonDefaultTiers(true).build());
+            _dedupContextBuilder.setHashFunction(HashFunction.NONE).build());
     Map<String, SegmentZKMetadata> zkMetadataMap = new HashMap<>();
     // Partition 0: committed segments 0 to 4 and the consuming segment 5
     for (int sequenceNumber = 0; sequenceNumber < 5; sequenceNumber++) {
@@ -687,14 +687,18 @@ public class ConcurrentMapPartitionDedupMetadataManagerWithTTLTest {
     putSegmentZKMetadata(zkMetadataMap, 0, 4, Status.DONE, null, null);
     assertEquals(metadataManager.selectWatermarkSeed(segmentNames, zkMetadataMap::get), 3000.0);
 
-    // A segment on a non-default tier is not added to the dedup metadata, so its max is not used
-    putSegmentZKMetadata(zkMetadataMap, 0, 3, Status.DONE, 3000.0, "coldTier");
-    assertEquals(metadataManager.selectWatermarkSeed(segmentNames, zkMetadataMap::get), 2000.0);
-
     // At most MAX_SEGMENTS_TO_CHECK_FOR_WATERMARK_SEED committed segments are checked
+    putSegmentZKMetadata(zkMetadataMap, 0, 3, Status.DONE, null, null);
     putSegmentZKMetadata(zkMetadataMap, 0, 2, Status.DONE, null, null);
     assertNull(metadataManager.selectWatermarkSeed(segmentNames, zkMetadataMap::get));
     assertNull(metadataManager.selectWatermarkSeed(List.of(), zkMetadataMap::get));
+    closeMetadataManager(metadataManager);
+
+    // No seed when segments on a non-default tier are not added: the partition max may come from one of them
+    putSegmentZKMetadata(zkMetadataMap, 0, 4, Status.DONE, 4000.0, null);
+    metadataManager = new ConcurrentMapPartitionDedupMetadataManager(DedupTestUtils.REALTIME_TABLE_NAME, 0,
+        _dedupContextBuilder.setHashFunction(HashFunction.NONE).setIgnoreNonDefaultTiers(true).build());
+    assertNull(metadataManager.selectWatermarkSeed(segmentNames, zkMetadataMap::get));
     closeMetadataManager(metadataManager);
   }
 
