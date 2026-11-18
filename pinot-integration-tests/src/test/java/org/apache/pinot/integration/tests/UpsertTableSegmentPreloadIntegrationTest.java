@@ -18,6 +18,7 @@
  */
 package org.apache.pinot.integration.tests;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import com.google.common.base.Joiner;
 import java.io.File;
 import java.io.IOException;
@@ -37,6 +38,7 @@ import org.apache.pinot.spi.data.Schema;
 import org.apache.pinot.spi.env.PinotConfiguration;
 import org.apache.pinot.spi.utils.CommonConstants.Helix.StateModel.SegmentStateModel;
 import org.apache.pinot.spi.utils.CommonConstants.Server;
+import org.apache.pinot.spi.utils.JsonUtils;
 import org.apache.pinot.spi.utils.builder.TableNameBuilder;
 import org.apache.pinot.util.TestUtils;
 import org.testng.annotations.AfterClass;
@@ -46,6 +48,8 @@ import org.testng.annotations.Test;
 import static org.testng.Assert.assertEquals;
 import static org.testng.Assert.assertFalse;
 import static org.testng.Assert.assertNotNull;
+import static org.testng.Assert.assertTrue;
+import static org.testng.Assert.expectThrows;
 
 
 public class UpsertTableSegmentPreloadIntegrationTest extends BaseClusterIntegrationTestSet {
@@ -202,6 +206,49 @@ public class UpsertTableSegmentPreloadIntegrationTest extends BaseClusterIntegra
     restartServers();
     verifyIdealState(7);
     waitForAllDocsLoaded(600_000L);
+  }
+
+  @Test(dependsOnMethods = "testSegmentAssignment")
+  public void testDropSegmentNeedsForceOnlyWithValidDocs()
+      throws Exception {
+    String realtimeTableName = TableNameBuilder.REALTIME.tableNameWithType(getTableName());
+    JsonNode validDocIdsMetadata = JsonUtils.stringToJsonNode(
+        getOrCreateAdminClient().getTableClient().getValidDocIdsMetadata(realtimeTableName, "SNAPSHOT"));
+    String segmentWithValidDocs = null;
+    long numValidDocs = 0;
+    String segmentWithoutValidDocs = null;
+    for (JsonNode segmentMetadata : validDocIdsMetadata) {
+      String segmentName = segmentMetadata.get("segmentName").asText();
+      long totalValidDocs = segmentMetadata.get("totalValidDocs").asLong();
+      if (totalValidDocs > 0 && segmentWithValidDocs == null) {
+        segmentWithValidDocs = segmentName;
+        numValidDocs = totalValidDocs;
+      } else if (totalValidDocs == 0 && segmentWithoutValidDocs == null) {
+        segmentWithoutValidDocs = segmentName;
+      }
+    }
+    assertNotNull(segmentWithValidDocs, validDocIdsMetadata.toString());
+    assertNotNull(segmentWithoutValidDocs, validDocIdsMetadata.toString());
+
+    // A segment that holds valid docs is refused, and the refusal names its valid doc count
+    String finalSegmentWithValidDocs = segmentWithValidDocs;
+    IOException refused =
+        expectThrows(IOException.class, () -> dropSegment(realtimeTableName, finalSegmentWithValidDocs));
+    assertTrue(refused.getMessage().contains(segmentWithValidDocs + "=" + numValidDocs + " valid docs"),
+        refused.getMessage());
+
+    // A segment with no valid docs is deleted without force, and the upsert view is unchanged
+    String finalSegmentWithoutValidDocs = segmentWithoutValidDocs;
+    dropSegment(realtimeTableName, segmentWithoutValidDocs);
+    TestUtils.waitForCondition(aVoid -> {
+      try {
+        return !listSegments(realtimeTableName).contains(finalSegmentWithoutValidDocs);
+      } catch (IOException e) {
+        throw new RuntimeException(e);
+      }
+    }, 60_000L, "Failed to drop the segment without valid docs");
+    assertTrue(listSegments(realtimeTableName).contains(segmentWithValidDocs));
+    assertEquals(getCurrentCountStarResult(), getCountStarResult());
   }
 
   protected void waitForSnapshotCreation()

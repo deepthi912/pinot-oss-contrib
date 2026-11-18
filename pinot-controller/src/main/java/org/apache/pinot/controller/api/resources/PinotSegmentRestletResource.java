@@ -572,8 +572,9 @@ public class PinotSegmentRestletResource {
     String tableNameWithType =
         ResourceUtils.getExistingTableNamesWithType(_pinotHelixResourceManager, tableName, tableType, LOGGER).get(0);
     if (segments.isEmpty()) {
+      // Deleting every segment leaves no key pointing at a deleted row, so the upsert valid doc check is skipped
       deleteSegmentsInternal(tableNameWithType,
-          _pinotHelixResourceManager.getSegmentsFromPropertyStore(tableNameWithType), retentionPeriod, force);
+          _pinotHelixResourceManager.getSegmentsFromPropertyStore(tableNameWithType), retentionPeriod);
       return new SuccessResponse("All segments of table " + tableNameWithType + " deleted");
     } else {
       int numSegments = segments.size();

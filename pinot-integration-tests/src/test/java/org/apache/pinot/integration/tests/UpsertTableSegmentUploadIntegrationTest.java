@@ -94,13 +94,9 @@ public class UpsertTableSegmentUploadIntegrationTest extends BaseClusterIntegrat
       throws IOException {
     String realtimeTableName = TableNameBuilder.REALTIME.tableNameWithType(getTableName());
 
-    // Test dropping all segments one by one. Segments of an upsert table that still hold valid docs can only be
-    // dropped with force.
-    List<String> segments = listSegments(realtimeTableName);
-    assertFalse(segments.isEmpty());
-    for (String segment : segments) {
-      dropSegment(realtimeTableName, segment, true);
-    }
+    // Deleting every segment of an upsert table needs no force
+    assertFalse(listSegments(realtimeTableName).isEmpty());
+    dropAllSegments(getTableName(), TableType.REALTIME);
     // NOTE: There is a delay to remove the segment from property store
     TestUtils.waitForCondition((aVoid) -> {
       try {
@@ -164,11 +160,11 @@ public class UpsertTableSegmentUploadIntegrationTest extends BaseClusterIntegrat
   }
 
   @Test
-  public void testDropSegmentWithValidDocsNeedsForce()
+  public void testDropSegmentWithoutValidDocsSnapshotNeedsForce()
       throws IOException {
     String realtimeTableName = TableNameBuilder.REALTIME.tableNameWithType(getTableName());
     int numSegments = listSegments(realtimeTableName).size();
-    // The segments the upsert view serves rows from hold the valid docs
+    // Snapshots are off in this test, so servers report no valid doc count and every hosted segment is refused
     ResultSet resultSet =
         getPinotConnection().execute("SELECT DISTINCT $segmentName FROM " + getTableName()).getResultSet(0);
     assertTrue(resultSet.getRowCount() > 0);
