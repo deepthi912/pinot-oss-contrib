@@ -22,6 +22,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
 import com.google.common.base.Strings;
+import com.google.common.collect.BiMap;
 import io.swagger.annotations.Api;
 import io.swagger.annotations.ApiKeyAuthDefinition;
 import io.swagger.annotations.ApiOperation;
@@ -70,6 +71,8 @@ import org.apache.pinot.common.lineage.SegmentLineage;
 import org.apache.pinot.common.metadata.ZKMetadataProvider;
 import org.apache.pinot.common.metadata.segment.SegmentPartitionMetadata;
 import org.apache.pinot.common.metadata.segment.SegmentZKMetadata;
+import org.apache.pinot.common.restlet.resources.ValidDocIdsMetadataInfo;
+import org.apache.pinot.common.restlet.resources.ValidDocIdsType;
 import org.apache.pinot.common.utils.DatabaseUtils;
 import org.apache.pinot.common.utils.LLCSegmentName;
 import org.apache.pinot.common.utils.PauselessConsumptionUtils;
@@ -81,6 +84,7 @@ import org.apache.pinot.controller.api.access.Authenticate;
 import org.apache.pinot.controller.api.exception.ControllerApplicationException;
 import org.apache.pinot.controller.helix.core.PinotHelixResourceManager;
 import org.apache.pinot.controller.helix.core.PinotResourceManagerResponse;
+import org.apache.pinot.controller.util.ServerSegmentMetadataReader;
 import org.apache.pinot.controller.util.TableMetadataReader;
 import org.apache.pinot.controller.util.TableTierReader;
 import org.apache.pinot.core.auth.Actions;
@@ -145,6 +149,13 @@ import static org.apache.pinot.spi.utils.CommonConstants.SWAGGER_AUTHORIZATION_K
 @Path("/")
 public class PinotSegmentRestletResource {
   private static final Logger LOGGER = LoggerFactory.getLogger(PinotSegmentRestletResource.class);
+  private static final String FORCE_DELETE_DESCRIPTION =
+      "Delete upsert table segments even when they may still hold valid docs. Deleting such a segment drops its "
+          + "primary keys from the upsert metadata, which breaks partial-upsert merges and can bring older rows back "
+          + "on restart";
+  // Matches the default batch size of the table validDocIdsMetadata API
+  private static final int VALID_DOC_IDS_SERVER_REQUEST_BATCH_SIZE = 500;
+  private static final int MAX_BLOCKED_SEGMENTS_IN_ERROR = 10;
 
   @Inject
   ControllerConf _controllerConf;
@@ -523,11 +534,14 @@ public class PinotSegmentRestletResource {
       @ApiParam(value = "Retention period for the table segments (e.g. 12h, 3d); If not set, the retention period "
           + "will default to the first config that's not null: the table config, then to cluster setting, then '7d'. "
           + "Using 0d or -1d will instantly delete segments without retention")
-      @QueryParam("retention") String retentionPeriod, @Context HttpHeaders headers) {
+      @QueryParam("retention") String retentionPeriod,
+      @ApiParam(value = FORCE_DELETE_DESCRIPTION, defaultValue = "false")
+      @QueryParam("force") @DefaultValue("false") boolean force,
+      @Context HttpHeaders headers) {
     tableName = DatabaseUtils.translateTableName(tableName, headers);
     segmentName = URIUtils.decode(segmentName);
     String tableNameWithType = getExistingTable(tableName, segmentName);
-    deleteSegmentsInternal(tableNameWithType, List.of(segmentName), retentionPeriod);
+    deleteSegmentsInternal(tableNameWithType, List.of(segmentName), retentionPeriod, force);
     return new SuccessResponse("Segment deleted");
   }
 
@@ -546,7 +560,10 @@ public class PinotSegmentRestletResource {
           + "Using 0d or -1d will instantly delete segments without retention")
       @QueryParam("retention") String retentionPeriod,
       @ApiParam(value = "Segment names to be deleted if not provided deletes all segments by default",
-          allowMultiple = true) @QueryParam("segments") List<String> segments, @Context HttpHeaders headers) {
+          allowMultiple = true) @QueryParam("segments") List<String> segments,
+      @ApiParam(value = FORCE_DELETE_DESCRIPTION, defaultValue = "false")
+      @QueryParam("force") @DefaultValue("false") boolean force,
+      @Context HttpHeaders headers) {
     tableName = DatabaseUtils.translateTableName(tableName, headers);
     TableType tableType = Constants.validateTableType(tableTypeStr);
     if (tableType == null) {
@@ -555,12 +572,13 @@ public class PinotSegmentRestletResource {
     String tableNameWithType =
         ResourceUtils.getExistingTableNamesWithType(_pinotHelixResourceManager, tableName, tableType, LOGGER).get(0);
     if (segments.isEmpty()) {
+      // Deleting every segment leaves no key pointing at a deleted row, so the upsert valid doc check is skipped
       deleteSegmentsInternal(tableNameWithType,
           _pinotHelixResourceManager.getSegmentsFromPropertyStore(tableNameWithType), retentionPeriod);
       return new SuccessResponse("All segments of table " + tableNameWithType + " deleted");
     } else {
       int numSegments = segments.size();
-      deleteSegmentsInternal(tableNameWithType, segments, retentionPeriod);
+      deleteSegmentsInternal(tableNameWithType, segments, retentionPeriod, force);
       if (numSegments <= 5) {
         return new SuccessResponse("Deleted segments: " + segments + " from table: " + tableNameWithType);
       } else {
@@ -583,14 +601,17 @@ public class PinotSegmentRestletResource {
       @ApiParam(value = "Retention period for the table segments (e.g. 12h, 3d); If not set, the retention period "
           + "will default to the first config that's not null: the table config, then to cluster setting, then '7d'. "
           + "Using 0d or -1d will instantly delete segments without retention")
-      @QueryParam("retention") String retentionPeriod, List<String> segments, @Context HttpHeaders headers) {
+      @QueryParam("retention") String retentionPeriod,
+      @ApiParam(value = FORCE_DELETE_DESCRIPTION, defaultValue = "false")
+      @QueryParam("force") @DefaultValue("false") boolean force,
+      List<String> segments, @Context HttpHeaders headers) {
     tableName = DatabaseUtils.translateTableName(tableName, headers);
     int numSegments = segments.size();
     if (numSegments == 0) {
       throw new ControllerApplicationException(LOGGER, "Segments must be provided", Status.BAD_REQUEST);
     }
     String tableNameWithType = getExistingTable(tableName, segments.get(0));
-    deleteSegmentsInternal(tableNameWithType, segments, retentionPeriod);
+    deleteSegmentsInternal(tableNameWithType, segments, retentionPeriod, force);
     if (numSegments <= 5) {
       return new SuccessResponse("Deleted segments: " + segments + " from table: " + tableNameWithType);
     } else {
@@ -624,7 +645,10 @@ public class PinotSegmentRestletResource {
       @ApiParam(value = "Retention period for the table segments (e.g. 12h, 3d); If not set, the retention period "
           + "will default to the first config that's not null: the table config, then to cluster setting, then '7d'. "
           + "Using 0d or -1d will instantly delete segments without retention")
-      @QueryParam("retention") String retentionPeriod, @Context HttpHeaders headers) {
+      @QueryParam("retention") String retentionPeriod,
+      @ApiParam(value = FORCE_DELETE_DESCRIPTION, defaultValue = "false")
+      @QueryParam("force") @DefaultValue("false") boolean force,
+      @Context HttpHeaders headers) {
     tableName = DatabaseUtils.translateTableName(tableName, headers);
     if (Strings.isNullOrEmpty(startTimestampStr) || Strings.isNullOrEmpty(endTimestampStr)) {
       throw new ControllerApplicationException(LOGGER, "start and end timestamp must by non empty", Status.BAD_REQUEST);
@@ -640,9 +664,15 @@ public class PinotSegmentRestletResource {
         continue;
       }
       String tableNameWithType = TableNameBuilder.forType(tableType).tableNameWithType(tableName);
-      deleteSegmentsInternal(tableNameWithType, segments, retentionPeriod);
+      deleteSegmentsInternal(tableNameWithType, segments, retentionPeriod, force);
     }
     return new SuccessResponse("Deleted " + numSegments + " segments from table: " + tableName);
+  }
+
+  private void deleteSegmentsInternal(String tableNameWithType, List<String> segments,
+      @Nullable String retentionPeriod, boolean force) {
+    checkUpsertSegmentsHaveNoValidDocs(tableNameWithType, segments, force);
+    deleteSegmentsInternal(tableNameWithType, segments, retentionPeriod);
   }
 
   private void deleteSegmentsInternal(String tableNameWithType, List<String> segments,
@@ -654,6 +684,83 @@ public class PinotSegmentRestletResource {
           "Failed to delete segments from table: " + tableNameWithType + ", error message: " + response.getMessage(),
           Status.INTERNAL_SERVER_ERROR);
     }
+  }
+
+  /// Refuses to delete upsert segments that may still hold valid docs unless `force` is set, since dropping them
+  /// loses the latest row of their keys. A hosted segment with no valid doc count counts as holding valid docs.
+  private void checkUpsertSegmentsHaveNoValidDocs(String tableNameWithType, List<String> segments, boolean force) {
+    if (segments.isEmpty()) {
+      return;
+    }
+    TableConfig tableConfig = _pinotHelixResourceManager.getTableConfig(tableNameWithType);
+    if (tableConfig == null || !tableConfig.isUpsertEnabled()) {
+      return;
+    }
+    Map<String, List<String>> serverToSegments = _pinotHelixResourceManager.getServerToSegmentsMap(tableNameWithType);
+    BiMap<String, String> endpoints;
+    try {
+      endpoints = _pinotHelixResourceManager.getDataInstanceAdminEndpoints(serverToSegments.keySet());
+    } catch (InvalidConfigException e) {
+      if (force) {
+        LOGGER.warn("Force deleting segments of upsert table: {} without checking their valid docs", tableNameWithType,
+            e);
+        return;
+      }
+      throw new ControllerApplicationException(LOGGER, String.format(
+          "Cannot check the valid docs of segments of upsert table: %s before deleting them. Pass force=true to delete "
+              + "anyway", tableNameWithType), Status.INTERNAL_SERVER_ERROR, e);
+    }
+    ServerSegmentMetadataReader.ValidDocIdsMetadataResult result =
+        new ServerSegmentMetadataReader(_executor, _connectionManager,
+            _pinotHelixResourceManager.getServerAdminAuthProvider()).getSegmentToValidDocIdsMetadataFromServer(
+            tableNameWithType, serverToSegments, endpoints, segments,
+            _controllerConf.getServerAdminRequestTimeoutSeconds() * 1000, ValidDocIdsType.SNAPSHOT.toString(),
+            VALID_DOC_IDS_SERVER_REQUEST_BATCH_SIZE);
+    Map<String, String> blockedSegments = getUpsertSegmentsBlockingDelete(segments, result.getSegmentToMetadata(),
+        result.getSegmentToExpectedReplicaCount());
+    if (blockedSegments.isEmpty()) {
+      return;
+    }
+    if (force) {
+      LOGGER.warn("Force deleting {} segment(s) of upsert table: {} that may still hold valid docs: {}",
+          blockedSegments.size(), tableNameWithType, blockedSegments);
+      return;
+    }
+    Map<String, String> blockedSegmentsToReport = blockedSegments.entrySet().stream()
+        .limit(MAX_BLOCKED_SEGMENTS_IN_ERROR)
+        .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue, (a, b) -> a, LinkedHashMap::new));
+    throw new ControllerApplicationException(LOGGER, String.format(
+        "Refusing to delete %d segment(s) of upsert table: %s that may still hold valid docs (first %d: %s). Deleting "
+            + "them drops their primary keys from the upsert metadata, which breaks partial-upsert merges and can "
+            + "bring older rows back on restart. Pass force=true to delete anyway", blockedSegments.size(),
+        tableNameWithType, blockedSegmentsToReport.size(), blockedSegmentsToReport), Status.CONFLICT);
+  }
+
+  /// Returns each segment that may still hold valid docs, mapped to the reason, in request order. A segment is listed
+  /// when any replica reports valid docs, or when fewer replicas report than host it.
+  @VisibleForTesting
+  static Map<String, String> getUpsertSegmentsBlockingDelete(List<String> segments,
+      Map<String, List<ValidDocIdsMetadataInfo>> segmentToMetadata,
+      Map<String, Integer> segmentToExpectedReplicaCount) {
+    Map<String, String> blockedSegments = new LinkedHashMap<>();
+    for (String segment : segments) {
+      int numExpectedReplicas = segmentToExpectedReplicaCount.getOrDefault(segment, 0);
+      if (numExpectedReplicas == 0) {
+        continue;
+      }
+      List<ValidDocIdsMetadataInfo> metadataList = segmentToMetadata.getOrDefault(segment, List.of());
+      long maxValidDocs = 0;
+      for (ValidDocIdsMetadataInfo metadata : metadataList) {
+        maxValidDocs = Math.max(maxValidDocs, metadata.getTotalValidDocs());
+      }
+      if (maxValidDocs > 0) {
+        blockedSegments.put(segment, maxValidDocs + " valid docs");
+      } else if (metadataList.size() < numExpectedReplicas) {
+        blockedSegments.put(segment,
+            "valid docs reported by " + metadataList.size() + " of " + numExpectedReplicas + " replicas");
+      }
+    }
+    return blockedSegments;
   }
 
   @GET

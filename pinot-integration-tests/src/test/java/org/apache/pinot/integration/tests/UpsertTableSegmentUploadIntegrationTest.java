@@ -24,6 +24,7 @@ import java.util.List;
 import java.util.Map;
 import org.apache.commons.io.FileUtils;
 import org.apache.helix.model.IdealState;
+import org.apache.pinot.client.ResultSet;
 import org.apache.pinot.common.utils.LLCSegmentName;
 import org.apache.pinot.common.utils.helix.HelixHelper;
 import org.apache.pinot.spi.config.table.TableConfig;
@@ -38,6 +39,8 @@ import org.testng.annotations.Test;
 
 import static org.testng.Assert.assertEquals;
 import static org.testng.Assert.assertFalse;
+import static org.testng.Assert.assertTrue;
+import static org.testng.Assert.expectThrows;
 
 
 public class UpsertTableSegmentUploadIntegrationTest extends BaseClusterIntegrationTestSet {
@@ -91,12 +94,9 @@ public class UpsertTableSegmentUploadIntegrationTest extends BaseClusterIntegrat
       throws IOException {
     String realtimeTableName = TableNameBuilder.REALTIME.tableNameWithType(getTableName());
 
-    // Test dropping all segments one by one
-    List<String> segments = listSegments(realtimeTableName);
-    assertFalse(segments.isEmpty());
-    for (String segment : segments) {
-      dropSegment(realtimeTableName, segment);
-    }
+    // Deleting every segment of an upsert table needs no force
+    assertFalse(listSegments(realtimeTableName).isEmpty());
+    dropAllSegments(getTableName(), TableType.REALTIME);
     // NOTE: There is a delay to remove the segment from property store
     TestUtils.waitForCondition((aVoid) -> {
       try {
@@ -157,6 +157,24 @@ public class UpsertTableSegmentUploadIntegrationTest extends BaseClusterIntegrat
   private long getCountStarResultWithoutUpsert() {
     // 3 Avro files, each with 100 documents, one copy from streaming source, one copy from batch source
     return 600;
+  }
+
+  @Test
+  public void testDropSegmentWithoutValidDocsSnapshotNeedsForce()
+      throws IOException {
+    String realtimeTableName = TableNameBuilder.REALTIME.tableNameWithType(getTableName());
+    int numSegments = listSegments(realtimeTableName).size();
+    // Snapshots are off in this test, so servers report no valid doc count and every hosted segment is refused
+    ResultSet resultSet =
+        getPinotConnection().execute("SELECT DISTINCT $segmentName FROM " + getTableName()).getResultSet(0);
+    assertTrue(resultSet.getRowCount() > 0);
+    for (int i = 0; i < resultSet.getRowCount(); i++) {
+      String segment = resultSet.getString(i, 0);
+      IOException refused = expectThrows(IOException.class, () -> dropSegment(realtimeTableName, segment));
+      assertTrue(refused.getMessage().contains("may still hold valid docs"), refused.getMessage());
+    }
+    assertEquals(listSegments(realtimeTableName).size(), numSegments);
+    assertEquals(getCurrentCountStarResult(), getCountStarResult());
   }
 
   @Test
