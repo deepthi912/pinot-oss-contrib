@@ -685,18 +685,8 @@ public class PinotSegmentRestletResource {
     }
   }
 
-  /// Refuses a manual delete of upsert table segments that may still hold valid docs, unless `force` is set.
-  ///
-  /// When a server drops an upsert segment, it removes every primary key whose current row is in that segment from
-  /// the upsert metadata, and does not point the key back at an older row. A partial-upsert table then merges the
-  /// next update for the key against nothing, and a full-upsert table can bring an older row back on restart. The
-  /// valid doc counts come from the validDocIds snapshot each server keeps on disk. A segment that a server hosts
-  /// but reports no count for (consuming, no snapshot, server down) is treated as holding valid docs. A segment that
-  /// no server hosts is in no upsert metadata, so it can be deleted.
-  ///
-  /// Only the REST delete endpoints call this. Retention, lineage cleanup and minion tasks delete segments on purpose
-  /// through [PinotHelixResourceManager#deleteSegments] and are not checked. Dedup tables have no valid doc ids and are
-  /// not checked either.
+  /// Refuses to delete upsert segments that may still hold valid docs unless `force` is set, since dropping them
+  /// loses the latest row of their keys. A hosted segment with no valid doc count counts as holding valid docs.
   private void checkUpsertSegmentsHaveNoValidDocs(String tableNameWithType, List<String> segments, boolean force) {
     if (segments.isEmpty()) {
       return;
