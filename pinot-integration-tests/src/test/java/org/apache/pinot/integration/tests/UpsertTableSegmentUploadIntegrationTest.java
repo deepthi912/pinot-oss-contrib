@@ -24,6 +24,7 @@ import java.util.List;
 import java.util.Map;
 import org.apache.commons.io.FileUtils;
 import org.apache.helix.model.IdealState;
+import org.apache.pinot.client.ResultSet;
 import org.apache.pinot.common.utils.LLCSegmentName;
 import org.apache.pinot.common.utils.helix.HelixHelper;
 import org.apache.pinot.spi.config.table.TableConfig;
@@ -38,6 +39,8 @@ import org.testng.annotations.Test;
 
 import static org.testng.Assert.assertEquals;
 import static org.testng.Assert.assertFalse;
+import static org.testng.Assert.assertTrue;
+import static org.testng.Assert.expectThrows;
 
 
 public class UpsertTableSegmentUploadIntegrationTest extends BaseClusterIntegrationTestSet {
@@ -91,11 +94,12 @@ public class UpsertTableSegmentUploadIntegrationTest extends BaseClusterIntegrat
       throws IOException {
     String realtimeTableName = TableNameBuilder.REALTIME.tableNameWithType(getTableName());
 
-    // Test dropping all segments one by one
+    // Test dropping all segments one by one. Segments of an upsert table that still hold valid docs can only be
+    // dropped with force.
     List<String> segments = listSegments(realtimeTableName);
     assertFalse(segments.isEmpty());
     for (String segment : segments) {
-      dropSegment(realtimeTableName, segment);
+      dropSegment(realtimeTableName, segment, true);
     }
     // NOTE: There is a delay to remove the segment from property store
     TestUtils.waitForCondition((aVoid) -> {
@@ -157,6 +161,24 @@ public class UpsertTableSegmentUploadIntegrationTest extends BaseClusterIntegrat
   private long getCountStarResultWithoutUpsert() {
     // 3 Avro files, each with 100 documents, one copy from streaming source, one copy from batch source
     return 600;
+  }
+
+  @Test
+  public void testDropSegmentWithValidDocsNeedsForce()
+      throws IOException {
+    String realtimeTableName = TableNameBuilder.REALTIME.tableNameWithType(getTableName());
+    int numSegments = listSegments(realtimeTableName).size();
+    // The segments the upsert view serves rows from hold the valid docs
+    ResultSet resultSet =
+        getPinotConnection().execute("SELECT DISTINCT $segmentName FROM " + getTableName()).getResultSet(0);
+    assertTrue(resultSet.getRowCount() > 0);
+    for (int i = 0; i < resultSet.getRowCount(); i++) {
+      String segment = resultSet.getString(i, 0);
+      IOException refused = expectThrows(IOException.class, () -> dropSegment(realtimeTableName, segment));
+      assertTrue(refused.getMessage().contains("may still hold valid docs"), refused.getMessage());
+    }
+    assertEquals(listSegments(realtimeTableName).size(), numSegments);
+    assertEquals(getCurrentCountStarResult(), getCountStarResult());
   }
 
   @Test

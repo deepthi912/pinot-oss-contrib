@@ -121,7 +121,7 @@ public class UpsertTableSegmentPreloadIntegrationTest extends BaseClusterIntegra
     List<String> segments = listSegments(realtimeTableName);
     assertFalse(segments.isEmpty());
     for (String segment : segments) {
-      dropSegment(realtimeTableName, segment);
+      dropSegment(realtimeTableName, segment, true);
     }
     // NOTE: There is a delay to remove the segment from property store
     TestUtils.waitForCondition((aVoid) -> {

@@ -1027,8 +1027,13 @@ public class ControllerTest {
 
   public void dropSegment(String tableName, String segmentName)
       throws IOException {
+    dropSegment(tableName, segmentName, false);
+  }
+
+  public void dropSegment(String tableName, String segmentName, boolean force)
+      throws IOException {
     try {
-      getOrCreateAdminClient().getSegmentClient().deleteSegment(tableName, segmentName, null);
+      getOrCreateAdminClient().getSegmentClient().deleteSegment(tableName, segmentName, null, force);
     } catch (PinotAdminException e) {
       throw new IOException(e);
     }

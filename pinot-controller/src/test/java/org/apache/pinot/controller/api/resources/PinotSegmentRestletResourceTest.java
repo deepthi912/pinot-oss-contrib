@@ -29,7 +29,10 @@ import org.apache.helix.model.IdealState;
 import org.apache.helix.zookeeper.datamodel.ZNRecord;
 import org.apache.pinot.common.exception.TableNotFoundException;
 import org.apache.pinot.common.metadata.segment.SegmentZKMetadata;
+import org.apache.pinot.common.restlet.resources.ValidDocIdsMetadataInfo;
+import org.apache.pinot.common.restlet.resources.ValidDocIdsType;
 import org.apache.pinot.common.utils.LLCSegmentName;
+import org.apache.pinot.common.utils.ServiceStatus;
 import org.apache.pinot.controller.helix.core.PinotHelixResourceManager;
 import org.apache.pinot.spi.utils.CommonConstants;
 import org.mockito.InjectMocks;
@@ -224,5 +227,39 @@ public class PinotSegmentRestletResourceTest {
       segments.add(new LLCSegmentName(tableName, partitionID, i, currentTime).getSegmentName());
     }
     return segments;
+  }
+
+  @Test
+  public void testGetUpsertSegmentsBlockingDelete() {
+    List<String> segments = List.of("noValidDocs", "validDocs", "oneReplicaValid", "missingReplica", "noReport",
+        "notHosted");
+    Map<String, List<ValidDocIdsMetadataInfo>> segmentToMetadata = Map.of(
+        "noValidDocs", List.of(validDocIdsMetadata("noValidDocs", 0, "server0"),
+            validDocIdsMetadata("noValidDocs", 0, "server1")),
+        "validDocs", List.of(validDocIdsMetadata("validDocs", 5, "server0"),
+            validDocIdsMetadata("validDocs", 5, "server1")),
+        "oneReplicaValid", List.of(validDocIdsMetadata("oneReplicaValid", 0, "server0"),
+            validDocIdsMetadata("oneReplicaValid", 3, "server1")),
+        "missingReplica", List.of(validDocIdsMetadata("missingReplica", 0, "server0")));
+    Map<String, Integer> segmentToExpectedReplicaCount =
+        Map.of("noValidDocs", 2, "validDocs", 2, "oneReplicaValid", 2, "missingReplica", 2, "noReport", 2);
+
+    Map<String, String> blockedSegments =
+        PinotSegmentRestletResource.getUpsertSegmentsBlockingDelete(segments, segmentToMetadata,
+            segmentToExpectedReplicaCount);
+
+    // A segment with no valid docs on every replica, or hosted by no server, can be deleted
+    assertEquals(new ArrayList<>(blockedSegments.keySet()),
+        List.of("validDocs", "oneReplicaValid", "missingReplica", "noReport"));
+    assertEquals(blockedSegments.get("validDocs"), "5 valid docs");
+    assertEquals(blockedSegments.get("oneReplicaValid"), "3 valid docs");
+    assertEquals(blockedSegments.get("missingReplica"), "valid docs reported by 1 of 2 replicas");
+    assertEquals(blockedSegments.get("noReport"), "valid docs reported by 0 of 2 replicas");
+  }
+
+  private static ValidDocIdsMetadataInfo validDocIdsMetadata(String segmentName, long totalValidDocs,
+      String instanceId) {
+    return new ValidDocIdsMetadataInfo(segmentName, totalValidDocs, 10 - totalValidDocs, 10, "1", null,
+        ValidDocIdsType.SNAPSHOT, 100, 0, instanceId, ServiceStatus.Status.GOOD);
   }
 }

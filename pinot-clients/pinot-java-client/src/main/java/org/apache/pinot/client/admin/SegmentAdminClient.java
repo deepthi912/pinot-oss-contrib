@@ -305,9 +305,19 @@ public class SegmentAdminClient extends BaseServiceAdminClient {
   /// @throws PinotAdminException If the request fails
   public String deleteSegment(String tableName, String segmentName, String retentionPeriod)
       throws PinotAdminException {
+    return deleteSegment(tableName, segmentName, retentionPeriod, false);
+  }
+
+  /// Deletes a segment. For an upsert table, the controller refuses to delete a segment that may still hold valid
+  /// docs unless `force` is true.
+  public String deleteSegment(String tableName, String segmentName, String retentionPeriod, boolean force)
+      throws PinotAdminException {
     Map<String, String> queryParams = new HashMap<>();
     if (retentionPeriod != null) {
       queryParams.put("retention", retentionPeriod);
+    }
+    if (force) {
+      queryParams.put("force", "true");
     }
 
     JsonNode response = _transport.executeDelete(_controllerAddress,
