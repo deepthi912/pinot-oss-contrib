@@ -704,6 +704,9 @@ public class MutableSegmentImpl implements MutableSegment {
         // a key is pointing to some other key's docID
         // TODO fix this metadata mismatch scenario
         boolean isOutOfOrderRecord = !_partitionUpsertMetadataManager.addRecord(this, recordInfo);
+        if (recordInfo.getComparisonValue() instanceof ComparisonColumns comparisonColumns) {
+          fillCarriedComparisonValues(updatedRow, comparisonColumns);
+        }
         if (_upsertOutOfOrderRecordColumn != null) {
           // The input never carries this column, so the null value transformer marked it null; the flag is a real value
           updatedRow.removeNullValueField(_upsertOutOfOrderRecordColumn);
@@ -813,6 +816,21 @@ public class MutableSegmentImpl implements MutableSegment {
     Comparable comparisonValue = getComparisonValue(row);
     boolean deleteRecord = _deleteRecordColumn != null && BooleanUtils.toBoolean(row.getValue(_deleteRecordColumn));
     return new RecordInfo(primaryKey, docId, comparisonValue, deleteRecord);
+  }
+
+  /// With multiple comparison columns, a record that wins in [ComparisonColumns#compareTo] takes the other columns'
+  /// values from the key's current metadata. Writes those carried values into the row, so that a commit or a restart,
+  /// which compares the stored rows, picks the same winner as live ingestion did.
+  /// Only the NONE consistency mode calls this: the other modes index the row before the metadata is updated.
+  private void fillCarriedComparisonValues(GenericRow row, ComparisonColumns comparisonColumns) {
+    Comparable[] values = comparisonColumns.getValues();
+    for (int i = 0; i < values.length; i++) {
+      String column = _upsertComparisonColumns.get(i);
+      if (values[i] != null && row.isNullValue(column)) {
+        row.removeNullValueField(column);
+        row.putValue(column, values[i] instanceof ByteArray byteArray ? byteArray.getBytes() : values[i]);
+      }
+    }
   }
 
   private Comparable getComparisonValue(GenericRow row) {
