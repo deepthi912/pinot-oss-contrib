@@ -1269,7 +1269,7 @@ public final class TableConfigUtils {
           upsertConfig.getConsistencyMode());
     }
 
-    validateTTLForUpsertConfig(tableConfig, schema);
+    validateTTLForUpsertConfig(tableConfig, schema, existingTableConfig);
     validatePartialUpsertStrategies(tableConfig, schema);
     validateConsumptionDuringUpsertRevert(tableConfig);
     Preconditions.checkState(!(PinotMd5Mode.isPinotMd5Disabled() && upsertConfig.getHashFunction() == HashFunction.MD5),
@@ -1334,6 +1334,15 @@ public final class TableConfigUtils {
   /// Validates the upsert config related to TTL.
   @VisibleForTesting
   static void validateTTLForUpsertConfig(TableConfig tableConfig, Schema schema) {
+    validateTTLForUpsertConfig(tableConfig, schema, null);
+  }
+
+  /// Validates the upsert config related to TTL. `existingTableConfig` is the config being replaced on an update (the
+  /// table's own config on a schema update), or null on create; it only grandfathers a TTL ordering the table already
+  /// has (see [#validateTTLOrderingForUpsertConfig]).
+  @VisibleForTesting
+  static void validateTTLForUpsertConfig(TableConfig tableConfig, Schema schema,
+      @Nullable TableConfig existingTableConfig) {
     UpsertConfig upsertConfig = tableConfig.getUpsertConfig();
     assert upsertConfig != null;
     if (upsertConfig.getMetadataTTL() <= 0 && upsertConfig.getDeletedKeysTTL() <= 0) {
@@ -1369,6 +1378,37 @@ public final class TableConfigUtils {
       Preconditions.checkState(upsertConfig.getDeleteRecordColumn() != null,
           "Deleted Keys TTL can only be enabled with deleteRecordColumn set.");
     }
+
+    validateTTLOrderingForUpsertConfig(tableConfig, existingTableConfig);
+  }
+
+  /// Requires `deletedKeysTTL < metadataTTL` when both are set. TTL cleanup checks metadataTTL first: a key past
+  /// metadataTTL is dropped from the metadata without clearing its valid doc, so with `deletedKeysTTL >= metadataTTL`
+  /// every delete marker old enough for deletedKeysTTL is dropped by metadataTTL instead, its doc stays valid forever,
+  /// and deletedKeysTTL never takes effect.
+  ///
+  /// A table that already has this ordering keeps it while an update (or a schema update) leaves both TTLs unchanged,
+  /// so the rule does not block unrelated changes; any update that changes either TTL must fix the ordering.
+  private static void validateTTLOrderingForUpsertConfig(TableConfig tableConfig,
+      @Nullable TableConfig existingTableConfig) {
+    UpsertConfig upsertConfig = tableConfig.getUpsertConfig();
+    assert upsertConfig != null;
+    double metadataTTL = upsertConfig.getMetadataTTL();
+    double deletedKeysTTL = upsertConfig.getDeletedKeysTTL();
+    if (metadataTTL <= 0 || deletedKeysTTL <= 0 || deletedKeysTTL < metadataTTL) {
+      return;
+    }
+    UpsertConfig existingUpsertConfig = existingTableConfig != null ? existingTableConfig.getUpsertConfig() : null;
+    if (existingUpsertConfig != null && Double.compare(existingUpsertConfig.getMetadataTTL(), metadataTTL) == 0
+        && Double.compare(existingUpsertConfig.getDeletedKeysTTL(), deletedKeysTTL) == 0) {
+      LOGGER.warn("Table: {} keeps deletedKeysTTL ({}) >= metadataTTL ({}); delete markers are never purged. Set "
+          + "deletedKeysTTL below metadataTTL to purge them", tableConfig.getTableName(), deletedKeysTTL, metadataTTL);
+      return;
+    }
+    throw new IllegalStateException(String.format(
+        "deletedKeysTTL (%s) must be less than metadataTTL (%s) when both are set: metadataTTL cleanup drops the key "
+            + "of an expired delete marker without purging the marker, so deletedKeysTTL would never take effect",
+        deletedKeysTTL, metadataTTL));
   }
 
   /// Validates the dedup config related to TTL.
