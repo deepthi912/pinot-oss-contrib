@@ -18,6 +18,7 @@
  */
 package org.apache.pinot.segment.local.dedup;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
 import com.google.common.util.concurrent.AtomicDouble;
 import java.io.File;
@@ -30,10 +31,15 @@ import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 import javax.annotation.Nullable;
 import org.apache.helix.HelixManager;
+import org.apache.helix.store.zk.ZkHelixPropertyStore;
+import org.apache.helix.zookeeper.datamodel.ZNRecord;
+import org.apache.pinot.common.metadata.ZKMetadataProvider;
+import org.apache.pinot.common.metadata.segment.SegmentZKMetadata;
 import org.apache.pinot.common.metrics.ServerGauge;
 import org.apache.pinot.common.metrics.ServerMeter;
 import org.apache.pinot.common.metrics.ServerMetrics;
 import org.apache.pinot.common.metrics.ServerTimer;
+import org.apache.pinot.common.utils.LLCSegmentName;
 import org.apache.pinot.segment.local.data.manager.TableDataManager;
 import org.apache.pinot.segment.local.indexsegment.immutable.EmptyIndexSegment;
 import org.apache.pinot.segment.local.indexsegment.immutable.ImmutableSegmentImpl;
@@ -62,6 +68,9 @@ public abstract class BasePartitionDedupMetadataManager implements PartitionDedu
   protected final double _metadataTTL;
   protected final String _dedupTimeColumn;
   protected final AtomicDouble _largestSeenTime;
+  // The watermark at the last removal of expired primary keys, by the consuming thread or while loading segments.
+  // Loading segments removes expired keys again once the watermark has moved by metadataTTL since then.
+  private final AtomicDouble _lastSweptWatermark;
   protected final File _tableIndexDir;
   protected final Logger _logger;
   // The following variables are always accessed within synchronized block
@@ -90,10 +99,12 @@ public abstract class BasePartitionDedupMetadataManager implements PartitionDedu
           "When metadataTTL is configured, metadata time column must be configured for dedup enabled table: %s",
           tableNameWithType);
       _largestSeenTime = new AtomicDouble(WatermarkUtils.loadWatermark(getWatermarkFile(), TTL_WATERMARK_NOT_SET));
+      seedWatermarkFromZK();
     } else {
       _largestSeenTime = new AtomicDouble(TTL_WATERMARK_NOT_SET);
       WatermarkUtils.deleteWatermark(getWatermarkFile());
     }
+    _lastSweptWatermark = new AtomicDouble(_largestSeenTime.get());
   }
 
   @Override
@@ -170,8 +181,7 @@ public abstract class BasePartitionDedupMetadataManager implements PartitionDedu
       // Bump watermark after doPreloadSegment; a concurrent removeExpiredPrimaryKeys sweep reading a pre-bumped
       // watermark could expire keys this preload is about to insert.
       if (!skipSegmentOutOfTTL(segment)) {
-        try (DedupUtils.DedupRecordInfoReader dedupRecordInfoReader = new DedupUtils.DedupRecordInfoReader(segment,
-            _primaryKeyColumns, _dedupTimeColumn)) {
+        try (DedupUtils.DedupRecordInfoReader dedupRecordInfoReader = createDedupRecordInfoReader(segment)) {
           Iterator<DedupRecordInfo> dedupRecordInfoIterator =
               DedupUtils.getDedupRecordInfoIterator(dedupRecordInfoReader, segment.getSegmentMetadata().getTotalDocs());
           doPreloadSegment(segment, dedupRecordInfoIterator);
@@ -179,6 +189,7 @@ public abstract class BasePartitionDedupMetadataManager implements PartitionDedu
         }
       }
       updateLargestSeenTime(segment);
+      removeExpiredPrimaryKeysWhileLoading();
     } catch (Exception e) {
       throw new RuntimeException(
           String.format("Caught exception while preloading segment: %s of table: %s in %s", segmentName,
@@ -210,6 +221,7 @@ public abstract class BasePartitionDedupMetadataManager implements PartitionDedu
         addOrReplaceSegment(null, segment);
       }
       updateLargestSeenTime(segment);
+      removeExpiredPrimaryKeysWhileLoading();
     } catch (Exception e) {
       throw new RuntimeException(
           String.format("Caught exception while adding segment: %s of table: %s to %s", segmentName, _tableNameWithType,
@@ -258,6 +270,84 @@ public abstract class BasePartitionDedupMetadataManager implements PartitionDedu
     return true;
   }
 
+  /// Removes the expired primary keys when the watermark has moved by at least metadataTTL since the last removal.
+  ///
+  /// Called after a segment's rows are added and the watermark is raised, the order #19512 set up, so it removes only
+  /// keys that are out of TTL against a watermark that covers the rows added. A server loading a long history without
+  /// a usable watermark file, e.g. one newly assigned the partition, would otherwise keep the keys of the whole
+  /// history until its consuming segment starts and removes them. With this, it keeps about two TTL windows whatever
+  /// order the segments load in. The removed keys are already treated as absent by every lookup, so dedup results do
+  /// not change.
+  ///
+  /// Not called on replace, so segment commit does not change.
+  private void removeExpiredPrimaryKeysWhileLoading() {
+    if (_metadataTTL <= 0) {
+      return;
+    }
+    double watermark = _largestSeenTime.get();
+    double lastSweptWatermark = _lastSweptWatermark.get();
+    // When segments load in parallel, the compare-and-set lets only one of them remove the keys.
+    if (watermark - lastSweptWatermark < _metadataTTL || !_lastSweptWatermark.compareAndSet(lastSweptWatermark,
+        watermark)) {
+      return;
+    }
+    long startTimeMs = System.currentTimeMillis();
+    long numPrimaryKeysBefore = getNumPrimaryKeys();
+    doRemoveExpiredPrimaryKeys();
+    updatePrimaryKeyGauge();
+    _logger.info("Removed expired primary keys while loading segments, watermark: {}, primary key count: {} -> {}, "
+        + "took: {}ms", watermark, numPrimaryKeysBefore, getNumPrimaryKeys(), System.currentTimeMillis() - startTimeMs);
+  }
+
+  /// Raises the watermark to the partition's dedup time max stored in ZK. A server newly assigned the partition has no
+  /// watermark file and would otherwise start from 0, keep every historical segment until loading raises the
+  /// watermark, and read every row of them.
+  ///
+  /// The controller carries the partition max from each committed segment to the next one, so the newest segment of
+  /// the partition holds the max of the committed segments. Loading raises the watermark at least that high before
+  /// consumption starts, so the seed never puts it above where it would end up. It only goes up: a higher watermark
+  /// from the local file is kept.
+  ///
+  /// There is no seed without a Helix manager (e.g. in a minion task), or when segments on a non-default tier are not
+  /// added, because the partition max may come from such a segment. A failure is logged and loading goes on without a
+  /// seed.
+  private void seedWatermarkFromZK() {
+    TableDataManager tableDataManager = _context.getTableDataManager();
+    HelixManager helixManager = tableDataManager != null ? tableDataManager.getHelixManager() : null;
+    if (helixManager == null || _context.isIgnoreNonDefaultTiers()) {
+      return;
+    }
+    try {
+      Double seed = getPartitionDedupTimeMax(helixManager.getHelixPropertyStore());
+      if (seed != null) {
+        double watermark = _largestSeenTime.getAndAccumulate(seed, Math::max);
+        _logger.info("Seeded TTL watermark from ZK: {}, watermark before: {}, after: {}", seed, watermark,
+            _largestSeenTime.get());
+      }
+    } catch (Exception e) {
+      _logger.warn("Failed to seed TTL watermark from ZK, loading without it", e);
+    }
+  }
+
+  /// Returns the dedup time max on the newest LLC segment of this partition, or `null` if it has none.
+  @Nullable
+  private Double getPartitionDedupTimeMax(ZkHelixPropertyStore<ZNRecord> propertyStore) {
+    LLCSegmentName newestSegment = null;
+    for (String segmentName : ZKMetadataProvider.getSegments(propertyStore, _tableNameWithType)) {
+      LLCSegmentName llcSegmentName = LLCSegmentName.of(segmentName);
+      if (llcSegmentName != null && llcSegmentName.getPartitionGroupId() == _partitionId && (newestSegment == null
+          || llcSegmentName.getSequenceNumber() > newestSegment.getSequenceNumber())) {
+        newestSegment = llcSegmentName;
+      }
+    }
+    if (newestSegment == null) {
+      return null;
+    }
+    SegmentZKMetadata segmentZKMetadata =
+        ZKMetadataProvider.getSegmentZKMetadata(propertyStore, _tableNameWithType, newestSegment.getSegmentName());
+    return segmentZKMetadata != null ? segmentZKMetadata.getDedupTimeMax() : null;
+  }
+
   protected void updateLargestSeenTime(IndexSegment segment) {
     if (_metadataTTL > 0) {
       updateLargestSeenTime(getMaxDedupTime(segment));
@@ -272,8 +362,7 @@ public abstract class BasePartitionDedupMetadataManager implements PartitionDedu
 
   private void addOrReplaceSegment(@Nullable IndexSegment oldSegment, IndexSegment newSegment)
       throws IOException {
-    try (DedupUtils.DedupRecordInfoReader dedupRecordInfoReader = new DedupUtils.DedupRecordInfoReader(newSegment,
-        _primaryKeyColumns, _dedupTimeColumn)) {
+    try (DedupUtils.DedupRecordInfoReader dedupRecordInfoReader = createDedupRecordInfoReader(newSegment)) {
       Iterator<DedupRecordInfo> dedupRecordInfoIterator =
           DedupUtils.getDedupRecordInfoIterator(dedupRecordInfoReader, newSegment.getSegmentMetadata().getTotalDocs());
       doAddOrReplaceSegment(oldSegment, newSegment, dedupRecordInfoIterator);
@@ -299,8 +388,7 @@ public abstract class BasePartitionDedupMetadataManager implements PartitionDedu
       if (skipSegmentOutOfTTL(segment)) {
         return;
       }
-      try (DedupUtils.DedupRecordInfoReader dedupRecordInfoReader = new DedupUtils.DedupRecordInfoReader(segment,
-          _primaryKeyColumns, _dedupTimeColumn)) {
+      try (DedupUtils.DedupRecordInfoReader dedupRecordInfoReader = createDedupRecordInfoReader(segment)) {
         Iterator<DedupRecordInfo> dedupRecordInfoIterator =
             DedupUtils.getDedupRecordInfoIterator(dedupRecordInfoReader, segment.getSegmentMetadata().getTotalDocs());
         doRemoveSegment(segment, dedupRecordInfoIterator);
@@ -331,6 +419,13 @@ public abstract class BasePartitionDedupMetadataManager implements PartitionDedu
         .getMaxValue()).doubleValue();
   }
 
+  /// Creates the reader of the primary keys and dedup times of the given segment. Tests override it to feed rows
+  /// without building a real segment.
+  @VisibleForTesting
+  DedupUtils.DedupRecordInfoReader createDedupRecordInfoReader(IndexSegment segment) {
+    return new DedupUtils.DedupRecordInfoReader(segment, _primaryKeyColumns, _dedupTimeColumn);
+  }
+
   protected File getWatermarkFile() {
     // Use 'dedup' suffix to avoid conflicts with upsert watermark file, as it's possible that a table is changed
     // from using dedup to upsert and the watermark should be re-calculated based on upsert comparison column.
@@ -348,6 +443,7 @@ public abstract class BasePartitionDedupMetadataManager implements PartitionDedu
     }
     try {
       long startTime = System.currentTimeMillis();
+      _lastSweptWatermark.accumulateAndGet(_largestSeenTime.get(), Math::max);
       doRemoveExpiredPrimaryKeys();
       WatermarkUtils.persistWatermark(_largestSeenTime.get(), getWatermarkFile());
       long duration = System.currentTimeMillis() - startTime;

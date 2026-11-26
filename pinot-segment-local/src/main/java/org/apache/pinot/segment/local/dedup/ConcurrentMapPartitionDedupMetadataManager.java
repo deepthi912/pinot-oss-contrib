@@ -44,6 +44,10 @@ class ConcurrentMapPartitionDedupMetadataManager extends BasePartitionDedupMetad
     while (dedupRecordInfoIterator.hasNext()) {
       DedupRecordInfo dedupRecordInfo = dedupRecordInfoIterator.next();
       double dedupTime = dedupRecordInfo.getDedupTime();
+      // Every lookup treats a key out of TTL as absent, so adding it would only take memory.
+      if (isOutOfMetadataTTL(dedupTime)) {
+        continue;
+      }
       _primaryKeyToSegmentAndTimeMap.put(HashUtils.hashPrimaryKey(dedupRecordInfo.getPrimaryKey(), _hashFunction),
           Pair.of(segment, dedupTime));
     }
@@ -56,6 +60,12 @@ class ConcurrentMapPartitionDedupMetadataManager extends BasePartitionDedupMetad
     while (dedupRecordInfoIteratorOfNewSegment.hasNext()) {
       DedupRecordInfo dedupRecordInfo = dedupRecordInfoIteratorOfNewSegment.next();
       double dedupTime = dedupRecordInfo.getDedupTime();
+      // When adding a segment, skip the rows out of TTL: every lookup treats them as absent. A replace keeps them, so
+      // stale entries move to the new segment instead of pointing to the replaced one, which removeSegment would not
+      // clean up as it only removes the entries pointing to the segment being removed.
+      if (oldSegment == null && isOutOfMetadataTTL(dedupTime)) {
+        continue;
+      }
       _primaryKeyToSegmentAndTimeMap.compute(HashUtils.hashPrimaryKey(dedupRecordInfo.getPrimaryKey(), _hashFunction),
           (primaryKey, segmentAndTime) -> {
             // Stale metadata is treated as not existing when checking for deduplicates.

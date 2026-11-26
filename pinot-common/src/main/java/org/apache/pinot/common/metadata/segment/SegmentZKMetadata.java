@@ -25,6 +25,7 @@ import java.io.IOException;
 import java.util.Map;
 import java.util.TreeMap;
 import java.util.concurrent.TimeUnit;
+import javax.annotation.Nullable;
 import org.apache.commons.collections4.MapUtils;
 import org.apache.helix.zookeeper.datamodel.ZNRecord;
 import org.apache.pinot.common.metadata.ZKMetadata;
@@ -201,6 +202,20 @@ public class SegmentZKMetadata implements ZKMetadata {
 
   public String getTier() {
     return _simpleFields.get(Segment.TIER);
+  }
+
+  /// Returns the max value of the dedup time column, or `null` if it is not recorded. It is recorded only for dedup
+  /// tables with metadataTTL, see [SegmentZKMetadataUtils#getDedupTimeColumnForTTL]. For a committed LLC segment it is
+  /// the max over the partition's segments up to this one; for an uploaded segment, the max in the segment.
+  @Nullable
+  public Double getDedupTimeMax() {
+    String dedupTimeMax = _simpleFields.get(Segment.DEDUP_TIME_MAX);
+    return dedupTimeMax != null ? Double.valueOf(dedupTimeMax) : null;
+  }
+
+  /// Sets the max value of the dedup time column in the segment, or removes it when `null`.
+  public void setDedupTimeMax(@Nullable Double dedupTimeMax) {
+    setValue(Segment.DEDUP_TIME_MAX, dedupTimeMax);
   }
 
   public void setTier(String tier) {

@@ -30,6 +30,8 @@ import org.apache.pinot.segment.spi.SegmentMetadata;
 import org.apache.pinot.segment.spi.creator.SegmentVersion;
 import org.apache.pinot.segment.spi.partition.PartitionFunction;
 import org.apache.pinot.segment.spi.partition.metadata.ColumnPartitionMetadata;
+import org.apache.pinot.spi.config.table.DedupConfig;
+import org.apache.pinot.spi.config.table.TableConfig;
 import org.apache.pinot.spi.data.DateTimeFieldSpec;
 import org.apache.pinot.spi.utils.CommonConstants;
 import org.apache.pinot.spi.utils.builder.TableNameBuilder;
@@ -40,27 +42,77 @@ public class SegmentZKMetadataUtils {
   private SegmentZKMetadataUtils() {
   }
 
-  /// Creates the segment ZK metadata for a new segment.
+  /// Creates the segment ZK metadata for a new segment, without the dedup time max.
   public static SegmentZKMetadata createSegmentZKMetadata(String tableNameWithType, SegmentMetadata segmentMetadata,
       String downloadUrl, @Nullable String crypterName, long segmentSizeInBytes) {
+    return createSegmentZKMetadata(tableNameWithType, segmentMetadata, downloadUrl, crypterName, segmentSizeInBytes,
+        null);
+  }
+
+  /// Creates the segment ZK metadata for a new segment. The dedup time max is recorded when `dedupTimeColumn` is set,
+  /// see [#getDedupTimeColumnForTTL].
+  public static SegmentZKMetadata createSegmentZKMetadata(String tableNameWithType, SegmentMetadata segmentMetadata,
+      String downloadUrl, @Nullable String crypterName, long segmentSizeInBytes, @Nullable String dedupTimeColumn) {
     SegmentZKMetadata segmentZKMetadata = new SegmentZKMetadata(segmentMetadata.getName());
     updateSegmentZKMetadata(tableNameWithType, segmentZKMetadata, segmentMetadata, downloadUrl, crypterName,
-        segmentSizeInBytes, null, true);
+        segmentSizeInBytes, null, true, dedupTimeColumn);
     return segmentZKMetadata;
   }
 
-  /// Refreshes the segment ZK metadata for a segment being replaced.
+  /// Refreshes the segment ZK metadata for a segment being replaced, removing the dedup time max.
   public static void refreshSegmentZKMetadata(String tableNameWithType, SegmentZKMetadata segmentZKMetadata,
       SegmentMetadata segmentMetadata, String downloadUrl, @Nullable String crypterName, long segmentSizeInBytes) {
-    updateSegmentZKMetadata(tableNameWithType, segmentZKMetadata, segmentMetadata, downloadUrl, crypterName,
-        segmentSizeInBytes, null, false);
+    refreshSegmentZKMetadata(tableNameWithType, segmentZKMetadata, segmentMetadata, downloadUrl, crypterName,
+        segmentSizeInBytes, null);
   }
 
-  /// Updates the segment ZK metadata for a committing segment.
+  /// Refreshes the segment ZK metadata for a segment being replaced. The dedup time max is recorded when
+  /// `dedupTimeColumn` is set and removed otherwise, so a refresh never keeps the max of the replaced segment.
+  public static void refreshSegmentZKMetadata(String tableNameWithType, SegmentZKMetadata segmentZKMetadata,
+      SegmentMetadata segmentMetadata, String downloadUrl, @Nullable String crypterName, long segmentSizeInBytes,
+      @Nullable String dedupTimeColumn) {
+    updateSegmentZKMetadata(tableNameWithType, segmentZKMetadata, segmentMetadata, downloadUrl, crypterName,
+        segmentSizeInBytes, null, false, dedupTimeColumn);
+  }
+
+  /// Updates the segment ZK metadata for a committing segment, removing the dedup time max.
   public static void updateCommittingSegmentZKMetadata(String realtimeTableName, SegmentZKMetadata segmentZKMetadata,
       SegmentMetadata segmentMetadata, String downloadUrl, long segmentSizeInBytes, String endOffset) {
+    updateCommittingSegmentZKMetadata(realtimeTableName, segmentZKMetadata, segmentMetadata, downloadUrl,
+        segmentSizeInBytes, endOffset, null);
+  }
+
+  /// Updates the segment ZK metadata for a committing segment. The dedup time max is recorded when `dedupTimeColumn`
+  /// is set and removed otherwise.
+  public static void updateCommittingSegmentZKMetadata(String realtimeTableName, SegmentZKMetadata segmentZKMetadata,
+      SegmentMetadata segmentMetadata, String downloadUrl, long segmentSizeInBytes, String endOffset,
+      @Nullable String dedupTimeColumn) {
+    // The committing segment carries the partition's dedup time max up to the previous segment, see
+    // PinotLLCRealtimeSegmentManager. Keep the larger one, so the newest committed segment has the partition max.
+    Double previousDedupTimeMax = segmentZKMetadata.getDedupTimeMax();
     updateSegmentZKMetadata(realtimeTableName, segmentZKMetadata, segmentMetadata, downloadUrl, null,
-        segmentSizeInBytes, endOffset, false);
+        segmentSizeInBytes, endOffset, false, dedupTimeColumn);
+    Double dedupTimeMax = segmentZKMetadata.getDedupTimeMax();
+    if (dedupTimeColumn != null && previousDedupTimeMax != null
+        && (dedupTimeMax == null || previousDedupTimeMax > dedupTimeMax)) {
+      segmentZKMetadata.setDedupTimeMax(previousDedupTimeMax);
+    }
+  }
+
+  /// Returns the column whose max is recorded as the dedup time max in the segment ZK metadata, or `null` when the
+  /// table is not a dedup table with metadataTTL. Uses the same rule as the server's dedup metadata manager: the
+  /// configured dedup time column, otherwise the table time column.
+  @Nullable
+  public static String getDedupTimeColumnForTTL(@Nullable TableConfig tableConfig) {
+    if (tableConfig == null || !tableConfig.isDedupEnabled()) {
+      return null;
+    }
+    DedupConfig dedupConfig = tableConfig.getDedupConfig();
+    if (dedupConfig.getMetadataTTL() <= 0) {
+      return null;
+    }
+    String dedupTimeColumn = dedupConfig.getDedupTimeColumn();
+    return dedupTimeColumn != null ? dedupTimeColumn : tableConfig.getValidationConfig().getTimeColumnName();
   }
 
   public static void updateSegmentZKTimeInterval(SegmentZKMetadata segmentZKMetadata,
@@ -80,7 +132,7 @@ public class SegmentZKMetadataUtils {
 
   private static void updateSegmentZKMetadata(String tableNameWithType, SegmentZKMetadata segmentZKMetadata,
       SegmentMetadata segmentMetadata, String downloadUrl, @Nullable String crypterName, long segmentSizeInBytes,
-      @Nullable String endOffset, boolean newSegment) {
+      @Nullable String endOffset, boolean newSegment, @Nullable String dedupTimeColumn) {
     String segmentName = segmentZKMetadata.getSegmentName();
 
     if (endOffset != null) {
@@ -164,6 +216,8 @@ public class SegmentZKMetadataUtils {
     segmentZKMetadata.setDownloadUrl(downloadUrl);
     segmentZKMetadata.setCrypterName(crypterName);
     segmentZKMetadata.setSizeInBytes(segmentSizeInBytes);
+    // Always set or remove it, so a refresh never keeps the max of the segment it replaces.
+    segmentZKMetadata.setDedupTimeMax(dedupTimeColumn != null ? getMaxValue(segmentMetadata, dedupTimeColumn) : null);
 
     // Set partition metadata
     Map<String, ColumnPartitionMetadata> columnPartitionMap = new HashMap<>();
@@ -189,6 +243,21 @@ public class SegmentZKMetadataUtils {
       customMap.putAll(segmentMetadata.getCustomMap());
     }
     segmentZKMetadata.setCustomMap(customMap);
+  }
+
+  /// Returns the max value of a numeric column, read the same way as the server's dedup metadata manager, or `null` if
+  /// the segment is empty or the column has no valid numeric max.
+  @Nullable
+  private static Double getMaxValue(SegmentMetadata segmentMetadata, String column) {
+    if (segmentMetadata.getTotalDocs() <= 0) {
+      return null;
+    }
+    ColumnMetadata columnMetadata = segmentMetadata.getColumnMetadataFor(column);
+    if (columnMetadata == null || columnMetadata.isMinMaxValueInvalid()
+        || !(columnMetadata.getMaxValue() instanceof Number)) {
+      return null;
+    }
+    return ((Number) columnMetadata.getMaxValue()).doubleValue();
   }
 
   private static boolean isValidTimeMetadata(ColumnMetadata timeColumnMetadata) {

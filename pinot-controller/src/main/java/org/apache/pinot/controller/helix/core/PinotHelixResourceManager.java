@@ -3010,7 +3010,8 @@ public class PinotHelixResourceManager {
     // NOTE: must first set the segment ZK metadata before assigning segment to instances because segment assignment
     // might need them to determine the partition of the segment, and server will need them to download the segment
     SegmentZKMetadata segmentZKMetadata =
-        SegmentZKMetadataUtils.createSegmentZKMetadata(tableNameWithType, segmentMetadata, downloadUrl, null, -1);
+        SegmentZKMetadataUtils.createSegmentZKMetadata(tableNameWithType, segmentMetadata, downloadUrl, null, -1,
+            SegmentZKMetadataUtils.getDedupTimeColumnForTTL(tableConfig));
 
     // Update segment tier to support direct assignment for multiple data directories
     if (needTieredSegmentAssignment(tableConfig)) {

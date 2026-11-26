@@ -1091,8 +1091,11 @@ public class TablesResource {
 
       // Update the Segment ZK Metadata with the segment metadata present on the server
       ImmutableSegment segment = ((ImmutableSegmentDataManager) segmentDataManager).getSegment();
+      // The controller replaces the committing segment's simple fields with these, so the dedup time max must be set
+      // here too.
       SegmentZKMetadataUtils.updateCommittingSegmentZKMetadata(realtimeTableName, segmentZKMetadata,
-          segment.getSegmentMetadata(), downloadUrl, segment.getSegmentSizeBytes(), segmentZKMetadata.getEndOffset());
+          segment.getSegmentMetadata(), downloadUrl, segment.getSegmentSizeBytes(), segmentZKMetadata.getEndOffset(),
+          SegmentZKMetadataUtils.getDedupTimeColumnForTTL(tableDataManager.getCachedTableConfigAndSchema().getLeft()));
       return segmentZKMetadata.toJsonString();
     } finally {
       FileUtils.deleteQuietly(segmentTarFile);
