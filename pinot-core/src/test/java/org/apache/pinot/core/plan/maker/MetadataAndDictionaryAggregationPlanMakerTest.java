@@ -21,6 +21,7 @@ package org.apache.pinot.core.plan.maker;
 import java.io.File;
 import java.net.URL;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
@@ -30,7 +31,10 @@ import org.apache.pinot.core.common.Operator;
 import org.apache.pinot.core.operator.BaseProjectOperator;
 import org.apache.pinot.core.operator.ExecutionStatistics;
 import org.apache.pinot.core.operator.blocks.results.AggregationResultsBlock;
+import org.apache.pinot.core.operator.blocks.results.DistinctResultsBlock;
 import org.apache.pinot.core.operator.query.AggregationOperator;
+import org.apache.pinot.core.operator.query.DictionaryBasedDistinctOperator;
+import org.apache.pinot.core.operator.query.DistinctOperator;
 import org.apache.pinot.core.operator.query.FastFilteredCountOperator;
 import org.apache.pinot.core.operator.query.GroupByOperator;
 import org.apache.pinot.core.operator.query.NonScanBasedAggregationOperator;
@@ -63,6 +67,7 @@ import org.apache.pinot.spi.data.readers.GenericRow;
 import org.apache.pinot.spi.exception.BadQueryRequestException;
 import org.apache.pinot.spi.utils.ReadMode;
 import org.apache.pinot.spi.utils.builder.TableConfigBuilder;
+import org.roaringbitmap.buffer.MutableRoaringBitmap;
 import org.testng.annotations.AfterClass;
 import org.testng.annotations.AfterTest;
 import org.testng.annotations.BeforeClass;
@@ -229,6 +234,43 @@ public class MetadataAndDictionaryAggregationPlanMakerTest {
     segmentContext.setDocIdsSnapshot(UpsertUtils.getQueryableDocIdsSnapshotFromSegment(_upsertIndexSegment));
     Operator<?> upsertOperator = PLAN_MAKER.makeSegmentPlanNode(segmentContext, queryContext).run();
     assertTrue(upsertOperatorClass.isInstance(upsertOperator));
+  }
+
+  /// On an upsert segment, DISTINCT must return only the values of the valid documents. The dictionary also holds the
+  /// values of the rows that newer records replaced, so it answers the query only when every document is valid.
+  @Test
+  public void testUpsertDistinctReturnsOnlyValidValues() {
+    QueryContext queryContext =
+        QueryContextConverterUtils.getQueryContext("select distinct daysSinceEpoch from testTable");
+    int numDocs = _upsertIndexSegment.getSegmentMetadata().getTotalDocs();
+    assertTrue(_upsertIndexSegment.getDataSource("daysSinceEpoch").getDictionary().length() > 1,
+        "The column must have more than one value for hiding rows to matter");
+
+    // No replaced row: the dictionary path is still taken
+    MutableRoaringBitmap allDocs = new MutableRoaringBitmap();
+    allDocs.add(0L, numDocs);
+    SegmentContext segmentContext = new SegmentContext(_upsertIndexSegment);
+    segmentContext.setDocIdsSnapshot(allDocs);
+    assertTrue(PLAN_MAKER.makeSegmentPlanNode(segmentContext, queryContext).run()
+        instanceof DictionaryBasedDistinctOperator);
+
+    // Only the documents with the value of document 0 are valid, so the other values must not be returned
+    Object validValue = _upsertIndexSegment.getValue(0, "daysSinceEpoch");
+    MutableRoaringBitmap validDocs = new MutableRoaringBitmap();
+    for (int docId = 0; docId < numDocs; docId++) {
+      if (validValue.equals(_upsertIndexSegment.getValue(docId, "daysSinceEpoch"))) {
+        validDocs.add(docId);
+      }
+    }
+    segmentContext = new SegmentContext(_upsertIndexSegment);
+    segmentContext.setDocIdsSnapshot(validDocs);
+    Operator<?> operator = PLAN_MAKER.makeSegmentPlanNode(segmentContext, queryContext).run();
+    assertTrue(operator instanceof DistinctOperator);
+    Set<Object> values = new HashSet<>();
+    for (Object[] row : ((DistinctResultsBlock) operator.nextBlock()).getRows()) {
+      values.add(row[0]);
+    }
+    assertEquals(values, Set.of(validValue));
   }
 
   /// Verifies the partial metadata-based aggregation path. When a query mixes a metadata-eligible function (MAX) with a
@@ -504,6 +546,22 @@ public class MetadataAndDictionaryAggregationPlanMakerTest {
     entries.add(new Object[]{
         "select count(*),min(daysSinceEpoch) from testTable group by daysSinceEpoch", GroupByOperator.class,
         GroupByOperator.class
+    });
+    // DISTINCT from dictionary. On an upsert segment the dictionary also holds the values of replaced rows, so the
+    // query must scan the valid documents instead.
+    entries.add(new Object[]{
+        "select distinct daysSinceEpoch from testTable", DictionaryBasedDistinctOperator.class,
+        DistinctOperator.class
+    });
+    // DISTINCT from dictionary with match all filter
+    entries.add(new Object[]{
+        "select distinct daysSinceEpoch from testTable where column1 > 10", DictionaryBasedDistinctOperator.class,
+        DistinctOperator.class
+    });
+    // DISTINCT with a filter
+    entries.add(new Object[]{
+        "select distinct daysSinceEpoch from testTable where column1 <= 10", DistinctOperator.class,
+        DistinctOperator.class
     });
 
     return entries.toArray(new Object[entries.size()][]);
