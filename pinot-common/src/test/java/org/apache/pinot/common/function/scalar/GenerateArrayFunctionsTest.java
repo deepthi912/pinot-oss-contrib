@@ -148,6 +148,32 @@ public class GenerateArrayFunctionsTest {
   }
 
   @Test
+  public void testFloatingPointStepCountJustBelowAnInteger() {
+    // (end - start) / inc lands just below the step count here, e.g. 5.999999999999999 for 0.1 to 0.7 by 0.1, so
+    // flooring it, even after adding 1, used to drop the end. See https://github.com/apache/pinot/issues/19814.
+    assertEquals(ArrayFunctions.generateDoubleArray(0.1, 0.7, 0.1).length, 7);
+    assertEquals(ArrayFunctions.generateDoubleArray(0.7, 0.1, -0.1).length, 7);
+    assertEquals(ArrayFunctions.generateDoubleArray(0, 0.3, 0.1).length, 4);
+    assertEquals(ArrayFunctions.generateDoubleArray(0, 0.6, 0.1).length, 7);
+    assertEquals(ArrayFunctions.generateDoubleArray(0, 0.7, 0.1).length, 8);
+    assertEquals(ArrayFunctions.generateDoubleArray(0, 0.9, 0.3).length, 4);
+    assertEquals(ArrayFunctions.generateFloatArray(0.1f, 0.7f, 0.1f).length, 7);
+    assertEquals(ArrayFunctions.generateFloatArray(0.7f, 0.1f, -0.1f).length, 7);
+    assertEquals(ArrayFunctions.generateFloatArray(0f, 0.3f, 0.1f).length, 4);
+    assertEquals(ArrayFunctions.generateFloatArray(0f, 0.6f, 0.1f).length, 7);
+    assertEquals(ArrayFunctions.generateFloatArray(0f, 0.7f, 0.1f).length, 8);
+    assertEquals(ArrayFunctions.generateFloatArray(0f, 0.9f, 0.3f).length, 4);
+  }
+
+  @Test
+  public void testFloatingPointStepCountScalesWithMagnitude() {
+    // The rounding error grows with the magnitude of the bounds, so a fixed epsilon would not cover these.
+    assertEquals(ArrayFunctions.generateDoubleArray(1e6 + 0.1, 1e6 + 0.7, 0.1).length, 7);
+    assertEquals(ArrayFunctions.generateDoubleArray(-1e6 - 0.7, -1e6 - 0.1, 0.1).length, 7);
+    assertEquals(ArrayFunctions.generateFloatArray(1000.1f, 1000.7f, 0.1f).length, 7);
+  }
+
+  @Test
   public void testFloatingPointEndBetweenStepsIsExcluded() {
     assertEquals(ArrayFunctions.generateDoubleArray(0, 0.95, 0.1).length, 10);
     assertEquals(ArrayFunctions.generateDoubleArray(0, 0.2999, 0.1).length, 3);
