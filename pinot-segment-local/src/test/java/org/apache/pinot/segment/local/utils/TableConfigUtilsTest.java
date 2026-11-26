@@ -4001,6 +4001,73 @@ public class TableConfigUtilsTest {
     TableConfigUtils.validateTTLForUpsertConfig(tableConfigWithValidTimestampTTLConfig, schema);
   }
 
+  @Test
+  public void testValidateTTLOrderingForUpsertConfig() {
+    Schema schema = new Schema.SchemaBuilder().setSchemaName(TABLE_NAME)
+        .addSingleValueDimension("myCol", DataType.STRING)
+        .addSingleValueDimension("deleteCol", DataType.BOOLEAN)
+        .addDateTime(TIME_COLUMN, DataType.LONG, "1:MILLISECONDS:EPOCH", "1:MILLISECONDS")
+        .setPrimaryKeyColumns(List.of("myCol"))
+        .build();
+
+    // deletedKeysTTL below metadataTTL is the only ordering where both TTLs take effect
+    TableConfigUtils.validateTTLForUpsertConfig(createTTLTableConfig(3600, 600), schema);
+    // Either TTL alone has no ordering to check
+    TableConfigUtils.validateTTLForUpsertConfig(createTTLTableConfig(3600, 0), schema);
+    TableConfigUtils.validateTTLForUpsertConfig(createTTLTableConfig(0, 3600), schema);
+
+    // Equal TTLs: metadataTTL removes the key of every delete marker before deletedKeysTTL can purge it
+    try {
+      TableConfigUtils.validateTTLForUpsertConfig(createTTLTableConfig(3600, 3600), schema);
+      fail("Should reject deletedKeysTTL equal to metadataTTL");
+    } catch (IllegalStateException e) {
+      assertTrue(e.getMessage().contains("deletedKeysTTL (3600.0) must be less than metadataTTL (3600.0)"),
+          e.getMessage());
+    }
+    // deletedKeysTTL above metadataTTL
+    try {
+      TableConfigUtils.validateTTLForUpsertConfig(createTTLTableConfig(600, 3600), schema);
+      fail("Should reject deletedKeysTTL above metadataTTL");
+    } catch (IllegalStateException e) {
+      assertTrue(e.getMessage().contains("deletedKeysTTL (3600.0) must be less than metadataTTL (600.0)"),
+          e.getMessage());
+    }
+
+    // An existing table that already has the ordering keeps accepting updates, and schema updates, that leave both
+    // TTLs unchanged
+    TableConfig existingTableConfig = createTTLTableConfig(600, 3600);
+    TableConfigUtils.validateTTLForUpsertConfig(createTTLTableConfig(600, 3600), schema, existingTableConfig);
+    // An update that changes either TTL must fix the ordering
+    try {
+      TableConfigUtils.validateTTLForUpsertConfig(createTTLTableConfig(1200, 3600), schema, existingTableConfig);
+      fail("Should reject an update that changes a TTL and keeps deletedKeysTTL above metadataTTL");
+    } catch (IllegalStateException e) {
+      assertTrue(e.getMessage().contains("deletedKeysTTL (3600.0) must be less than metadataTTL (1200.0)"),
+          e.getMessage());
+    }
+    TableConfigUtils.validateTTLForUpsertConfig(createTTLTableConfig(7200, 3600), schema, existingTableConfig);
+    // A new table gets no grandfathering from an existing config without these TTLs
+    try {
+      TableConfigUtils.validateTTLForUpsertConfig(createTTLTableConfig(600, 3600), schema,
+          createTTLTableConfig(0, 0));
+      fail("Should reject adding deletedKeysTTL above metadataTTL");
+    } catch (IllegalStateException e) {
+      // Expected
+    }
+  }
+
+  private static TableConfig createTTLTableConfig(double metadataTTL, double deletedKeysTTL) {
+    UpsertConfig upsertConfig = new UpsertConfig(UpsertConfig.Mode.FULL);
+    upsertConfig.setMetadataTTL(metadataTTL);
+    upsertConfig.setDeletedKeysTTL(deletedKeysTTL);
+    upsertConfig.setDeleteRecordColumn("deleteCol");
+    upsertConfig.setSnapshot(Enablement.ENABLE);
+    return new TableConfigBuilder(TableType.REALTIME).setTableName(TABLE_NAME)
+        .setTimeColumnName(TIME_COLUMN)
+        .setUpsertConfig(upsertConfig)
+        .build();
+  }
+
   @SuppressWarnings("removal")
   private static InstanceAssignmentConfig createReplicaGroupInstanceAssignmentConfig(boolean replicaGroupBased,
       int numInstancesPerReplicaGroup, int numPartitions, int numInstancesPerPartition) {
